@@ -1,6 +1,12 @@
 #include "src/cli/serve/logging.hpp"
 
+#if defined(_WIN32)
+#include <io.h>
+#include <psapi.h>  // after windows.h: needs BOOL/DWORD definitions
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <chrono>
@@ -42,13 +48,18 @@ std::string CurrentTimestamp() {
   const auto now = std::chrono::system_clock::now();
   const auto seconds = std::chrono::system_clock::to_time_t(now);
   std::tm calendar{};
+#if defined(_WIN32)
+  (void)localtime_s(&calendar, &seconds);
+#else
   ::localtime_r(&seconds, &calendar);
+#endif
   std::array<char, 32> buffer{};
   const auto written = std::strftime(buffer.data(), buffer.size(),
                                      "%Y-%m-%d %H:%M:%S", &calendar);
   return {buffer.data(), written};
 }
 
+#if !defined(_WIN32)
 std::size_t ReadMemoryKiB(const char* path, std::string_view field) {
   std::ifstream input(path);
   for (std::string line; std::getline(input, line);) {
@@ -61,13 +72,18 @@ std::size_t ReadMemoryKiB(const char* path, std::string_view field) {
   }
   return 0;
 }
+#endif
 
 }  // namespace
 
 void Logger::Log(LogLevel level, std::string_view component,
                  std::string_view message) {
-  static const bool color =
-      std::getenv("NO_COLOR") == nullptr && ::isatty(STDERR_FILENO) != 0;
+  static const bool color = std::getenv("NO_COLOR") == nullptr &&
+#if defined(_WIN32)
+                            _isatty(_fileno(stderr)) != 0;
+#else
+                            ::isatty(STDERR_FILENO) != 0;
+#endif
   const char* tag = level == LogLevel::kError  ? "ERROR"
                     : level == LogLevel::kWarn ? "WARN"
                                                : "INFO";
@@ -89,9 +105,22 @@ void Logger::Log(LogLevel level, std::string_view component,
 
 std::string Logger::MemoryStatus() {
   std::ostringstream output;
+#if defined(_WIN32)
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  if (GlobalMemoryStatusEx(&status))
+    output << " host_available_mib=" << status.ullAvailPhys / (1024 * 1024);
+  if (GetProcessMemoryInfo(
+          GetCurrentProcess(),
+          reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+          sizeof(counters)))
+    output << " rss_mib=" << counters.WorkingSetSize / (1024 * 1024);
+#else
   output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
          << " host_available_mib="
          << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+#endif
   return output.str();
 }
 

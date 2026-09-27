@@ -1,6 +1,8 @@
 #include "src/core/diagnostics/linux_sysfs.h"
 
+#if !defined(_WIN32)
 #include <sys/utsname.h>
+#endif
 
 #include <charconv>
 #include <fstream>
@@ -52,6 +54,9 @@ std::optional<std::string> LinuxSysfs::ReadFile(
 }
 
 std::optional<HostUnameInfo> LinuxSysfs::QueryUname() const {
+#if defined(_WIN32)
+  return std::nullopt;  // Kernel identity reporting is Linux-only for now.
+#else
   const auto version_opt = ReadFile(proc_root_ / "version");
   struct utsname uts{};
   if (uname(&uts) == 0) {
@@ -64,6 +69,7 @@ std::optional<HostUnameInfo> LinuxSysfs::QueryUname() const {
     return info;
   }
   return std::nullopt;
+#endif
 }
 
 std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {

@@ -1,7 +1,15 @@
 cmake_minimum_required(VERSION 3.21)
 project(gufo LANGUAGES C CXX)
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-  message(FATAL_ERROR "Gufo requires Linux x86-64 with an AMD gfx1151 GPU")
+# Production remains Linux x86-64 on gfx1151; Windows x86-64 is a supported
+# native build target sharing the same source tree.
+if (NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  message(FATAL_ERROR "Gufo requires Linux or Windows on x86-64 with an AMD gfx1151 GPU")
+endif()
+if (WIN32)
+  # Declared before any subdirectory: windows.h must never define the
+  # min/max macros that break std::min/std::max and rocPRIM device headers.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -49,7 +57,38 @@ if (ENGINE_ENABLE_HIP)
   find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp REQUIRED)
   find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp REQUIRED)
   message(STATUS "gufo: HIP target ${CMAKE_HIP_ARCHITECTURES}")
+  if (WIN32)
+    # The AMD driver installs an older amdhip64 into System32 that shadows
+    # the TheRock runtime on the DLL search path; executables must carry the
+    # matching runtime beside them (the exe directory precedes System32).
+    file(GLOB GUFO_HIP_RUNTIME_DLLS "${ROCM_PATH}/bin/*.dll")
+    if (NOT GUFO_HIP_RUNTIME_DLLS)
+      file(GLOB GUFO_HIP_RUNTIME_DLLS "C:/TheRock/build/bin/*.dll")
+    endif()
+    if (NOT GUFO_HIP_RUNTIME_DLLS)
+      message(FATAL_ERROR "Cannot locate TheRock runtime DLLs for the Windows HIP build")
+    endif()
+    message(STATUS "gufo: staging ${GUFO_HIP_RUNTIME_DLLS}")
+  endif()
 endif()
+
+function(gufo_stage_hip_runtime target)
+  if (ENGINE_ENABLE_HIP AND WIN32 AND GUFO_HIP_RUNTIME_DLLS)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${GUFO_HIP_RUNTIME_DLLS} $<TARGET_FILE_DIR:${target}>)
+    # rocBLAS/hipBLASLt resolve their Tensile kernel libraries relative to
+    # their own DLL location, so the data directories ship beside the exe.
+    foreach(data_dir rocblas hipblaslt)
+      if (EXISTS "${ROCM_PATH}/bin/${data_dir}")
+        add_custom_command(TARGET ${target} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_directory
+                  "${ROCM_PATH}/bin/${data_dir}"
+                  "$<TARGET_FILE_DIR:${target}>/${data_dir}")
+      endif()
+    endforeach()
+  endif()
+endfunction()
 
 if (ENGINE_ENABLE_HIP)
   add_subdirectory(src/models/deepseek_v4_flash)
@@ -74,9 +113,14 @@ if (GUFO_ENABLE_WARNINGS)
   endif()
 endif()
 
-if (GUFO_ENABLE_SANITIZERS)
+if (GUFO_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
+endif()
+
+if (WIN32)
+  # Platform layer: WinSock (net), process memory counters (logging).
+  set(GUFO_PLATFORM_LIBS ws2_32 psapi)
 endif()
 
 add_library(gufo_diagnostics STATIC
@@ -103,6 +147,11 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_core STATIC
+  src/core/platform/mapped_file.cpp
+  src/core/platform/net.cpp
+  src/core/platform/os_info.cpp
+  src/core/platform/publish.cpp
+  src/core/platform/shutdown_signal.cpp
   src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
@@ -134,6 +183,9 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads
   PNG::PNG JPEG::JPEG CURL::libcurl OpenSSL::Crypto)
+if (WIN32)
+  target_link_libraries(gufo_core PUBLIC ${GUFO_PLATFORM_LIBS})
+endif()
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
@@ -215,6 +267,7 @@ add_executable(gufo
   src/eval/http_client.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
+gufo_stage_hip_runtime(gufo)
 target_compile_definitions(gufo PRIVATE
   GUFO_VERSION="${GUFO_VERSION}"
   GUFO_EVAL_SOURCE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
@@ -227,10 +280,18 @@ if (ENGINE_ENABLE_HIP)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
 
-add_custom_target(gufo-server ALL
-  COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
-  DEPENDS gufo
-)
+if (WIN32)
+  add_custom_target(gufo-server ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gufo>
+            ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
+    DEPENDS gufo
+  )
+else()
+  add_custom_target(gufo-server ALL
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
+    DEPENDS gufo
+  )
+endif()
 if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
   add_library(gufo_kernel_bench_support STATIC
     src/cli/bench/kernel_bench.cpp)
@@ -270,7 +331,11 @@ install(FILES
 install(FILES LICENSE NOTICE THIRD_PARTY_NOTICES.md DESTINATION share/licenses/gufo)
 install(DIRECTORY licenses/ DESTINATION share/licenses/gufo/third-party)
 install(FILES src/models/deepseek_v4_flash/LICENSE.ds4 DESTINATION share/licenses/gufo/third-party)
-install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink gufo \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server\")")
+if (NOT WIN32)
+  install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink gufo \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server\")")
+else()
+  install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E copy \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo.exe\" \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server.exe\")")
+endif()
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   install(TARGETS gufo-kernel-bench tune_hipblaslt
     DESTINATION bin)
@@ -281,7 +346,11 @@ include(CTest)
 
 # Test assertions remain active when model code uses production optimization.
 if (BUILD_TESTING)
-  add_compile_options(-UNDEBUG)
+  if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-UNDEBUG)
+  elseif (MSVC)
+    add_compile_options(/UNDEBUG)
+  endif()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   add_subdirectory(tests/models/qwen)

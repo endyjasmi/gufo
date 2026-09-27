@@ -1,9 +1,6 @@
 #include "src/cli/serve/websocket.hpp"
 
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <openssl/evp.h>
-#include <sys/socket.h>
 
 #include <array>
 #include <cctype>
@@ -11,7 +8,16 @@
 #include <cstring>
 
 #include "src/cli/serve/audio_stream.hpp"
+#include "src/core/platform/net.hpp"
 #include "src/core/utf8.hpp"
+
+#if defined(_WIN32)
+constexpr int kShutdownRead = SD_RECEIVE;
+constexpr int kShutdownBoth = SD_BOTH;
+#else
+constexpr int kShutdownRead = SHUT_RD;
+constexpr int kShutdownBoth = SHUT_RDWR;
+#endif
 
 namespace gufo::server {
 namespace {
@@ -86,13 +92,10 @@ WebSocket::WebSocket(int fd, std::string buffered)
     : fd_(fd), buffered_(std::move(buffered)) {
   // Frame headers and audio payloads are separate writes; do not wait for a
   // delayed TCP acknowledgement before sending the payload.
-  const int no_delay = 1;
-  (void)::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &no_delay,
-                     sizeof(no_delay));
+  (void)net::SetNoDelay(fd_);
   // Bound backpressure from a client that stops consuming audio. Read timeout
   // stays at the server's idle timeout.
-  const timeval timeout{5, 0};
-  (void)::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  (void)net::SetSocketTimeouts(fd_, 5'000);
   reader_ = std::jthread([this] { ReadLoop(); });
 }
 
@@ -100,9 +103,9 @@ WebSocket::~WebSocket() {
   Close();
   // Cancellation can wake the consumer before the reader finishes its close
   // reply. Let that writer complete before shutting down the send half.
-  (void)::shutdown(fd_, SHUT_RD);
+  (void)::shutdown(fd_, kShutdownRead);
   reader_.join();
-  (void)::shutdown(fd_, SHUT_RDWR);
+  (void)::shutdown(fd_, kShutdownBoth);
 }
 
 bool WebSocket::Read(char* data, std::size_t size) {
@@ -115,7 +118,7 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
-    const auto count = ::recv(fd_, data, size, 0);
+    const auto count = ::recv(fd_, data, static_cast<int>(size), 0);
     if (count < 0 && errno == EINTR)
       continue;
     if (count <= 0)
@@ -142,12 +145,12 @@ bool WebSocket::Send(std::uint8_t opcode, std::string_view bytes) {
   }
   for (auto part : {std::string_view(header), bytes}) {
     while (!part.empty()) {
-      const auto count = ::send(fd_, part.data(), part.size(), MSG_NOSIGNAL);
+      const auto count = net::SendNoSignal(fd_, part.data(), part.size());
       if (count < 0 && errno == EINTR)
         continue;
       if (count <= 0) {
         MarkClosed();
-        (void)::shutdown(fd_, SHUT_RDWR);
+        (void)::shutdown(fd_, kShutdownBoth);
         return false;
       }
       part.remove_prefix(static_cast<std::size_t>(count));
@@ -169,7 +172,7 @@ void WebSocket::Close(std::uint16_t code) {
   const std::array<char, 2> payload{static_cast<char>(code >> 8),
                                     static_cast<char>(code & 255)};
   (void)Send(8, std::string_view(payload.data(), payload.size()));
-  (void)::shutdown(fd_, SHUT_RD);
+  (void)::shutdown(fd_, kShutdownRead);
 }
 
 bool WebSocket::MarkClosed() {

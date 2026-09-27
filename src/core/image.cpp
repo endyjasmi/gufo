@@ -2,9 +2,20 @@
 
 #include <curl/curl.h>
 #include <jpeglib.h>
-#include <netinet/in.h>
 #include <png.h>
+
+#if defined(_WIN32)
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
 #include <sys/socket.h>
+#endif
+
+#if defined(_WIN32)
+constexpr int kSocketCloexec = 0;
+#else
+constexpr int kSocketCloexec = SOCK_CLOEXEC;
+#endif
 
 #include <algorithm>
 #include <array>
@@ -503,7 +514,7 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
         }
         if (!IsPublicImageAddress(ip))
           return CURL_SOCKET_BAD;
-        return ::socket(endpoint->family, endpoint->socktype | SOCK_CLOEXEC,
+        return ::socket(endpoint->family, endpoint->socktype | kSocketCloexec,
                         endpoint->protocol);
       });
   struct Download {

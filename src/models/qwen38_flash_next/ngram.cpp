@@ -1,7 +1,13 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -69,13 +75,19 @@ NgramTable::~NgramTable() {
     w.join();
   }
   if (fd_ >= 0) {
+#if defined(_WIN32)
+    if (file_handle_ != nullptr)
+      CloseHandle(static_cast<HANDLE>(file_handle_));
+#else
     ::close(fd_);
+#endif
   }
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
-    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
+    int file_descriptor, const std::string& source_path,
+    std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
+    core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
   const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
   const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18 : 2;
@@ -94,8 +106,28 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
+#if defined(_WIN32)
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
+  HANDLE unbuffered =
+      CreateFileA(source_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                  OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+  if (unbuffered != INVALID_HANDLE_VALUE) {
+    t->file_handle_ = unbuffered;
+    t->direct_ = true;
+  } else {
+    HANDLE buffered =
+        CreateFileA(source_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (buffered == INVALID_HANDLE_VALUE) {
+      if (error_msg != nullptr) {
+        *error_msg = "cannot open bound n-gram table: " + source_path;
+      }
+      return nullptr;
+    }
+    t->file_handle_ = buffered;
+  }
+#else
   const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   t->direct_ = t->fd_ >= 0;
@@ -109,6 +141,7 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     }
     return nullptr;
   }
+#endif
   const std::size_t workers = std::min(
       kWorkers, static_cast<std::size_t>(std::thread::hardware_concurrency()));
   for (std::size_t i = 0; i < std::max<std::size_t>(1, workers); ++i) {
@@ -180,11 +213,25 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
       entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
   std::size_t got = 0;
   while (got < needed) {
+#if defined(_WIN32)
+    OVERLAPPED overlapped{};
+    overlapped.Offset = static_cast<DWORD>(begin + got);
+    overlapped.OffsetHigh = static_cast<DWORD>((begin + got) >> 32);
+    DWORD read_bytes = 0;
+    const bool ok =
+        ReadFile(static_cast<HANDLE>(file_handle_), base + got,
+                 static_cast<DWORD>(length - got), &read_bytes, &overlapped) &&
+        read_bytes > 0;
+    const std::size_t n = ok ? read_bytes : 0;
+#else
     const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
+#endif
     if (n <= 0) {
+#if !defined(_WIN32)
       if (n < 0 && errno == EINTR) {
         continue;
       }
+#endif
       return false;
     }
     got += static_cast<std::size_t>(n);

@@ -1,13 +1,5 @@
 #include "src/cli/serve/http_server.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -43,11 +35,36 @@
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
+#include "src/core/platform/net.hpp"
+#include "src/core/platform/shutdown_signal.hpp"
 #include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
 namespace {
+
+#if defined(_WIN32)
+using PollDescriptor = WSAPOLLFD;
+constexpr short kPollIn = POLLRDNORM;
+constexpr short kPollErr = POLLERR;
+constexpr short kPollHup = POLLHUP;
+constexpr int kShutdownBoth = SD_BOTH;
+#else
+using PollDescriptor = struct pollfd;
+constexpr short kPollIn = POLLIN;
+constexpr short kPollErr = POLLERR;
+constexpr short kPollHup = POLLHUP;
+constexpr int kShutdownBoth = SHUT_RDWR;
+#endif
+
+/// Read up to `n` bytes from a stream socket; returns bytes read or -1.
+int ReceiveAll(int fd, void* buffer, std::size_t n) {
+#if defined(_WIN32)
+  return ::recv(fd, static_cast<char*>(buffer), static_cast<int>(n), 0);
+#else
+  return static_cast<int>(::read(fd, buffer, n));
+#endif
+}
 
 std::atomic<int> shutdown_signal{0};
 static_assert(std::atomic<int>::is_always_lock_free);
@@ -60,31 +77,12 @@ void RequestShutdown(int signal) noexcept {
 
 class ShutdownSignals {
 public:
-  ShutdownSignals() {
+  ShutdownSignals() : guard_(&RequestShutdown) {
     shutdown_signal.store(0, std::memory_order_relaxed);
-    struct sigaction action{};
-    action.sa_handler = RequestShutdown;
-    ::sigemptyset(&action.sa_mask);
-    if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0)
-      throw std::system_error(errno, std::generic_category(),
-                              "install SIGINT handler");
-    if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
-      const int error = errno;
-      (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-      throw std::system_error(error, std::generic_category(),
-                              "install SIGTERM handler");
-    }
   }
-  ~ShutdownSignals() {
-    (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
-    (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-  }
-  ShutdownSignals(const ShutdownSignals&) = delete;
-  ShutdownSignals& operator=(const ShutdownSignals&) = delete;
 
 private:
-  struct sigaction previous_interrupt_{};
-  struct sigaction previous_terminate_{};
+  platform::ShutdownSignalGuard guard_;
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +92,7 @@ private:
 bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    const int n = ReceiveAll(fd, buf, sizeof(buf));
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -110,7 +108,7 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = ::read(fd, buf, want);
+    const int r = ReceiveAll(fd, buf, want);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -122,12 +120,8 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
 bool SendAll(int fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-#ifdef MSG_NOSIGNAL
-    const int flags = MSG_NOSIGNAL;
-#else
-    const int flags = 0;
-#endif
-    const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, flags);
+    const std::intptr_t n =
+        net::SendNoSignal(fd, data.data() + sent, data.size() - sent);
     if (n <= 0)
       return false;
     sent += static_cast<std::size_t>(n);
@@ -148,7 +142,24 @@ bool SendChunk(int fd, std::string_view data) {
 }
 
 bool IsPeerDisconnected(int fd) noexcept {
-  pollfd descriptor{
+#if defined(_WIN32)
+  PollDescriptor descriptor{};
+  descriptor.fd = fd;
+  descriptor.events = kPollIn | kPollErr | kPollHup;
+  const int ready = ::WSAPoll(&descriptor, 1, 0);
+  if (ready <= 0)
+    return false;
+  if ((descriptor.revents & (kPollErr | kPollHup | POLLNVAL)) != 0)
+    return true;
+  if ((descriptor.revents & kPollIn) == 0)
+    return false;
+  // Readable with zero bytes pending is a graceful disconnect.
+  u_long available = 0;
+  if (::ioctlsocket(fd, FIONREAD, &available) != 0)
+    return false;
+  return available == 0;
+#else
+  PollDescriptor descriptor{
       .fd = fd,
       .events = POLLIN | POLLERR | POLLHUP,
       .revents = 0,
@@ -171,6 +182,7 @@ bool IsPeerDisconnected(int fd) noexcept {
   const auto count = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
   return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                         errno != EINTR);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1014,8 @@ HttpServer::HttpServer(std::string host, int port,
 HttpServer::~HttpServer() {
   stop();
   if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
+    listen_fd_ = -1;
   }
 }
 
@@ -1044,6 +1057,7 @@ void HttpServer::register_routes() {
 }
 
 bool HttpServer::start(std::string* error) {
+  net::EnsureSocketRuntimeStarted();
   if (listen_fd_ >= 0 || stopped_.load(std::memory_order_acquire)) {
     if (error != nullptr) {
       *error = "HTTP server has already been started or stopped";
@@ -1061,29 +1075,30 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   addr.sin_port = htons(static_cast<unsigned short>(port_));
-  (void)::signal(SIGPIPE, SIG_IGN);
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  platform::IgnoreSocketPipeSignal();
+  listen_fd_ = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   if (listen_fd_ < 0) {
     if (error != nullptr)
       *error = "socket() failed";
     return false;
   }
   const int yes = 1;
-  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
 
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
       0) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
   if (::listen(listen_fd_, 16) < 0) {
     if (error != nullptr)
       *error = "listen() failed";
-    ::close(listen_fd_);
+    net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
@@ -1095,7 +1110,7 @@ bool HttpServer::start(std::string* error) {
       if (error != nullptr) {
         *error = "getsockname() failed";
       }
-      ::close(listen_fd_);
+      net::CloseSocket(listen_fd_);
       listen_fd_ = -1;
       return false;
     }
@@ -1110,8 +1125,7 @@ void HttpServer::run(bool handle_signals) {
     signals.emplace();
     // A connection may disappear between poll and accept. Never let that
     // race put the signal-aware loop back into an uninterruptible accept.
-    const int flags = ::fcntl(listen_fd_, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK) != 0)
+    if (!net::SetNonBlocking(listen_fd_))
       throw std::system_error(errno, std::generic_category(),
                               "configure HTTP listener");
   }
@@ -1130,15 +1144,19 @@ void HttpServer::run(bool handle_signals) {
         stop();
         break;
       }
-      pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
-      const int ready = ::poll(&descriptor, 1, 100);
+      PollDescriptor descriptor{};
+      descriptor.fd = listen_fd_;
+      descriptor.events = kPollIn;
+      descriptor.revents = 0;
+      const int ready = net::PollSocket(&descriptor, 1, 100);
       if (ready < 0 && errno != EINTR)
         throw std::system_error(errno, std::generic_category(),
                                 "poll HTTP listener");
       if (ready <= 0)
         continue;
     }
-    const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    const int client_fd =
+        static_cast<int>(::accept(listen_fd_, nullptr, nullptr));
     if (client_fd < 0) {
       if (stopped_.load(std::memory_order_acquire)) {
         break;
@@ -1146,7 +1164,7 @@ void HttpServer::run(bool handle_signals) {
       continue;
     }
     if (stopped_.load(std::memory_order_acquire)) {
-      ::close(client_fd);
+      net::CloseSocket(client_fd);
       break;
     }
 
@@ -1164,7 +1182,7 @@ void HttpServer::run(bool handle_signals) {
           handle_connection(client_fd);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            ::close(worker_ptr->fd);
+            net::CloseSocket(worker_ptr->fd);
             worker_ptr->fd = -1;
           }
           worker_ptr->done.store(true, std::memory_order_release);
@@ -1178,7 +1196,7 @@ void HttpServer::run(bool handle_signals) {
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
       (void)SendAll(client_fd, BuildResponse(response));
-      ::close(client_fd);
+      net::CloseSocket(client_fd);
     }
   }
   reap_workers();
@@ -1189,7 +1207,7 @@ void HttpServer::stop() {
   if (!was_stopped && listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
-    (void)::shutdown(listen_fd_, SHUT_RDWR);
+    (void)::shutdown(listen_fd_, kShutdownBoth);
   }
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
@@ -1198,7 +1216,7 @@ void HttpServer::stop() {
     workers = std::move(workers_);
     for (const auto& worker : workers) {
       if (worker->fd >= 0) {
-        (void)::shutdown(worker->fd, SHUT_RDWR);
+        (void)::shutdown(worker->fd, kShutdownBoth);
       }
     }
   }
@@ -1319,9 +1337,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 void HttpServer::handle_connection(int client_fd) {
-  const struct timeval tv{120, 0};
-  ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  (void)net::SetSocketTimeouts(client_fd, 120'000);
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;

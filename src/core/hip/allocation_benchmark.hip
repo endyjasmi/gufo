@@ -2,12 +2,16 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <hip/hip_runtime.h>
 
@@ -59,6 +63,9 @@ struct FaultSnapshot {
 };
 
 FaultSnapshot ReadFaults() {
+#if defined(_WIN32)
+  return {};  // Windows exposes no per-process minor/major fault counters.
+#else
   rusage usage{};
   if (getrusage(RUSAGE_SELF, &usage) != 0) {
     return {};
@@ -67,6 +74,7 @@ FaultSnapshot ReadFaults() {
       .minor = static_cast<std::uint64_t>(usage.ru_minflt),
       .major = static_cast<std::uint64_t>(usage.ru_majflt),
   };
+#endif
 }
 
 AllocationFaultDelta FaultDelta(FaultSnapshot before, FaultSnapshot after) {
@@ -94,12 +102,24 @@ std::uint64_t ReadMeminfoValue(std::string_view requested_key) {
 }
 
 std::uint64_t AvailableMemoryBytes() {
+#if defined(_WIN32)
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#else
   return ReadMeminfoValue("MemAvailable:");
+#endif
 }
 
 std::uint64_t PageSizeBytes() {
+#if defined(_WIN32)
+  SYSTEM_INFO info{};
+  GetSystemInfo(&info);
+  return info.dwPageSize != 0 ? info.dwPageSize : 0;
+#else
   const long page_size = sysconf(_SC_PAGESIZE);
   return page_size > 0 ? static_cast<std::uint64_t>(page_size) : 0;
+#endif
 }
 
 std::string HipReason(hipError_t status) {
@@ -252,12 +272,14 @@ public:
     if (host_registered_ && host_ != nullptr) {
       (void)hipHostUnregister(host_);
     }
+#if !defined(_WIN32)
     if (mapping_ != nullptr && mapping_size_ != 0) {
       (void)munmap(mapping_, mapping_size_);
     }
     if (fd_ >= 0) {
       (void)close(fd_);
     }
+#endif
     if (stream_ != nullptr) {
       (void)hipStreamDestroy(stream_);
     }
@@ -328,6 +350,11 @@ void MeasureCpuCall(AllocationPhaseResult* phase, Function&& function) {
 }
 
 std::string MincoreEvidence(void* pointer, std::size_t size) {
+#if defined(_WIN32)
+  (void)pointer;
+  (void)size;
+  return "mincore unavailable on Windows";
+#else
   if (pointer == nullptr || size == 0) {
     return "mincore unavailable: no host mapping";
   }
@@ -362,6 +389,7 @@ std::string MincoreEvidence(void* pointer, std::size_t size) {
   }
   return std::to_string(resident) + "/" + std::to_string(page_count) +
          " pages resident";
+#endif
 }
 
 std::uint32_t KernelBlocks() {
@@ -524,6 +552,13 @@ bool CreateResource(AllocationKind kind, std::size_t size,
       }
       break;
     case AllocationKind::kFileMmapHostRegister: {
+#if defined(_WIN32)
+      result->allocation_api = "unavailable on Windows";
+      allocation.status = "unavailable";
+      allocation.reason = "memfd_create is Linux-only";
+      ComputeAllocationPhaseStatistics(&allocation);
+      break;
+#else
       result->allocation_api =
           "memfd_create + mmap(MAP_SHARED) + hipHostRegister";
       result->flags =
@@ -580,6 +615,7 @@ bool CreateResource(AllocationKind kind, std::size_t size,
         result->phases.push_back(std::move(registration));
       }
       break;
+#endif
     }
     case AllocationKind::kHipMallocAsync:
       result->allocation_api = "hipMallocAsync";
@@ -1103,7 +1139,11 @@ std::string CurrentIso8601Utc() {
   const auto now = std::chrono::system_clock::now();
   const auto time = std::chrono::system_clock::to_time_t(now);
   std::tm utc{};
+  #if defined(_WIN32)
+  gmtime_s(&utc, &time);
+#else
   gmtime_r(&time, &utc);
+#endif
   std::ostringstream output;
   output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
   return output.str();

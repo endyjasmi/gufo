@@ -7938,6 +7938,21 @@ int ds4_rocm_graph_save_snapshot(const ds4_rocm_graph* graph,
     snap->cap = bytes + 1u;
   }
 
+#if defined(_WIN32)
+  // fmemopen is POSIX; stage through a temp file and read the bytes back.
+  FILE* fp = std::tmpfile();
+  if (!fp) {
+    payload_set_err(err, errlen,
+                    "failed to open memory stream for session snapshot");
+    return 1;
+  }
+  const int rc =
+      rocm_graph_save_payload(graph, checkpoint, logits, prefill_capacity,
+                              context_size, state, fp, err, errlen);
+  if (rc == 0 && fseek(fp, 0, SEEK_SET) == 0) {
+    snap->len = fread(snap->ptr, 1, static_cast<size_t>(bytes), fp);
+  }
+#else
   FILE* fp = fmemopen(snap->ptr, static_cast<size_t>(bytes + 1u), "wb");
   if (!fp) {
     payload_set_err(err, errlen,
@@ -7947,6 +7962,7 @@ int ds4_rocm_graph_save_snapshot(const ds4_rocm_graph* graph,
   const int rc =
       rocm_graph_save_payload(graph, checkpoint, logits, prefill_capacity,
                               context_size, state, fp, err, errlen);
+#endif
   if (fclose(fp) != 0 && rc == 0) {
     payload_set_err(err, errlen, "failed to finalize memory session snapshot");
     return 1;
@@ -7973,11 +7989,21 @@ int ds4_rocm_graph_load_snapshot(ds4_rocm_graph* graph, ds4_tokens* checkpoint,
         return 1;
     }
 
+#if defined(_WIN32)
+    FILE *fp = std::tmpfile();
+    if (!fp || fwrite(snap->ptr, 1, (size_t)snap->len, fp) != (size_t)snap->len ||
+        fseek(fp, 0, SEEK_SET) != 0) {
+        if (fp) fclose(fp);
+        payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
+        return 1;
+    }
+#else
     FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
     }
+#endif
     const int rc = rocm_graph_load_payload(graph, checkpoint, logits,
                                            prefill_capacity, context_size,
                                            state, fp, snap->len, err, errlen);

@@ -2,7 +2,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
@@ -11,14 +10,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#if defined(_WIN32)
+#include <chrono>
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#include <sys/locking.h>
+#else
+#include <fcntl.h>
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
+#include <filesystem>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -160,9 +170,14 @@ void *ds4_xrealloc(void *ptr, size_t size) {
 }
 
 double ds4_now_seconds(void) {
+#if defined(_WIN32)
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double>(now).count();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+#endif
 }
 
 static const char *ds4_log_color_code(ds4_log_type type) {
@@ -188,8 +203,12 @@ static const char *ds4_log_color_code(ds4_log_type type) {
 }
 
 bool ds4_log_is_tty(FILE *fp) {
+#if defined(_WIN32)
+    return _isatty(_fileno(fp)) != 0;
+#else
     int fd = fileno(fp);
     return fd >= 0 && isatty(fd) != 0;
+#endif
 }
 
 static void ds4_vlog(FILE *fp, ds4_log_type type, const char *fmt, va_list ap) {
@@ -531,8 +550,11 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    m->mapping.Close();
+    m->map = nullptr;
+#if !defined(_WIN32)
     if (m->fd >= 0) close(m->fd);
+#endif
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 }
@@ -628,20 +650,12 @@ static void model_open(ds4_model *m, const char *path) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
-    m->fd = fd;
+    if (!m->mapping.Open(path))
+        ds4_die("cannot open or map model");
 
-    struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
-    if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
-
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
-
-    m->fd = fd;
-    m->map = static_cast<const uint8_t *>(map);
-    m->size = (uint64_t)st.st_size;
+    if (m->mapping.size < 32) ds4_die("model file is too small to be GGUF");
+    m->map = static_cast<const uint8_t *>(m->mapping.data);
+    m->size = (uint64_t)m->mapping.size;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -1690,7 +1704,11 @@ void ds4_dspark_close(ds4_dspark_model *d) {
 
 static void ds4_release_instance_lock(void) {
     if (g_ds4_lock_fd >= 0) {
+#if defined(_WIN32)
+        _close(g_ds4_lock_fd);
+#else
         close(g_ds4_lock_fd);
+#endif
         g_ds4_lock_fd = -1;
     }
 }
@@ -1699,19 +1717,51 @@ static void ds4_release_instance_lock(void) {
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+#if defined(_WIN32)
+    std::string fallback;
+    if (!path || !path[0]) {
+        std::error_code temp_error;
+        const auto temp_dir = std::filesystem::temp_directory_path(temp_error);
+        fallback = temp_error ? std::string("ds4.lock")
+                              : (temp_dir / "ds4.lock").string();
+        path = fallback.c_str();
+    }
+    const int fd = _sopen(path, _O_RDWR | _O_CREAT, _SH_DENYNO,
+                          _S_IREAD | _S_IWRITE);
+#else
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
+#endif
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         throw std::runtime_error("DeepSeek instance lock unavailable");
     }
+#if !defined(_WIN32)
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
 
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+#if defined(_WIN32)
+    /* A one-byte exclusive region at the start of the file stands in for
+     * flock(LOCK_EX | LOCK_NB); the OS releases it when the process dies. */
+    _lseek(fd, 0, SEEK_SET);
+    const int lock_result = _locking(fd, _LK_NBLCK, 1);
+#else
+    const int lock_result = flock(fd, LOCK_EX | LOCK_NB);
+#endif
+    if (lock_result != 0) {
+#if defined(_WIN32)
+        if (errno == EACCES || errno == EDEADLOCK) {
+#else
         if (errno == EWOULDBLOCK) {
+#endif
             char buf[64];
+#if defined(_WIN32)
+            _lseek(fd, 0, SEEK_SET);
+            const int n = _read(fd, buf, sizeof(buf) - 1);
+#else
             const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+#endif
             long owner = -1;
             if (n > 0) {
                 buf[n] = '\0';
@@ -1723,20 +1773,45 @@ static void ds4_acquire_instance_lock(void) {
             } else {
                 fprintf(stderr, "ds4: another ds4 process is already running; refusing to start\n");
             }
+#if defined(_WIN32)
+            _close(fd);
+#else
             close(fd);
+#endif
             throw std::runtime_error("DeepSeek instance lock unavailable");
         }
         fprintf(stderr, "ds4: failed to lock %s: %s\n", path, strerror(errno));
+#if defined(_WIN32)
+        _close(fd);
+#else
         close(fd);
+#endif
         throw std::runtime_error("DeepSeek instance lock unavailable");
     }
 
+#if defined(_WIN32)
+    if (_chsize(fd, 0) != 0) {
+#else
     if (ftruncate(fd, 0) != 0) {
+#endif
         fprintf(stderr, "ds4: failed to truncate lock file %s: %s\n", path, strerror(errno));
+#if defined(_WIN32)
+        _close(fd);
+#else
         close(fd);
+#endif
         throw std::runtime_error("DeepSeek instance lock unavailable");
     }
-    dprintf(fd, "%ld\n", (long)getpid());
+    {
+        char owner[32];
+#if defined(_WIN32)
+        const int n = snprintf(owner, sizeof(owner), "%ld\n", (long)_getpid());
+        if (n > 0) (void)_write(fd, owner, (unsigned)n);
+#else
+        const int n = dprintf(fd, "%ld\n", (long)getpid());
+        (void)n;
+#endif
+    }
     g_ds4_lock_fd = fd;
 }
 

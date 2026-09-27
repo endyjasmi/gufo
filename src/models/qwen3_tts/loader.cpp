@@ -1,9 +1,11 @@
 #include "src/models/qwen3_tts/loader.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -17,6 +19,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {
@@ -49,33 +52,21 @@ public:
 
   /// Maps the file read-only. Returns false on failure.
   bool Open(const std::string& path) {
-    struct stat status{};
-    if (stat(path.c_str(), &status) != 0 || status.st_size <= 0) {
+    if (!mapped_.Open(path.c_str()))
       return false;
-    }
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-      return false;
-    }
-    void* mapped = mmap(nullptr, static_cast<std::size_t>(status.st_size),
-                        PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (mapped == MAP_FAILED) {
-      return false;
-    }
-    base_ = mapped;
-    size_ = static_cast<std::size_t>(status.st_size);
+    base_ = mapped_.data;
+    size_ = mapped_.size;
     return true;
   }
 
 private:
   void Unmap() {
-    if (base_ != nullptr) {
-      munmap(base_, size_);
-      base_ = nullptr;
-    }
+    mapped_.Close();
+    base_ = nullptr;
+    size_ = 0;
   }
 
+  platform::RawMappedFile mapped_;
   void* base_ = nullptr;
   std::size_t size_ = 0;
 };
@@ -196,8 +187,8 @@ std::vector<MappedRegion> LoadResult::RegionsFor(
   std::vector<MappedRegion> result;
   if (!store)
     return result;
-  const auto page_size = sysconf(_SC_PAGESIZE);
-  if (page_size <= 0 || page_size % 16 != 0)
+  const auto page_size = platform::SystemPageSize();
+  if (page_size % 16 != 0)
     throw std::runtime_error("TTS cannot determine mapped weight alignment");
   for (const auto& region : mapped_regions) {
     std::size_t begin = region.size, end = 0;

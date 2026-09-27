@@ -1,9 +1,11 @@
 #include "src/models/qwen3_asr/loader.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -17,6 +19,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {
@@ -32,23 +35,10 @@ public:
   MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] bool Open(const std::filesystem::path& path) {
-    struct stat status{};
-    if (stat(path.c_str(), &status) != 0 || status.st_size <= 0) {
+    if (!mapped_.Open(path.string().c_str()))
       return false;
-    }
-    const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (descriptor < 0) {
-      return false;
-    }
-    void* mapping = mmap(nullptr, static_cast<std::size_t>(status.st_size),
-                         PROT_READ, MAP_PRIVATE, descriptor, 0);
-    close(descriptor);
-    if (mapping == MAP_FAILED) {
-      return false;
-    }
-    data_ = mapping;
-    size_ = static_cast<std::size_t>(status.st_size);
-    (void)madvise(data_, size_, MADV_SEQUENTIAL);
+    data_ = mapped_.data;
+    size_ = mapped_.size;
     return true;
   }
 
@@ -59,13 +49,12 @@ public:
 
 private:
   void Reset() noexcept {
-    if (data_ != nullptr) {
-      (void)munmap(data_, size_);
-      data_ = nullptr;
-      size_ = 0;
-    }
+    mapped_.Close();
+    data_ = nullptr;
+    size_ = 0;
   }
 
+  platform::RawMappedFile mapped_;
   void* data_{nullptr};
   std::size_t size_{0};
 };
@@ -179,8 +168,8 @@ std::vector<MappedRegion> LoadResult::RegionsFor(
   std::vector<MappedRegion> result;
   if (!store)
     return result;
-  const auto system_page_bytes = sysconf(_SC_PAGESIZE);
-  if (system_page_bytes <= 0 || system_page_bytes % 16 != 0)
+  const auto system_page_bytes = platform::SystemPageSize();
+  if (system_page_bytes % 16 != 0)
     throw std::runtime_error("ASR cannot determine mapped weight alignment");
   const auto page_bytes = static_cast<std::size_t>(system_page_bytes);
   for (const auto& region : mapped_regions) {

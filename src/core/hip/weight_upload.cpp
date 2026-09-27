@@ -1,9 +1,6 @@
 #include "src/core/hip/weight_upload.hpp"
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +14,14 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace gufo::hip {
 namespace {
 
@@ -24,6 +29,26 @@ constexpr std::size_t kAlignment = 4096;
 constexpr std::size_t kChunkBytes = 16ULL << 20;
 constexpr std::size_t kReaders = 16;
 
+#if defined(_WIN32)
+// Positional read on a HANDLE; equivalent of pread for a shared file handle.
+bool ReadFully(HANDLE file, void* buffer, std::uint64_t offset,
+               std::size_t length, std::size_t required) {
+  std::size_t got = 0;
+  while (got < required) {
+    OVERLAPPED overlapped{};
+    overlapped.Offset = static_cast<DWORD>(offset + got);
+    overlapped.OffsetHigh = static_cast<DWORD>((offset + got) >> 32);
+    DWORD read_bytes = 0;
+    if (!ReadFile(file, static_cast<char*>(buffer) + got,
+                  static_cast<DWORD>(length - got), &read_bytes, &overlapped) ||
+        read_bytes == 0) {
+      return false;
+    }
+    got += read_bytes;
+  }
+  return true;
+}
+#else
 bool ReadFully(int fd, void* buffer, std::uint64_t offset, std::size_t length,
                std::size_t required) {
   std::size_t got = 0;
@@ -43,13 +68,19 @@ bool ReadFully(int fd, void* buffer, std::uint64_t offset, std::size_t length,
   }
   return true;
 }
+#endif
 
 }  // namespace
 
 struct WeightUpload::State {
   struct Shard {
+#if defined(_WIN32)
+    HANDLE file{INVALID_HANDLE_VALUE};
+    HANDLE unbuffered{INVALID_HANDLE_VALUE};
+#else
     int fd{-1};
     int direct_fd{-1};
+#endif
     std::uint64_t size{0};
   };
   struct Slot {
@@ -91,12 +122,21 @@ struct WeightUpload::State {
       }
     }
     for (const auto& shard : shards) {
+#if defined(_WIN32)
+      if (shard.file != INVALID_HANDLE_VALUE) {
+        CloseHandle(shard.file);
+      }
+      if (shard.unbuffered != INVALID_HANDLE_VALUE) {
+        CloseHandle(shard.unbuffered);
+      }
+#else
       if (shard.fd >= 0) {
         ::close(shard.fd);
       }
       if (shard.direct_fd >= 0) {
         ::close(shard.direct_fd);
       }
+#endif
     }
   }
 
@@ -121,6 +161,25 @@ struct WeightUpload::State {
     const auto& shard = shards[task.shard];
     const void* payload = slot.buffer;
     bool read = false;
+#if defined(_WIN32)
+    if (shard.unbuffered != INVALID_HANDLE_VALUE) {
+      const auto begin = task.offset & ~(kAlignment - 1);
+      const auto skip = static_cast<std::size_t>(task.offset - begin);
+      const auto length =
+          (skip + task.size + kAlignment - 1) & ~(kAlignment - 1);
+      read = ReadFully(shard.unbuffered, slot.buffer, begin, length,
+                       skip + task.size);
+      payload = static_cast<const char*>(slot.buffer) + skip;
+    }
+    if (!read) {
+      // Sector-size mismatches and EOF tails fall back to the cached handle.
+      if (!ReadFully(shard.file, slot.buffer, task.offset, task.size,
+                     task.size)) {
+        return "shard read failed";
+      }
+      payload = slot.buffer;
+    }
+#else
     if (shard.direct_fd >= 0) {
       const auto begin = task.offset & ~(kAlignment - 1);
       const auto skip = static_cast<std::size_t>(task.offset - begin);
@@ -143,6 +202,7 @@ struct WeightUpload::State {
       (void)::posix_fadvise(shard.fd, static_cast<off_t>(task.offset),
                             static_cast<off_t>(task.size), POSIX_FADV_DONTNEED);
     }
+#endif
     auto status = hipMemcpyAsync(task.destination, payload, task.size,
                                  hipMemcpyHostToDevice, slot.stream);
     if (status == hipSuccess) {
@@ -189,6 +249,29 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
   auto& s = *uploader->state_;
   for (const auto& region : regions) {
     auto& shard = s.shards.emplace_back();
+#if defined(_WIN32)
+    // The mapping carries no POSIX descriptor on Windows; reopen the source
+    // path, cached for throughput and unbuffered to skip the page cache.
+    shard.file =
+        CreateFileA(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (shard.file == INVALID_HANDLE_VALUE) {
+      s.Fail("cannot read the mapped GGUF shard");
+      s.Status(error);
+      return nullptr;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(shard.file, &size) || size.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(size.QuadPart) != region.size) {
+      s.Fail("cannot read the mapped GGUF shard");
+      s.Status(error);
+      return nullptr;
+    }
+    shard.size = static_cast<std::uint64_t>(size.QuadPart);
+    shard.unbuffered =
+        CreateFileA(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+#else
     shard.fd = ::fcntl(region.file_descriptor, F_DUPFD_CLOEXEC, 0);
     struct stat info{};
     if (shard.fd < 0 || ::fstat(shard.fd, &info) != 0 || info.st_size <= 0 ||
@@ -202,6 +285,7 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     // description without resolving the original, replaceable pathname.
     const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
     shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+#endif
   }
   for (auto& slot : s.slots) {
     if (hipHostMalloc(&slot.buffer, kChunkBytes + kAlignment) != hipSuccess ||

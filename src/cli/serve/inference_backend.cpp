@@ -1,7 +1,9 @@
-#include "src/cli/serve/inference_backend.hpp"
-
+#if defined(_WIN32)
+#include <process.h>
+#endif
+#if !defined(_WIN32)
 #include <unistd.h>
-
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -20,6 +22,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"

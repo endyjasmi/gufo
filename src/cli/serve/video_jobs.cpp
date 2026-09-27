@@ -1,7 +1,9 @@
-#include "src/cli/serve/video_jobs.hpp"
-
+#if defined(_WIN32)
+#include <process.h>
+#endif
+#if !defined(_WIN32)
 #include <unistd.h>
-
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,6 +28,7 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/video_jobs.hpp"
 #include "src/core/json.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
@@ -175,7 +178,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(getpid()) + "-" +
+                                        std::to_string(_getpid()) + "-" +
                                         std::to_string(NextFileNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);

@@ -1,3 +1,14 @@
+#if defined(_WIN32)
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#endif
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "backend.h"
 #include <hipblaslt/hipblaslt.h>
 
@@ -27,14 +38,10 @@ extern "C" int ds4_hip_q8_fold_take_q81(
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>

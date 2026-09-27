@@ -1,7 +1,9 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
+#if !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -113,7 +115,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
     m->ngram_ = NgramTable::Open(
-        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
+        m->reader_->GetMappedRegions()[t.shard].file_descriptor,
+        m->reader_->GetMappedRegions()[t.shard].source_path, t.file_offset,
         t.rows, c.ple_head_dim, t.type, error_msg);
     if (!m->ngram_) {
       return nullptr;
@@ -437,6 +440,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
 
 SessionSnapshot::SessionSnapshot(std::uint64_t size)
     : data_(new std::uint8_t[size]), size_(size) {
+#if !defined(_WIN32)
   // Snapshot copies first-touch hundreds of MiB. Let Linux back the interior
   // with transparent huge pages instead of faulting one 4 KiB page at a time.
   // Advise only complete pages belonging to this allocation; this is optional
@@ -451,6 +455,7 @@ SessionSnapshot::SessionSnapshot(std::uint64_t size)
         (void)madvise(data_.get() + skip, length, MADV_HUGEPAGE);
     }
   }
+#endif
 }
 
 bool SessionSnapshot::CopyTo(

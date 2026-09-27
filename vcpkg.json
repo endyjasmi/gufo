@@ -1,0 +1,11 @@
+{
+  "name": "gufo",
+  "version": "0.0.0-dev",
+  "dependencies": [
+    "icu",
+    "curl",
+    "openssl",
+    "libpng",
+    "libjpeg-turbo"
+  ]
+}

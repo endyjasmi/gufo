@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/platform/mapped_file.hpp"
+
 #include "model.h"
 #include "tensor_types.h"
 
@@ -71,6 +73,7 @@ struct ds4_tensor {
 
 struct ds4_model {
     int fd;
+    gufo::platform::RawMappedFile mapping;
     const uint8_t *map;
     uint64_t size;
     uint32_t version;

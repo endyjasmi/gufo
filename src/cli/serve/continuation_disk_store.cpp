@@ -1,9 +1,16 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -79,7 +86,11 @@ public:
       : descriptor_(descriptor) {}
   ~ScopedFileDescriptor() {
     if (descriptor_ >= 0) {
+#if defined(_WIN32)
+      _close(descriptor_);
+#else
       ::close(descriptor_);
+#endif
     }
   }
 
@@ -91,7 +102,11 @@ public:
   ScopedFileDescriptor& operator=(ScopedFileDescriptor&& other) noexcept {
     if (this != &other) {
       if (descriptor_ >= 0) {
+#if defined(_WIN32)
+        _close(descriptor_);
+#else
         ::close(descriptor_);
+#endif
       }
       descriptor_ = std::exchange(other.descriptor_, -1);
     }
@@ -247,12 +262,19 @@ std::string ErrnoMessage(std::string_view operation) {
 bool WriteAll(int descriptor, std::span<const std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
+#if defined(_WIN32)
+    const int written = _write(descriptor, bytes.data() + offset,
+                               static_cast<unsigned>(bytes.size() - offset));
+#else
     const ssize_t written =
         ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+#endif
     if (written < 0) {
+#if !defined(_WIN32)
       if (errno == EINTR) {
         continue;
       }
+#endif
       return false;
     }
     if (written == 0) {
@@ -266,12 +288,19 @@ bool WriteAll(int descriptor, std::span<const std::uint8_t> bytes) noexcept {
 bool ReadAll(int descriptor, std::span<std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
+#if defined(_WIN32)
+    const int count = _read(descriptor, bytes.data() + offset,
+                            static_cast<unsigned>(bytes.size() - offset));
+#else
     const ssize_t count =
         ::read(descriptor, bytes.data() + offset, bytes.size() - offset);
+#endif
     if (count < 0) {
+#if !defined(_WIN32)
       if (errno == EINTR) {
         continue;
       }
+#endif
       return false;
     }
     if (count == 0) {
@@ -548,9 +577,11 @@ struct ContinuationDiskStore::Impl {
     queue_changed.notify_all();
     if (writer.joinable())
       writer.join();
+#if !defined(_WIN32)
     if (directory_fd >= 0) {
       ::close(directory_fd);
     }
+#endif
   }
 
   void PersistQueued() noexcept {
@@ -621,6 +652,15 @@ struct ContinuationDiskStore::Impl {
       }
     }
 
+#if defined(_WIN32)
+    // The ownership/symlink/mode hardening is a POSIX permissions model; on
+    // Windows validate that the path is a real directory and keep operating
+    // on joined paths instead of a directory descriptor.
+    if (!std::filesystem::is_directory(options.directory, error) || error) {
+      throw std::runtime_error(
+          "continuation disk directory is not a directory");
+    }
+#else
     struct stat status{};
     if (::lstat(options.directory.c_str(), &status) != 0) {
       throw std::runtime_error(
@@ -642,6 +682,7 @@ struct ContinuationDiskStore::Impl {
       throw std::runtime_error(
           ErrnoMessage("failed to open continuation disk directory"));
     }
+#endif
   }
 
   void Emit(ContinuationDiskEventAction action,
@@ -716,6 +757,21 @@ struct ContinuationDiskStore::Impl {
         filename.find("..") != std::string_view::npos || status == nullptr) {
       return false;
     }
+#if defined(_WIN32)
+    // _stat64 follows the joined path; symlinks are rejected via
+    // symlink_status because CRT stat reports link targets.
+    const auto joined = options.directory / std::string(filename);
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(joined))) {
+      return false;
+    }
+    struct _stat64 info{};
+    if (_stat64(joined.string().c_str(), &info) != 0) {
+      return false;
+    }
+    *status = {};
+    status->st_size = static_cast<off_t>(info.st_size);
+    return (info.st_mode & S_IFMT) == S_IFREG;
+#else
     if (::fstatat(directory_fd, std::string(filename).c_str(), status,
                   AT_SYMLINK_NOFOLLOW) != 0) {
       return false;
@@ -724,6 +780,7 @@ struct ContinuationDiskStore::Impl {
            status->st_uid == ::geteuid() &&
            (status->st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
            (status->st_mode & S_IRUSR) != 0;
+#endif
   }
 
   [[nodiscard]] bool ReadImage(std::string_view filename,
@@ -748,6 +805,15 @@ struct ContinuationDiskStore::Impl {
                             : ContinuationDiskEventReason::kCorrupt;
       return false;
     }
+#if defined(_WIN32)
+    const ScopedFileDescriptor file(
+        _open((options.directory / std::string(filename)).string().c_str(),
+              _O_RDONLY | _O_BINARY));
+    if (!file) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+#else
     const ScopedFileDescriptor file(
         ::openat(directory_fd, std::string(filename).c_str(),
                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
@@ -755,6 +821,7 @@ struct ContinuationDiskStore::Impl {
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
       return false;
     }
+#endif
     image->resize(static_cast<std::size_t>(status.st_size));
     if (!ReadAll(file.get(), *image)) {
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
@@ -762,10 +829,18 @@ struct ContinuationDiskStore::Impl {
     }
     std::uint8_t trailing = 0;
     while (true) {
+#if defined(_WIN32)
+      const int count = _read(file.get(), &trailing, 1);
+      if (count < 0) {
+        *failure_reason = ContinuationDiskEventReason::kIoFailure;
+        return false;
+      }
+#else
       const ssize_t count = ::read(file.get(), &trailing, 1);
       if (count < 0 && errno == EINTR) {
         continue;
       }
+#endif
       if (count != 0) {
         *failure_reason = count < 0 ? ContinuationDiskEventReason::kIoFailure
                                     : ContinuationDiskEventReason::kCorrupt;
@@ -777,9 +852,16 @@ struct ContinuationDiskStore::Impl {
   }
 
   void RemoveFileOnly(std::string_view filename) const noexcept {
-    if (!filename.empty()) {
-      (void)::unlinkat(directory_fd, std::string(filename).c_str(), 0);
+    if (filename.empty()) {
+      return;
     }
+#if defined(_WIN32)
+    std::error_code ignored;
+    (void)std::filesystem::remove(options.directory / std::string(filename),
+                                  ignored);
+#else
+    (void)::unlinkat(directory_fd, std::string(filename).c_str(), 0);
+#endif
   }
 
   void IndexExistingFiles() {
@@ -916,6 +998,17 @@ struct ContinuationDiskStore::Impl {
     if (entry == entries.end()) {
       return true;
     }
+#if defined(_WIN32)
+    std::error_code remove_error;
+    (void)std::filesystem::remove(options.directory / entry->filename,
+                                  remove_error);
+    if (remove_error) {
+      Emit(ContinuationDiskEventAction::kSkipped,
+           ContinuationDiskEventReason::kIoFailure, entry->file_bytes,
+           entry->payload_bytes, entry->tokens.size());
+      return false;
+    }
+#else
     if (::unlinkat(directory_fd, entry->filename.c_str(), 0) != 0 &&
         errno != ENOENT) {
       Emit(ContinuationDiskEventAction::kSkipped,
@@ -923,6 +1016,7 @@ struct ContinuationDiskStore::Impl {
            entry->payload_bytes, entry->tokens.size());
       return false;
     }
+#endif
     const std::size_t file_bytes = entry->file_bytes;
     const std::size_t payload_bytes = entry->payload_bytes;
     const std::size_t token_count = entry->tokens.size();
@@ -977,7 +1071,13 @@ struct ContinuationDiskStore::Impl {
         (static_cast<std::uint64_t>(random_device()) << 32U) ^
         static_cast<std::uint64_t>(random_device()) ^
         static_cast<std::uint64_t>(++unique_counter) ^
-        static_cast<std::uint64_t>(::getpid());
+        static_cast<std::uint64_t>(
+#if defined(_WIN32)
+            _getpid()
+#else
+            ::getpid()
+#endif
+        );
     std::ostringstream output;
     output << std::hex << std::setfill('0') << std::setw(16) << random_value;
     return output.str();
@@ -987,12 +1087,18 @@ struct ContinuationDiskStore::Impl {
     for (int attempt = 0; attempt < 64; ++attempt) {
       const std::string filename =
           digest + "-" + UniqueSuffix() + std::string(kFileSuffix);
+#if defined(_WIN32)
+      if (!std::filesystem::exists(options.directory / filename)) {
+        return filename;
+      }
+#else
       struct stat status{};
       if (::fstatat(directory_fd, filename.c_str(), &status,
                     AT_SYMLINK_NOFOLLOW) != 0 &&
           errno == ENOENT) {
         return filename;
       }
+#endif
     }
     throw std::runtime_error("failed to allocate a continuation disk filename");
   }
@@ -1004,10 +1110,16 @@ struct ContinuationDiskStore::Impl {
                                   std::size_t payload_bytes) {
     const std::string temporary_filename =
         std::string(kTemporaryPrefix) + UniqueSuffix();
+#if defined(_WIN32)
+    ScopedFileDescriptor temporary(_open(
+        (options.directory / temporary_filename).string().c_str(),
+        _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE));
+#else
     ScopedFileDescriptor temporary(
         ::openat(directory_fd, temporary_filename.c_str(),
                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                  S_IRUSR | S_IWUSR));
+#endif
     if (!temporary) {
       return false;
     }
@@ -1039,7 +1151,12 @@ struct ContinuationDiskStore::Impl {
         throw std::runtime_error("snapshot serialization truncated");
       }
       const auto checksum = hasher.FinishHex();
+#if defined(_WIN32)
+      if (_lseek(temporary.get(), static_cast<long>(kChecksumOffset),
+                 SEEK_SET) < 0 ||
+#else
       if (::lseek(temporary.get(), kChecksumOffset, SEEK_SET) < 0 ||
+#endif
           !WriteAll(temporary.get(),
                     {reinterpret_cast<const std::uint8_t*>(checksum.data()),
                      checksum.size()})) {
@@ -1048,15 +1165,36 @@ struct ContinuationDiskStore::Impl {
     } catch (...) {
       valid = false;
     }
+#if defined(_WIN32)
+    valid = valid && _commit(temporary.get()) == 0;
+#else
     valid = valid && ::fsync(temporary.get()) == 0;
+#endif
     const int raw_descriptor = temporary.release();
+#if defined(_WIN32)
+    if (_close(raw_descriptor) != 0) {
+      valid = false;
+    }
+#else
     if (::close(raw_descriptor) != 0) {
       valid = false;
     }
+#endif
     if (!valid) {
       RemoveFileOnly(temporary_filename);
       return false;
     }
+#if defined(_WIN32)
+    // NTFS journaling covers the rename; the file bytes were committed above.
+    std::error_code rename_error;
+    std::filesystem::rename(options.directory / temporary_filename,
+                            options.directory / std::string(final_filename),
+                            rename_error);
+    if (rename_error) {
+      RemoveFileOnly(temporary_filename);
+      return false;
+    }
+#else
     if (::renameat(directory_fd, temporary_filename.c_str(), directory_fd,
                    std::string(final_filename).c_str()) != 0) {
       RemoveFileOnly(temporary_filename);
@@ -1067,6 +1205,7 @@ struct ContinuationDiskStore::Impl {
       (void)::fsync(directory_fd);
       return false;
     }
+#endif
     return true;
   }
 
@@ -1285,8 +1424,10 @@ struct ContinuationDiskStore::Impl {
 
   void TouchEntry(EntryIterator entry) {
     entry->last_access = std::filesystem::file_time_type::clock::now();
+#if !defined(_WIN32)
     (void)::utimensat(directory_fd, entry->filename.c_str(), nullptr,
                       AT_SYMLINK_NOFOLLOW);
+#endif
   }
 
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(

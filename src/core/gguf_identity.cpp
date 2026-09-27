@@ -1,5 +1,6 @@
 #include "src/core/gguf_identity.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -250,3 +251,154 @@ std::string GgufIdentityHex(const GgufReader& reader) {
 }
 
 }  // namespace gufo::core
+#else  // defined(_WIN32)
+#include <windows.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "src/core/crypto/sha256.hpp"
+
+namespace gufo::core {
+namespace {
+
+void HashString(crypto::Sha256Hasher& hash, std::string_view value) {
+  hash.Update(
+      {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
+}
+
+// The volume serial and file index identify the file as uniquely as
+// POSIX dev:ino; write and creation times plus size complete the stamp.
+std::string FileStamp(const std::string& path, std::size_t size) {
+  const HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                  nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    throw std::runtime_error("GGUF file changed or cannot be inspected");
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (!GetFileInformationByHandle(file, &info) ||
+      (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32 |
+       info.nFileSizeLow) != size) {
+    CloseHandle(file);
+    throw std::runtime_error("GGUF file changed or cannot be inspected");
+  }
+  CloseHandle(file);
+  return std::to_string(info.dwVolumeSerialNumber) + ':' +
+         std::to_string(static_cast<std::uint64_t>(info.nFileIndexHigh) << 32 |
+                        info.nFileIndexLow) +
+         ':' + std::to_string(size) + ':' +
+         std::to_string(
+             static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime)
+                 << 32 |
+             info.ftLastWriteTime.dwLowDateTime) +
+         ':' +
+         std::to_string(
+             static_cast<std::uint64_t>(info.ftCreationTime.dwHighDateTime)
+                 << 32 |
+             info.ftCreationTime.dwLowDateTime);
+}
+
+std::filesystem::path CacheDirectory() {
+  const char* base = std::getenv("LOCALAPPDATA");
+  if (base == nullptr || *base == '\0')
+    return {};
+  std::error_code error;
+  const auto path = std::filesystem::path(base) / "gufo" / "gguf-sha256-v1";
+  std::filesystem::create_directories(path, error);
+  if (error)
+    return {};
+  return path;
+}
+
+std::string ReadDigest(const std::filesystem::path& directory,
+                       const std::string& key) {
+  if (directory.empty())
+    return {};
+  std::ifstream input(directory / key, std::ios::binary);
+  std::array<char, 65> bytes{};
+  if (!input.read(bytes.data(), static_cast<std::streamsize>(bytes.size())) ||
+      input.get() != std::char_traits<char>::eof() || bytes.back() != '\n' ||
+      !std::all_of(bytes.begin(), bytes.end() - 1, [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+      }))
+    return {};
+  return {bytes.data(), bytes.size() - 1};
+}
+
+void StoreDigest(const std::filesystem::path& directory, const std::string& key,
+                 const std::string& digest) {
+  if (directory.empty())
+    return;
+  const auto temporary = directory / ("." + key);
+  {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output << digest << '\n';
+    if (!output.good())
+      return;
+  }
+  std::error_code ignored;
+  std::filesystem::rename(temporary, directory / key, ignored);
+}
+
+// Hashing reads the existing read-only mapping directly: the same resident
+// pages the loader produced, with no second copy of the weights.
+std::string RegionDigest(const GgufMappedRegion& region) {
+  std::string stamp;
+  if (!region.source_path.empty())
+    stamp = FileStamp(region.source_path, region.size);
+  const auto directory =
+      stamp.empty() ? std::filesystem::path{} : CacheDirectory();
+  crypto::Sha256Hasher key_hash;
+  HashString(key_hash, stamp);
+  const auto key = key_hash.FinishHex();
+  std::string digest = ReadDigest(directory, key);
+  const bool cached = !digest.empty();
+  if (!cached) {
+    crypto::Sha256Hasher hash;
+    constexpr std::size_t chunk = 8 * 1024 * 1024;
+    const auto* bytes = static_cast<const std::uint8_t*>(region.data);
+    for (std::size_t offset = 0; offset < region.size;) {
+      const auto length = std::min(chunk, region.size - offset);
+      hash.Update({bytes + offset, length});
+      offset += length;
+    }
+    digest = hash.FinishHex();
+  }
+  if (!stamp.empty() && FileStamp(region.source_path, region.size) != stamp)
+    throw std::runtime_error("GGUF file changed during identity lookup");
+  if (!cached)
+    StoreDigest(directory, key, digest);
+  return digest;
+}
+
+}  // namespace
+
+std::string GgufIdentityHex(const GgufReader& reader) {
+  std::vector<std::string> stamps;
+  for (const auto& region : reader.GetMappedRegions())
+    stamps.push_back(region.source_path.empty()
+                         ? std::string{}
+                         : FileStamp(region.source_path, region.size));
+  crypto::Sha256Hasher hash;
+  HashString(hash, kGgufIdentityScheme);
+  for (const auto& region : reader.GetMappedRegions()) {
+    HashString(hash, ":" + std::to_string(region.size) + ":");
+    HashString(hash, RegionDigest(region));
+  }
+  for (std::size_t index = 0; index < stamps.size(); ++index) {
+    const auto& region = reader.GetMappedRegions()[index];
+    if (!stamps[index].empty() &&
+        stamps[index] != FileStamp(region.source_path, region.size))
+      throw std::runtime_error("GGUF artifact changed during identity lookup");
+  }
+  return hash.FinishHex();
+}
+
+}  // namespace gufo::core
+#endif  // defined(_WIN32)

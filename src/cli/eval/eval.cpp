@@ -1,7 +1,9 @@
-#include "src/cli/eval/eval.hpp"
-
+#if defined(_WIN32)
+#include <process.h>
+#endif
+#if !defined(_WIN32)
 #include <unistd.h>
-
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -20,6 +22,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/eval/eval.hpp"
 #include "src/core/json.hpp"
 #include "src/eval/dataset.hpp"
 #include "src/eval/extract.hpp"
@@ -334,7 +337,7 @@ bool WriteReport(const std::filesystem::path& output, const Value& report,
     return false;
   }
   std::filesystem::path temporary = output;
-  temporary += ".tmp-" + std::to_string(static_cast<long long>(getpid()));
+  temporary += ".tmp-" + std::to_string(static_cast<long long>(_getpid()));
   {
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
