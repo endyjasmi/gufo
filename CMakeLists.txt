@@ -9,7 +9,8 @@ endif()
 if (WIN32)
   # Declared before any subdirectory: windows.h must never define the
   # min/max macros that break std::min/std::max and rocPRIM device headers.
-  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # PSAPI_VERSION=2 resolves GetProcessMemoryInfo through kernel32 directly.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN PSAPI_VERSION=2)
 endif()
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -120,7 +121,7 @@ endif()
 
 if (WIN32)
   # Platform layer: WinSock (net), process memory counters (logging).
-  set(GUFO_PLATFORM_LIBS ws2_32 psapi)
+  set(GUFO_PLATFORM_LIBS ws2_32)
 endif()
 
 add_library(gufo_diagnostics STATIC

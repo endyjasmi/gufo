@@ -2,10 +2,14 @@
 
 #if defined(_WIN32)
 #include <io.h>
-#include <psapi.h>  // after windows.h: needs BOOL/DWORD definitions
-#include <windows.h>
+#include <windows.h>  // PSAPI_VERSION=2: GetProcessMemoryInfo via kernel32
 #else
 #include <unistd.h>
+#endif
+// A separate conditional keeps psapi.h after windows.h under include
+// regrouping; psapi.h needs the BOOL/DWORD definitions from windows.h.
+#if defined(_WIN32)
+#include <psapi.h>
 #endif
 
 #include <array>
