@@ -16,7 +16,10 @@ import hashlib
 import json
 import os
 import platform
-import resource
+try:
+    import resource
+except ModuleNotFoundError:  # POSIX-only; Windows reports zeroed rusage.
+    resource = None
 import signal
 import statistics
 import subprocess
@@ -277,6 +280,18 @@ def public_descriptor(
 
 
 def child_rusage() -> dict[str, float | int]:
+    if resource is None:
+        return {
+            "user_seconds": 0,
+            "system_seconds": 0,
+            "maximum_rss_kib": 0,
+            "minor_page_faults": 0,
+            "major_page_faults": 0,
+            "block_inputs": 0,
+            "block_outputs": 0,
+            "voluntary_context_switches": 0,
+            "involuntary_context_switches": 0,
+        }
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     return {
         "user_seconds": usage.ru_utime,

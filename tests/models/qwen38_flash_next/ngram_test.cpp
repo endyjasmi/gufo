@@ -1,8 +1,13 @@
 // PLE n-gram hashing and disk row reads, checked without the model.
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <cstdio>
@@ -20,11 +25,23 @@ std::unique_ptr<q::NgramTable> OpenTable(const std::filesystem::path& path,
                                          std::uint64_t rows, std::uint32_t dim,
                                          gufo::core::GgmlType type,
                                          std::string* error) {
+#if defined(_WIN32)
+  HANDLE file =
+      ::CreateFileA(path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  auto table =
+      q::NgramTable::Open(file != INVALID_HANDLE_VALUE ? 0 : -1, path.string(),
+                          offset, rows, dim, type, error);
+  if (file != INVALID_HANDLE_VALUE)
+    ::CloseHandle(file);
+  return table;
+#else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   auto table = q::NgramTable::Open(fd, offset, rows, dim, type, error);
   if (fd >= 0)
     ::close(fd);
   return table;
+#endif
 }
 
 q::Config FlashNextPle() {
@@ -334,6 +351,11 @@ void TestDistantRows() {
 }
 
 void TestReplacedPath() {
+#if defined(_WIN32)
+  // The Windows table binds by path, so the POSIX open-inode-then-replace
+  // scenario does not exist there.
+  return;
+#else
   char name[] = "/tmp/qwen-ngram-bound-XXXXXX";
   const int fd = ::mkstemp(name);
   Check(fd >= 0, "create bound table");
@@ -358,6 +380,7 @@ void TestReplacedPath() {
     Check(table->Read(ids, output) && output[0] == 1.0F,
           "PLE reads original weights after replacement and descriptor close");
   std::filesystem::remove(name);
+#endif
 }
 
 }  // namespace

@@ -1,4 +1,10 @@
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <process.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -253,7 +259,7 @@ void TestPresetsAndReports() {
 void TestAtomicFrames() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("gufo-h3-generation-test-" + std::to_string(getpid()));
+      ("gufo-h3-generation-test-" + std::to_string(_getpid()));
   const std::filesystem::path target = root / "frames";
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);
@@ -306,7 +312,7 @@ void TestAtomicFrames() {
 void TestAtomicLatents() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("gufo-h3-latent-test-" + std::to_string(getpid()));
+      ("gufo-h3-latent-test-" + std::to_string(_getpid()));
   const std::filesystem::path target = root / "latents";
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);

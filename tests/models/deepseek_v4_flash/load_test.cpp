@@ -1,6 +1,12 @@
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <cstdio>
+#endif
 
 #include <cassert>
 #include <cstdint>
@@ -23,15 +29,24 @@ void String(std::ostream& out, std::string_view text) {
 }
 
 std::size_t OpenDescriptors() {
-  std::size_t count = 0;
-  for ([[maybe_unused]] const auto& file :
-       std::filesystem::directory_iterator("/proc/self/fd"))
+#if !defined(_WIN32)
+  int count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd"))
     ++count;
   return count;
+#else
+  return 0;  // /proc does not exist; the leak check is POSIX-only.
+#endif
 }
 }  // namespace
 
 int main() {
+#if defined(_WIN32)
+  // The lifecycle test leans on /proc fd accounting, mkdtemp, and POSIX
+  // setenv; revisit with the DeepSeek Windows bring-up phase.
+  std::puts("SKIP: POSIX-only lifecycle test");
+  return 77;
+#else
   char directory[] = "/tmp/gufo-ds4-load-XXXXXX";
   assert(::mkdtemp(directory));
   const auto root = std::filesystem::path(directory);
@@ -70,13 +85,24 @@ int main() {
       assert(ds4_engine_open(&engine, &options) != 0);
       assert(engine == nullptr);
       // Failure must release both mapped files and the process lock.
+#if defined(_WIN32)
+      const int lock = _open(lock_path.c_str(), _O_RDWR);
+      assert(lock >= 0);
+      _lseek(lock, 0, SEEK_SET);
+      assert(_locking(lock, _LK_NBLCK, 1) == 0);
+      // A separately held lock must cause another ordinary load failure.
+      assert(ds4_engine_open(&engine, &options) != 0 && engine == nullptr);
+      _close(lock);
+#else
       const int lock = ::open(lock_path.c_str(), O_RDWR);
       assert(lock >= 0 && ::flock(lock, LOCK_EX | LOCK_NB) == 0);
       // A separately held lock must cause another ordinary load failure.
       assert(ds4_engine_open(&engine, &options) != 0 && engine == nullptr);
       ::close(lock);
+#endif
       assert(OpenDescriptors() == descriptors);
     }
   }
   std::filesystem::remove_all(root);
+#endif  // !defined(_WIN32)
 }

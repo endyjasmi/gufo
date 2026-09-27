@@ -110,15 +110,17 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
   HANDLE unbuffered =
-      CreateFileA(source_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                  OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+      CreateFileA(source_path.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
   if (unbuffered != INVALID_HANDLE_VALUE) {
     t->file_handle_ = unbuffered;
     t->direct_ = true;
   } else {
     HANDLE buffered =
-        CreateFileA(source_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        CreateFileA(source_path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (buffered == INVALID_HANDLE_VALUE) {
       if (error_msg != nullptr) {
         *error_msg = "cannot open bound n-gram table: " + source_path;

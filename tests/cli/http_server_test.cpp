@@ -1,9 +1,11 @@
 #include "src/cli/serve/http_server.hpp"
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
+#include "src/core/platform/net.hpp"
+
+#if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -21,6 +23,7 @@
 #include "src/cli/serve/logging.hpp"
 
 namespace {
+namespace net = gufo::net;
 
 using gufo::server::HttpServer;
 using gufo::server::TextGenerationBackend;
@@ -177,9 +180,7 @@ public:
   int Connect() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
-    const timeval timeout{3, 0};
-    assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                        sizeof(timeout)) == 0);
+    assert(gufo::net::SetSocketTimeouts(fd, 3'000));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(server.port());
@@ -191,26 +192,34 @@ public:
   std::string Send(std::string_view request, bool half_close = false) {
     const int fd = Connect();
     while (!request.empty()) {
-      const auto count =
-          ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+      const auto count = net::SendNoSignal(fd, request.data(), request.size());
       assert(count > 0);
       request.remove_prefix(static_cast<std::size_t>(count));
     }
     // A half-close allows malformed/truncated-body tests to complete without
     // timing-dependent sleeps.
     if (half_close)
+#if defined(_WIN32)
+      ::shutdown(fd, SD_SEND);
+#else
       ::shutdown(fd, SHUT_WR);
+#endif
     std::string response;
     char buffer[4096];
     for (;;) {
+#if defined(_WIN32)
+      const auto count =
+          ::recv(fd, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
       const auto count = ::read(fd, buffer, sizeof(buffer));
+#endif
       assert(count >= 0);
       if (count == 0) {
         break;
       }
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     return response;
   }
 
@@ -577,10 +586,10 @@ void TestPeerDisconnect() {
       "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
       "Content-Type: application/json\r\nContent-Length: " +
       std::to_string(body.size()) + "\r\n\r\n" + body;
-  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
-         static_cast<ssize_t>(request.size()));
+  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
+         static_cast<std::intptr_t>(request.size()));
   assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
-  ::close(fd);
+  net::CloseSocket(fd);
   assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
   assert(server.backend->disconnected);
 }
@@ -692,6 +701,11 @@ void TestStreamingFraming() {
 }
 
 void TestSignalShutdown() {
+#if defined(_WIN32)
+  // fork/kill/waitpid process semantics are POSIX; Windows console-event
+  // shutdown is covered by manual serve runs (SetConsoleCtrlHandler).
+#else
+
   // Process signals must never terminate the test runner itself. Prove that
   // both idle listeners and active generation return through normal cleanup.
   for (const int signal : {SIGINT, SIGTERM}) {
@@ -712,7 +726,7 @@ void TestSignalShutdown() {
             const std::string request =
                 "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\n\r\n" + body;
-            assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+            assert(net::SendNoSignal(fd, request.data(), request.size()) ==
                    static_cast<ssize_t>(request.size()));
             assert(server.backend->entered.try_acquire_for(
                 std::chrono::seconds(2)));
@@ -721,7 +735,7 @@ void TestSignalShutdown() {
           assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
           if (active) {
             assert(server.backend->disconnected);
-            ::close(fd);
+            net::CloseSocket(fd);
           }
         }
         ::_exit(0);
@@ -733,20 +747,46 @@ void TestSignalShutdown() {
   }
 }
 
+#endif
+}
 }  // namespace
 
 int main() {
+  std::fprintf(stderr, "hst: TestRequestLogging\n");
+  std::fflush(stderr);
   TestRequestLogging();
+  std::fprintf(stderr, "hst: TestInvalidBindSettings\n");
+  std::fflush(stderr);
   TestInvalidBindSettings();
+  std::fprintf(stderr, "hst: TestQueryParameters\n");
+  std::fflush(stderr);
   TestQueryParameters();
+  std::fprintf(stderr, "hst: TestAuthorization\n");
+  std::fflush(stderr);
   TestAuthorization();
+  std::fprintf(stderr, "hst: TestFramingAndMetrics\n");
+  std::fflush(stderr);
   TestFramingAndMetrics();
+  std::fprintf(stderr, "hst: TestCompatibilityRequests\n");
+  std::fflush(stderr);
   TestCompatibilityRequests();
+  std::fprintf(stderr, "hst: TestCompatibilityStopSequences\n");
+  std::fflush(stderr);
   TestCompatibilityStopSequences();
+  std::fprintf(stderr, "hst: TestCompatibilityThinkingDefaults\n");
+  std::fflush(stderr);
   TestCompatibilityThinkingDefaults();
+  std::fprintf(stderr, "hst: TestCompatibilityUtf8\n");
+  std::fflush(stderr);
   TestCompatibilityUtf8();
+  std::fprintf(stderr, "hst: TestPeerDisconnect\n");
+  std::fflush(stderr);
   TestPeerDisconnect();
+  std::fprintf(stderr, "hst: TestStreamingFraming\n");
+  std::fflush(stderr);
   TestStreamingFraming();
+  std::fprintf(stderr, "hst: TestSignalShutdown\n");
+  std::fflush(stderr);
   TestSignalShutdown();
   std::cout << "HTTP transport checks passed.\n";
 }

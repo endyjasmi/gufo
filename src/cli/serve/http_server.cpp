@@ -143,9 +143,11 @@ bool SendChunk(int fd, std::string_view data) {
 
 bool IsPeerDisconnected(int fd) noexcept {
 #if defined(_WIN32)
+  // WSAPoll rejects POLLERR/POLLHUP as input events (WSAEINVAL); error and
+  // hangup arrive through revents alone.
   PollDescriptor descriptor{};
   descriptor.fd = fd;
-  descriptor.events = kPollIn | kPollErr | kPollHup;
+  descriptor.events = kPollIn;
   const int ready = ::WSAPoll(&descriptor, 1, 0);
   if (ready <= 0)
     return false;
@@ -1208,6 +1210,11 @@ void HttpServer::stop() {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
     (void)::shutdown(listen_fd_, kShutdownBoth);
+#if defined(_WIN32)
+    // Windows shutdown() does not wake a blocking accept(); closing does.
+    net::CloseSocket(listen_fd_);
+    listen_fd_ = -1;
+#endif
   }
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;

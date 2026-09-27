@@ -1,7 +1,9 @@
 #include "src/core/gguf_reader.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -333,9 +335,14 @@ void WriteBinaryFile(const std::filesystem::path& path,
 }
 
 void TestSplitGgufDiscovery() {
-  const auto temp_dir =
-      std::filesystem::temp_directory_path() /
-      ("gufo-gguf-reader-" + std::to_string(static_cast<long>(getpid())));
+  const auto temp_dir = std::filesystem::temp_directory_path() /
+                        ("gufo-gguf-reader-" + std::to_string(static_cast<long>(
+#if defined(_WIN32)
+                                                   _getpid()
+#else
+                                                   getpid()
+#endif
+                                                       )));
   std::filesystem::create_directories(temp_dir);
   const auto first_path = temp_dir / "model-00001-of-00002.gguf";
   const auto second_path = temp_dir / "model-00002-of-00002.gguf";
@@ -601,21 +608,55 @@ void TestIntegerRoutingTensor() {
 }
 
 void TestMappedPrefetch() {
+#if defined(_WIN32)
+  const auto fixture_path =
+      std::filesystem::temp_directory_path() /
+      ("gufo-prefetch-" + std::to_string(_getpid()) + ".bin");
+  {
+    std::ofstream out(fixture_path, std::ios::binary | std::ios::trunc);
+    out.write("", 0);
+  }
+  HANDLE file =
+      ::CreateFileA(fixture_path.string().c_str(), GENERIC_READ | GENERIC_WRITE,
+                    0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Expect(file != INVALID_HANDLE_VALUE, "create prefetch fixture");
+#else
   char path[] = "/tmp/gufo-prefetch-XXXXXX";
   const int fd = mkstemp(path);
   Expect(fd >= 0, "create prefetch fixture");
   unlink(path);
+#endif
   constexpr std::size_t bytes = (17U << 20) + 7;
-  Expect(ftruncate(fd, bytes) == 0, "size two-chunk prefetch fixture");
   const char marker = 'Q';
+#if defined(_WIN32)
+  LARGE_INTEGER size{};
+  size.QuadPart = static_cast<LONGLONG>(bytes);
+  Expect(::SetFilePointerEx(file, size, nullptr, FILE_BEGIN) &&
+             ::SetEndOfFile(file),
+         "size two-chunk prefetch fixture");
+  OVERLAPPED at_tail{};
+  at_tail.Offset = static_cast<DWORD>(bytes - 1);
+  DWORD written = 0;
+  Expect(::WriteFile(file, &marker, 1, &written, &at_tail) && written == 1,
+         "write tail marker");
+  HANDLE section =
+      ::CreateFileMappingA(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+  Expect(section != nullptr, "map prefetch fixture");
+  auto* data = static_cast<const char*>(
+      ::MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, bytes));
+  Expect(data != nullptr, "map prefetch fixture");
+#else
+  Expect(ftruncate(fd, bytes) == 0, "size two-chunk prefetch fixture");
   Expect(pwrite(fd, &marker, 1, bytes - 1) == 1, "write tail marker");
   auto* data = static_cast<const char*>(
       mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0));
   Expect(data != MAP_FAILED, "map prefetch fixture");
+#endif
   gufo::core::PrefaultMappedRange(data + 13, bytes - 13);
   Expect(data[13] == 0 && data[bytes - 1] == marker,
          "parallel unaligned prefetch preserves the complete readable range");
   gufo::core::PrefaultMappedRange(nullptr, 0);
+#if !defined(_WIN32)
   Expect(ftruncate(fd, 4096) == 0, "truncate mapped fixture");
   bool rejected = false;
   try {
@@ -626,6 +667,19 @@ void TestMappedPrefetch() {
   Expect(rejected, "failed parallel reads are joined and propagated");
   munmap(const_cast<char*>(data), bytes);
   close(fd);
+#endif  // the truncate-while-mapped contract is POSIX
+#if defined(_WIN32)
+  if (data != nullptr)
+    ::UnmapViewOfFile(data);
+  if (section != nullptr)
+    ::CloseHandle(section);
+  if (file != INVALID_HANDLE_VALUE)
+    ::CloseHandle(file);
+  std::error_code ignored;
+  std::filesystem::remove(fixture_path, ignored);
+#else
+  ::close(fd);
+#endif
 }
 
 }  // namespace

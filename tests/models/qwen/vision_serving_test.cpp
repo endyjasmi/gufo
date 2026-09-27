@@ -1,4 +1,12 @@
+#if !defined(_WIN32)
+#if !defined(_WIN32)
 #include <unistd.h>
+#if defined(_WIN32)
+#include <process.h>
+#include <windows.h>
+#endif
+#endif
+#endif
 
 #include <array>
 #include <cctype>
@@ -389,6 +397,25 @@ int main(int argc, char** argv) {
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
+#if defined(_WIN32)
+    std::filesystem::path cache_root;
+    bool cache_created = false;
+    for (int attempt = 0; attempt < 64 && !cache_created; ++attempt) {
+      cache_root = std::filesystem::temp_directory_path() /
+                   ("gufo-vision-cache-" + std::to_string(_getpid()) + "-" +
+                    std::to_string(attempt));
+      std::error_code error;
+      cache_created = std::filesystem::create_directory(cache_root, error);
+    }
+    Require(cache_created, "cannot create test cache");
+    struct Cleanup {
+      std::filesystem::path path;
+      ~Cleanup() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+      }
+    } cleanup{cache_root};
+#else
     std::array<char, 64> pattern{};
     const std::string temporary = "/tmp/gufo-vision-cache-XXXXXX";
     std::copy(temporary.begin(), temporary.end(), pattern.begin());
@@ -400,6 +427,7 @@ int main(int argc, char** argv) {
         std::filesystem::remove_all(path, ignored);
       }
     } cleanup{pattern.data()};
+#endif
     server::TextDiskCacheConfig cache{
         .directory = cleanup.path,
         .capacity_bytes = std::size_t{2} << 30,

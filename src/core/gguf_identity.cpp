@@ -277,8 +277,10 @@ void HashString(crypto::Sha256Hasher& hash, std::string_view value) {
 // The volume serial and file index identify the file as uniquely as
 // POSIX dev:ino; write and creation times plus size complete the stamp.
 std::string FileStamp(const std::string& path, std::size_t size) {
-  const HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                  nullptr, OPEN_EXISTING, 0, nullptr);
+  const HANDLE file =
+      CreateFileA(path.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, 0, nullptr);
   if (file == INVALID_HANDLE_VALUE)
     throw std::runtime_error("GGUF file changed or cannot be inspected");
   BY_HANDLE_FILE_INFORMATION info{};

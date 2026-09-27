@@ -1,4 +1,7 @@
 #include <hip/hip_runtime.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -139,6 +142,20 @@ void CheckSamplingStrategies(
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
+#if defined(_WIN32)
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      const auto candidate =
+          std::filesystem::temp_directory_path() /
+          ("gufo-qwen-disk-cache-" + std::to_string(::GetCurrentProcessId()) +
+           "-" + std::to_string(attempt));
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = candidate;
+        return;
+      }
+    }
+    throw std::runtime_error("failed to create Qwen cache directory");
+#else
     std::string pattern =
         (std::filesystem::temp_directory_path() / "gufo-qwen-disk-cache-XXXXXX")
             .string();
@@ -147,6 +164,7 @@ public:
       throw std::runtime_error("failed to create Qwen cache directory");
     }
     path_ = created;
+#endif
   }
 
   ~TemporaryDirectory() {

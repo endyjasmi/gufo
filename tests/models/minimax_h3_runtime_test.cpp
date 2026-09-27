@@ -1,4 +1,10 @@
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -42,6 +48,20 @@ void Expect(bool condition, const std::string& message) {
 
 struct TemporaryDirectory {
   TemporaryDirectory() {
+#if defined(_WIN32)
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      const auto candidate =
+          std::filesystem::temp_directory_path() /
+          ("gufo-h3-runtime-" + std::to_string(::GetCurrentProcessId()) + "-" +
+           std::to_string(attempt));
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        path = candidate;
+        return;
+      }
+    }
+    throw std::runtime_error("mkdtemp failed");
+#else
     std::array<char, 64> pattern{};
     std::strcpy(pattern.data(), "/tmp/gufo-h3-runtime-XXXXXX");
     char* result = mkdtemp(pattern.data());
@@ -49,6 +69,7 @@ struct TemporaryDirectory {
       throw std::runtime_error("mkdtemp failed");
     }
     path = result;
+#endif
   }
   ~TemporaryDirectory() {
     std::error_code error;

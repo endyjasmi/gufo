@@ -1,6 +1,16 @@
+#if !defined(_WIN32)
 #include <fcntl.h>
+#endif
 #include <hip/hip_runtime.h>
+
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <process.h>
+#include <windows.h>
+#endif
 
 #include <array>
 #include <cstdint>
@@ -28,10 +38,25 @@ void Require(bool ok, const std::string& message) {
 struct Files {
   std::filesystem::path directory;
   Files() {
+#if defined(_WIN32)
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      const auto candidate =
+          std::filesystem::temp_directory_path() /
+          ("gufo-weight-upload-" + std::to_string(::GetCurrentProcessId()) +
+           "-" + std::to_string(attempt));
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        directory = candidate;
+        return;
+      }
+    }
+    Require(false, "mkdtemp");
+#else
     char path[] = "/tmp/gufo-weight-upload-XXXXXX";
     const char* result = ::mkdtemp(path);
     Require(result != nullptr, "mkdtemp");
     directory = result;
+#endif
   }
   ~Files() { std::filesystem::remove_all(directory); }
 };
@@ -66,12 +91,18 @@ int main() {
 
   std::array<gufo::core::GgufMappedRegion, 2> regions;
   for (std::size_t i = 0; i < paths.size(); ++i) {
+#if defined(_WIN32)
+    // The Windows uploader binds by source_path; the descriptor-holds-the-
+    // inode defense against path replacement is a POSIX-only property.
+    regions[i] = {nullptr, source[i].size(), -1, paths[i].string()};
+#else
     regions[i] = {nullptr, source[i].size(),
                   ::open(paths[i].c_str(), O_RDONLY | O_CLOEXEC)};
     Require(regions[i].file_descriptor >= 0, "open original shard");
     std::filesystem::rename(paths[i], paths[i].string() + ".old");
     std::ofstream replacement(paths[i], std::ios::binary);
     replacement << "replacement must never supply model bytes";
+#endif
   }
   constexpr std::size_t guard = 64;
   std::vector<std::uint8_t> expected(guard, 0xa5);
@@ -138,6 +169,8 @@ int main() {
   std::puts(
       "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
   upload.reset();
+#if !defined(_WIN32)
   for (const auto& region : regions)
     ::close(region.file_descriptor);
+#endif
 }

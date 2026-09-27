@@ -91,9 +91,11 @@ ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::string& path,
     return ReadOnlyMappedFile();
   };
 #if defined(_WIN32)
-  const HANDLE file = CreateFileA(
-      path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-      FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+  const HANDLE file =
+      CreateFileA(path.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file == INVALID_HANDLE_VALUE)
     return fail(FormatWindowsError("CreateFileA", GetLastError()));
   LARGE_INTEGER file_size{};
@@ -164,7 +166,9 @@ std::size_t SystemPageSize() noexcept {
 bool RawMappedFile::Open(const char* path) noexcept {
 #if defined(_WIN32)
   const HANDLE file =
-      CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      CreateFileA(path, GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING,
                   FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file == INVALID_HANDLE_VALUE)
     return false;
@@ -215,7 +219,9 @@ bool RawMappedFile::OpenRange(const char* path, std::uint64_t offset,
                               std::size_t length) noexcept {
 #if defined(_WIN32)
   const HANDLE file =
-      CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      CreateFileA(path, GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING,
                   FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file == INVALID_HANDLE_VALUE)
     return false;
@@ -286,8 +292,9 @@ void RawMappedFile::Close() noexcept {
 
 PlatformFile OpenReadFile(const std::string& path) noexcept {
 #if defined(_WIN32)
-  return CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  return CreateFileA(path.c_str(), GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 #else
   return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 #endif

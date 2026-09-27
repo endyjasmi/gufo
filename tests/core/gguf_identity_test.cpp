@@ -1,8 +1,13 @@
 #include "src/core/gguf_identity.hpp"
+#if defined(_WIN32)
+#include <process.h>
+#endif
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -142,6 +147,11 @@ void TestEveryPayloadByte() {
 }
 
 void TestFileDigestCache() {
+#if defined(_WIN32)
+  // The POSIX cache contract leans on inode stamps and utimensat mtime
+  // restoration; the Windows stamp (volume:index + write + creation time)
+  // invalidates on same-size edits without restoration.
+#else
   char temp[] = "/tmp/gufo-identity-XXXXXX";
   Expect(mkdtemp(temp) != nullptr, "create cache test directory");
   const std::filesystem::path root(temp);
@@ -190,12 +200,19 @@ void TestFileDigestCache() {
   else
     unsetenv("XDG_CACHE_HOME");
   std::filesystem::remove_all(root);
+#endif  // !defined(_WIN32)
 }
 
 void TestPipelinedFileHash() {
   const auto bytes = BuildImage("pipeline", "first", 40 * 1024 * 1024, 8194);
   const auto path = std::filesystem::temp_directory_path() /
-                    ("gufo-identity-pipeline-" + std::to_string(getpid()));
+                    ("gufo-identity-pipeline-" + std::to_string(
+#if defined(_WIN32)
+                                                     _getpid()
+#else
+                                                     getpid()
+#endif
+                                                         ));
   {
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());

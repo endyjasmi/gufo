@@ -1,7 +1,13 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
+#if !defined(_WIN32)
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -60,6 +66,20 @@ void Expect(bool condition, std::string_view message) {
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
+#if defined(_WIN32)
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      const auto candidate =
+          std::filesystem::temp_directory_path() /
+          ("gufo-continuation-disk-" + std::to_string(::GetCurrentProcessId()) +
+           "-" + std::to_string(attempt));
+      std::error_code create_error;
+      if (std::filesystem::create_directory(candidate, create_error)) {
+        path_ = candidate;
+        return;
+      }
+    }
+    throw std::runtime_error("failed to create temporary directory");
+#else
     std::string pattern = (std::filesystem::temp_directory_path() /
                            "gufo-continuation-disk-XXXXXX")
                               .string();
@@ -68,6 +88,7 @@ public:
       throw std::runtime_error("failed to create temporary directory");
     }
     path_ = created;
+#endif
   }
 
   ~TemporaryDirectory() {
@@ -460,6 +481,7 @@ void TestCorruptionBecomesDeterministicMissAndRemoval() {
   stream.write(&value, 1);
   stream.close();
 
+#if !defined(_WIN32)
   if (::geteuid() != 0) {
     Expect(::chmod(directory.path().c_str(), S_IRUSR | S_IXUSR) == 0,
            "cache directory can simulate an unlink failure");
@@ -475,6 +497,7 @@ void TestCorruptionBecomesDeterministicMissAndRemoval() {
     Expect(returned && !result.restored && store.entry_count() == 1,
            "unremovable corrupt entries miss without an infinite retry");
   }
+#endif  // POSIX permission-based unlink failure
 
   auto state = runner.CreateState();
   Expect(!RestoreTokens(store, runner, *state, {4, 4, 4, 5}).restored,
@@ -664,12 +687,14 @@ void TestAtomicPublicationAndPrivatePermissions() {
     Expect(!entry.path().filename().string().starts_with(".tmp-"),
            "successful publication leaves no temporary file");
   }
+#if !defined(_WIN32)
   struct stat status{};
   Expect(::lstat(files.front().c_str(), &status) == 0 &&
              S_ISREG(status.st_mode) &&
              (status.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
              (status.st_mode & S_IRUSR) != 0 && (status.st_mode & S_IWUSR) != 0,
          "published cache file is private and owner read-write");
+#endif
 }
 
 void TestStartupRejectsUnsafeAndInvalidFiles() {

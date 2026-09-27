@@ -1,5 +1,6 @@
-#include "src/cli/serve/text_model_runner.hpp"
-
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -17,6 +18,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "src/cli/serve/text_model_runner.hpp"
 
 namespace {
 
@@ -554,6 +557,22 @@ private:
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
+#if defined(_WIN32)
+    std::string candidate;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      candidate = (std::filesystem::temp_directory_path() /
+                   ("gufo-runner-disk-cache-" +
+                    std::to_string(::GetCurrentProcessId()) + "-" +
+                    std::to_string(attempt)))
+                      .string();
+      std::error_code create_error;
+      if (std::filesystem::create_directory(candidate, create_error)) {
+        path_ = candidate;
+        return;
+      }
+    }
+    throw std::runtime_error("failed to create runner cache directory");
+#else
     std::string pattern = (std::filesystem::temp_directory_path() /
                            "gufo-runner-disk-cache-XXXXXX")
                               .string();
@@ -562,6 +581,7 @@ public:
       throw std::runtime_error("failed to create runner cache directory");
     }
     path_ = created;
+#endif
   }
 
   ~TemporaryDirectory() {

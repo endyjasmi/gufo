@@ -7,6 +7,18 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+
+#if defined(_WIN32)
+#include <cstdlib>
+namespace {
+int setenv(const char* name, const char* value, int) {
+  return _putenv((std::string(name) + "=" + value).c_str());
+}
+int unsetenv(const char* name) {
+  return _putenv((std::string(name) + "=").c_str());
+}
+}  // namespace
+#endif
 #include <thread>
 #include <vector>
 
@@ -186,7 +198,11 @@ int main() {
   const char* saved = std::getenv("GUFO_FFMPEG");
   const std::string saved_value = saved == nullptr ? "" : saved;
   WriteSentinel(error_output);
+#if defined(_WIN32)
+  _putenv("GUFO_FFMPEG=/bin/false");
+#else
   setenv("GUFO_FFMPEG", "/bin/false", 1);
+#endif
   const bool error_result = WriteSynchronizedMp4(
       error_output, frames, kFrames, kWidth, kHeight, 24, pcm, kSamples, 2,
       32000, nullptr, &telemetry, &error);
