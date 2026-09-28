@@ -57,13 +57,51 @@ constexpr short kPollHup = POLLHUP;
 constexpr int kShutdownBoth = SHUT_RDWR;
 #endif
 
+// Diagnostics for the connection whose request read failed: the recv() result
+// and error code plus how many bytes were still pending, so a spurious socket
+// failure is distinguishable from a client that really sent garbage.
+// ReceiveAll and handle_connection run on the same connection thread.
+thread_local int recv_failure_result = 0;
+thread_local int recv_failure_error = 0;
+
 /// Read up to `n` bytes from a stream socket; returns bytes read or -1.
 int ReceiveAll(int fd, void* buffer, std::size_t n) {
 #if defined(_WIN32)
-  return ::recv(fd, static_cast<char*>(buffer), static_cast<int>(n), 0);
+  const int read =
+      ::recv(fd, static_cast<char*>(buffer), static_cast<int>(n), 0);
 #else
-  return static_cast<int>(::read(fd, buffer, n));
+  const int read = static_cast<int>(::read(fd, buffer, n));
 #endif
+  recv_failure_result = read < 0 ? -1 : 0;
+  if (read < 0) {
+#if defined(_WIN32)
+    recv_failure_error = ::WSAGetLastError();
+#else
+    recv_failure_error = errno;
+#endif
+  }
+  return read;
+}
+
+std::string EscapedHead(const std::string& data, std::size_t max_bytes) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  const std::size_t count = std::min(data.size(), max_bytes);
+  out.reserve(count * 4);
+  for (std::size_t i = 0; i < count; ++i) {
+    const unsigned char c = static_cast<unsigned char>(data[i]);
+    if (c >= 0x20 && c < 0x7f && c != '\\') {
+      out += static_cast<char>(c);
+    } else {
+      out += "\\x";
+      out += kHex[c >> 4];
+      out += kHex[c & 0xf];
+    }
+  }
+  if (data.size() > max_bytes) {
+    out += "...";
+  }
+  return out;
 }
 
 std::atomic<int> shutdown_signal{0};
@@ -1165,6 +1203,14 @@ void HttpServer::run(bool handle_signals) {
       }
       continue;
     }
+    // Windows accepted sockets inherit the listener's non-blocking mode, so a
+    // first recv() that beats the client's request bytes fails with
+    // WSAEWOULDBLOCK and the request is rejected as malformed. Connection
+    // handling below is written for blocking sockets (SO_RCVTIMEO timeouts).
+    if (!net::SetBlocking(client_fd)) {
+      net::CloseSocket(client_fd);
+      continue;
+    }
     if (stopped_.load(std::memory_order_acquire)) {
       net::CloseSocket(client_fd);
       break;
@@ -1368,9 +1414,14 @@ void HttpServer::handle_connection(int client_fd) {
   try {
     bool ok = false;
     bool payload_too_large = false;
+    std::string read_failure;
+    std::size_t buffer_debug_size = 0;
+    std::string buffer_debug_head;
     {
       std::string buffer;
       if (ReadUntil(buffer, client_fd, "\r\n\r\n")) {
+        buffer_debug_size = buffer.size();
+        buffer_debug_head = EscapedHead(buffer, 48);
         // ReadUntil over-reads: `buffer` holds the headers, the blank line, and
         // possibly some body bytes already. Split at the blank line and carry
         // the over-read body bytes forward so we only read the remainder from
@@ -1437,11 +1488,15 @@ void HttpServer::handle_connection(int client_fd) {
             content_length > body.size() ? content_length - body.size() : 0;
         if (!valid_headers || !parsed_length.has_value()) {
           ok = false;
+          read_failure = "invalid_headers";
         } else if (content_length > options_.max_request_body_bytes) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
             ok = ReadN(body, client_fd, remaining);
+            if (!ok) {
+              read_failure = "body_read_failed";
+            }
           } else {
             ok = true;
           }
@@ -1459,7 +1514,22 @@ void HttpServer::handle_connection(int client_fd) {
             return IsPeerDisconnected(client_fd);
           };
         }
+      } else {
+        read_failure = "header_read_failed";
       }
+    }
+    if (!read_failure.empty()) {
+      u_long pending = 0;
+#if defined(_WIN32)
+      ::ioctlsocket(client_fd, FIONREAD, &pending);
+#else
+      ::ioctl(client_fd, FIONREAD, &pending);
+#endif
+      read_failure += " recv_result=" + std::to_string(recv_failure_result) +
+                      " recv_error=" + std::to_string(recv_failure_error) +
+                      " pending_bytes=" + std::to_string(pending) +
+                      " buffered=" + std::to_string(buffer_debug_size) +
+                      " head=\"" + buffer_debug_head + "\"";
     }
 
     // Successful health/metrics polling and video status polling stay quiet.
@@ -1481,6 +1551,7 @@ void HttpServer::handle_connection(int client_fd) {
     } else if (!ok) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
+      resp.log_details = read_failure;
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {

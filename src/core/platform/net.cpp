@@ -67,6 +67,18 @@ bool SetNonBlocking(Socket socket) noexcept {
 #endif
 }
 
+bool SetBlocking(Socket socket) noexcept {
+#if defined(_WIN32)
+  u_long mode = 0;
+  return ioctlsocket(socket, FIONBIO, &mode) == 0;
+#else
+  const int flags = ::fcntl(socket, F_GETFL, 0);
+  if (flags < 0)
+    return false;
+  return ::fcntl(socket, F_SETFL, flags & ~O_NONBLOCK) == 0;
+#endif
+}
+
 bool SetNoDelay(Socket socket) noexcept {
   int value = 1;
   return ::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,

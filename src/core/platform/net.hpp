@@ -42,6 +42,11 @@ std::intptr_t SendNoSignal(Socket socket, const void* data, std::size_t bytes);
 /// Mark a socket non-blocking; returns false on failure.
 bool SetNonBlocking(Socket socket) noexcept;
 
+/// Mark a socket blocking; returns false on failure. Required for sockets
+/// accepted from a non-blocking listener on Windows, where they inherit the
+/// listener's mode (POSIX accepted sockets never inherit O_NONBLOCK).
+bool SetBlocking(Socket socket) noexcept;
+
 /// Disable Nagle on a connected stream socket; returns false on failure.
 bool SetNoDelay(Socket socket) noexcept;
 
