@@ -80,7 +80,8 @@ private:
   };
   void DecodeRow(const std::uint8_t* src, float* dst) const;
   bool ReadCached(std::uint32_t row, float* dst);
-  bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf);
+  bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
+               void* io_event);
   void Worker();
 
   struct CacheEntry {

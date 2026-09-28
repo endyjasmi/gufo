@@ -109,18 +109,21 @@ std::unique_ptr<NgramTable> NgramTable::Open(
 #if defined(_WIN32)
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
-  HANDLE unbuffered =
-      CreateFileA(source_path.c_str(), GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+  // The handle must be asynchronous: ReadFile with a non-null OVERLAPPED on a
+  // synchronous handle is undefined, and the worker pool relies on
+  // concurrent in-flight reads.
+  HANDLE unbuffered = CreateFileA(
+      source_path.c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
   if (unbuffered != INVALID_HANDLE_VALUE) {
     t->file_handle_ = unbuffered;
     t->direct_ = true;
   } else {
-    HANDLE buffered =
-        CreateFileA(source_path.c_str(), GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    HANDLE buffered = CreateFileA(
+        source_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, nullptr);
     if (buffered == INVALID_HANDLE_VALUE) {
       if (error_msg != nullptr) {
         *error_msg = "cannot open bound n-gram table: " + source_path;
@@ -183,7 +186,7 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
 }
 
 bool NgramTable::ReadOne(std::uint32_t row, float* dst,
-                         std::vector<std::uint8_t>& buf) {
+                         std::vector<std::uint8_t>& buf, void* io_event) {
   if (row >= rows_) {
     return false;
   }
@@ -219,11 +222,30 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     OVERLAPPED overlapped{};
     overlapped.Offset = static_cast<DWORD>(begin + got);
     overlapped.OffsetHigh = static_cast<DWORD>((begin + got) >> 32);
-    DWORD read_bytes = 0;
-    const bool ok =
+    overlapped.hEvent = io_event;
+    // The handle is asynchronous; submit and wait per segment. Each worker
+    // holds its own event, so concurrent reads stay independent.
+    const bool submitted =
         ReadFile(static_cast<HANDLE>(file_handle_), base + got,
-                 static_cast<DWORD>(length - got), &read_bytes, &overlapped) &&
-        read_bytes > 0;
+                 static_cast<DWORD>(length - got), nullptr, &overlapped) ||
+        GetLastError() == ERROR_IO_PENDING;
+    DWORD read_bytes = 0;
+    bool ok = false;
+    if (submitted) {
+      // Window reads complete in tens of microseconds; blocking in
+      // GetOverlappedResult costs milliseconds of timer-granularity wait on
+      // this platform. Spin briefly, then fall back to the blocking wait.
+      for (int spin = 0; spin < 20000 && !HasOverlappedIoCompleted(&overlapped);
+           ++spin) {
+        YieldProcessor();
+      }
+      ok = HasOverlappedIoCompleted(&overlapped)
+               ? GetOverlappedResult(static_cast<HANDLE>(file_handle_),
+                                     &overlapped, &read_bytes, FALSE)
+               : GetOverlappedResult(static_cast<HANDLE>(file_handle_),
+                                     &overlapped, &read_bytes, TRUE);
+    }
+    ok = ok && read_bytes > 0;
     const std::size_t n = ok ? read_bytes : 0;
 #else
     const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
@@ -253,11 +275,20 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
 
 void NgramTable::Worker() {
   std::vector<std::uint8_t> buf;
+#if defined(_WIN32)
+  // One manual-reset event per worker keeps concurrent in-flight reads
+  // independent on the shared asynchronous handle.
+  void* io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#endif
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
     wake_.wait(lock,
                [&] { return stop_ || (active_ && next_job_ < jobs_.size()); });
     if (stop_) {
+#if defined(_WIN32)
+      if (io_event != nullptr)
+        CloseHandle(io_event);
+#endif
       return;
     }
     // Large gathers amortize the queue lock. Small gathers keep one read
@@ -270,7 +301,11 @@ void NgramTable::Worker() {
     lock.unlock();
     bool ok = true;
     for (std::size_t i = 0; i < count; ++i) {
-      ok = ReadOne(batch[i].row, batch[i].dst, buf) && ok;
+#if defined(_WIN32)
+      ok = ReadOne(batch[i].row, batch[i].dst, buf, io_event) && ok;
+#else
+      ok = ReadOne(batch[i].row, batch[i].dst, buf, nullptr) && ok;
+#endif
     }
     lock.lock();
     failed_ = failed_ || !ok;
