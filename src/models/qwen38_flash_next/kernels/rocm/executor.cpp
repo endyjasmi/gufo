@@ -2306,14 +2306,18 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     std::memcpy(payload.data() + payload.size() - grid_bytes,
                 session.VisionLayout().images.data(), grid_bytes);
   }
-  return WalkSnapshot(h, &session,
-                      [&](void* device, std::uint64_t offset,
-                          std::uint64_t bytes, const char*) {
-                        if (!session.CheckCancellation(error_msg))
-                          return false;
-                        transfer.Copy(payload.data() + offset, device, bytes);
-                        return true;
-                      }) != 0;
+  const bool walked =
+      WalkSnapshot(h, &session,
+                   [&](void* device, std::uint64_t offset,
+                       std::uint64_t bytes, const char*) {
+                     if (!session.CheckCancellation(error_msg))
+                       return false;
+                     transfer.Enqueue(payload.data() + offset, device, bytes);
+                     return true;
+                   }) != 0;
+  if (walked)
+    transfer.Finish();
+  return walked;
 }
 
 bool Executor::RestoreSnapshot(Session& session,
