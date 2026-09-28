@@ -1,3 +1,4 @@
+// SYNCPROBE-2026-09-29A
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 
@@ -40,8 +41,10 @@ enum class WeightType : std::uint32_t {
   kF16 = 1,
   kQ5_1 = 7,
   kQ8_0 = 8,
+  kIQ4_NL = 20,
   kQ4_K = 12,
   kQ5_K = 13,
+  kIQ3_S = 21,
   kBF16 = 30,
 };
 

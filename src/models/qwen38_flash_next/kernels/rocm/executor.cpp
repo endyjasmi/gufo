@@ -1050,14 +1050,33 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
       AssignError(error_msg, "expert vector pair GEMM failed");
       return false;
     }
-  } else if (same_shape && a.type == GgmlType::kQ4_K) {
-    // The wide Q4_K path shares its gather and tiled quantization as well.
+  } else if (same_shape && (a.type == GgmlType::kQ4_K ||
+                            a.type == GgmlType::kIQ3_S ||
+                            a.type == GgmlType::kIQ4_XS)) {
+    // The wide pair path shares its gather and tiled quantization as well.
     RoutedHints(a, n_tokens);
-    if (qfn_mmq_q4_K_moe_pair_unique(
+    int rc = -1;
+    switch (a.type) {
+      case GgmlType::kQ4_K:
+        rc = qfn_mmq_q4_K_moe_pair_unique(
             a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
             static_cast<int>(a.cols), static_cast<int>(n_tokens),
-            static_cast<int>(a.experts), static_cast<int>(n_used),
-            stream_) != 0) {
+            static_cast<int>(a.experts), static_cast<int>(n_used), stream_);
+        break;
+      case GgmlType::kIQ3_S:
+        rc = qfn_mmq_iq3_s_moe_pair_unique(
+            a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
+            static_cast<int>(a.cols), static_cast<int>(n_tokens),
+            static_cast<int>(a.experts), static_cast<int>(n_used), stream_);
+        break;
+      default:
+        rc = qfn_mmq_iq4_xs_moe_pair_unique(
+            a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
+            static_cast<int>(a.cols), static_cast<int>(n_tokens),
+            static_cast<int>(a.experts), static_cast<int>(n_used), stream_);
+        break;
+    }
+    if (rc != 0) {
       AssignError(error_msg, "expert pair GEMM failed");
       return false;
     }
@@ -1596,10 +1615,12 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // F16 matrix-core GEMM per (expert, row tile).
   const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+                             l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+                             l.ffn_gate_exps.type == GgmlType::kIQ3_S) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+                             l.ffn_down_exps.type == GgmlType::kQ8_0 ||
+                             l.ffn_down_exps.type == GgmlType::kIQ4_NL) &&
                             c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
@@ -1621,11 +1642,16 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Large batches pair the gate/up projections and apply SwiGLU without
     // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const WeightType gate_type =
+        l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
+        : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
+                                                   : WeightType::kQ4_K;
+    // The paired gate/up kernel only stages the Q4_K/Q5_K block layouts;
+    // IQ3_S runs the two projections separately with the same fused SwiGLU.
+    const bool pair_ok =
+        gate_type == WeightType::kQ4_K || gate_type == WeightType::kQ5_K;
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48
+        pair_ok && n_tokens >= 1024 && routed_tile_rows_ == 48
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
@@ -1645,13 +1671,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    const WeightType down_type =
+        l.ffn_down_exps.type == GgmlType::kQ8_0   ? WeightType::kQ8_0
+        : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
+                                                    : WeightType::kQ5_1;
     // Larger down tiles amortize weight decoding. Reuse the 64-token map
     // when it has no more padded rows than the 48-token map.
     const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
+        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0 ||
+         down_type == WeightType::kIQ4_NL) &&
         routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
         routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the
