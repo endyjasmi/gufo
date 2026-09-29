@@ -31,3 +31,24 @@
   and reduction, tripping the greedy-equivalence gate at C4 (mixed) / C6
   (repetitive) — fix direction: cap co-batched verify rows at the vector
   contract or make the tiled path reproduce it.
+- 2026-09-29 Q8_0 artifact pass: every projection keeps its native Q8_0
+  bytes end to end. Three engine changes, retained: (1) `DequantizeRow`
+  decodes Q8_0 sources — the raw-block memcpy fallback would have
+  corrupted the dense stacks and the alpha/beta stacks of a Q8_0 artifact;
+  (2) `CopyDequantQ8_0` streams Q8_0 parts straight to the device instead
+  of a dequant+requant round trip, and the split MTP projection drains the
+  staging pipeline before it frees the combined buffer — that free was
+  only safe while the upload was synchronous (first Q8_0 load died in the
+  staging worker with `invalid argument`); (3) routed Q8_0 gate/up joins
+  the F16 WMMA tier (the routed kernel already decoded Q8_0 downs):
+  pp2048 2530 → 3074 tok/s, +21% over the int8 raw-moe fallback and +7%
+  over the Q4_K_M build. Findings: single-stream AR decode is
+  bandwidth-bound and pays the artifact's 1.7× expert bytes (-17% vs
+  Q4_K_M), converging to Q4_K_M at C4-C8 where batched GEMVs are
+  MAC-bound (C6 +2%); HTTP MTP loses (-14/-23%) even though native MTP
+  gains (+3%), because acceptance drops (55/58% vs 63/78%) while the
+  adaptive policy drafts more per cycle — sharper draft and target logits
+  agree less often on near-ties. llama.cpp b11243's Q8_0 greedy is NOT
+  ground truth for this artifact: it diverges from our F32 oracle at a
+  0.6-logit near-tie where the GPU matches the oracle; use the oracle
+  gates in QUALITY.md for Q8_0 comparisons.

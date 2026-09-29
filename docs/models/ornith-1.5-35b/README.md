@@ -12,6 +12,10 @@ the model file (`nextn`). Gufo registers the architecture as `qwen35moe`.
 hf download ornith-ai/Ornith-1.5-35B-A3B-GGUF   Ornith-1.5-35B-Q4_K_M.gguf --local-dir models/ornith-1.5-35b
 ```
 
+The Q8_0 artifact from the same repository runs natively end to end (raw
+Q8_0 bytes on every path; see [BENCHMARKS.md](BENCHMARKS.md) for the
+quant trade-off).
+
 MIT licensed; the GGUF embeds the tokenizer and chat template. Optional vision
 sidecar: `mmproj-Ornith-1.5-35B-BF16.gguf` (auto-discovered beside the model).
 
@@ -29,6 +33,7 @@ sidecar or `--mtp-model` is needed.
 ## Notes
 
 - Dense Q4_K/Q6_K projections are host-dequantized to Q8_0 at load; routed
-  Q4_K experts keep their native layout on the MMQ/WMMA tiers.
+  Q4_K experts keep their native layout on the MMQ/WMMA tiers. Q8_0
+  artifacts stream through unchanged and skip the dequant pass entirely.
 - The current Windows port qualifies this model on a single Strix Halo
   gfx1151 host; Linux numbers land in BENCHMARKS.md once measured.

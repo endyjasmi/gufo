@@ -92,12 +92,63 @@ withheld (see `artifacts/unavailable.json`). The engine fix is tracked in
 | 8 | TODO | N/A | N/A | TODO | N/A | N/A |
 <!-- /bench -->
 
+## Q8_0 artifact (2026-09-29)
+
+The `Ornith-1.5-35B-Q8_0.gguf` artifact (37.8 GB, 35.2 GiB resident — no
+load-time dequantized copies) runs every projection on its native Q8_0
+bytes: decode reads the raw file bytes through the vector kernels, prefill
+runs the routed F16 WMMA tier with in-kernel Q8_0 decode, and the upload
+is a raw stream (load ≈ 13 s against ≈ 19 s for Q4_K_M). Same build,
+method and hash gates as the Q4_K_M tables above; artifacts in
+`artifacts-q8/`.
+
+| Metric | Q4_K_M | Q8_0 | Δ |
+| --- | ---: | ---: | ---: |
+| Native pp2048 (tok/s) | 2870.9 ± 14.7 | 3073.7 ± 9.9 | +7.1% |
+| Native tg128 AR (tok/s) | 63.21 ± 0.09 | 52.29 ± 0.05 | -17.3% |
+| Native tg128 MTP (tok/s) | 78.90 ± 0.18 | 81.54 ± 0.88 | +3.3% |
+| HTTP pp2048 (tok/s) | 2653.5 | 2780.9 | +4.8% |
+| HTTP tg128 AR (tok/s) | 62.11 | 51.01 | -17.9% |
+| HTTP MTP, mixed (tok/s) | 73.18 | 63.0 | -13.9% |
+| HTTP MTP, repetitive (tok/s) | 79.50 | 60.9 | -23.4% |
+
+Both quants decode on the memory-bandwidth roofline, so single-stream AR
+pays the artifact's 1.7× expert-byte traffic directly (-17%); the gap
+closes as concurrency amortizes weight reads over MAC-bound batched GEMVs
+(C4 -3%, C6 +2%, C8 -2%). Prefill exceeds Q4_K_M in both paths. HTTP MTP
+gives the native MTP gain back through the host-side draft-chaining tax:
+the sharper quant drafts more per cycle but accepts less (55% mixed / 58%
+repetitive against Q4_K_M's 63% / 78%) — see EXPERIMENTS.md.
+
+| Ornith Q8 AR<br>Users | Gufo AR (tok/s) | Q4_K_M AR (tok/s) |
+| ---: | ---: | ---: |
+| 1 | 51.77 | 61.67 |
+| 2 | 81.20 | 94.48 |
+| 4 | 145.75 | 150.36 |
+| 6 | 176.22 | 172.35 |
+| 8 | 194.34 | 198.26 |
+
+### Q8_0 multiple users, MTP
+
+Same cohort method and hash gates. Q8_0 passes the greedy-equivalence
+gate through C4 on both workloads (Q4_K_M mixed trips at C4); C6 and C8
+are withheld by the same 8-row vector-kernel contract
+(`artifacts-q8/unavailable.json`).
+
+| Ornith Q8 MTP<br>Users | Gufo mixed (tok/s) | Q4_K_M mixed (tok/s) | Gufo repetitive (tok/s) | Q4_K_M repetitive (tok/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 62.16 | 72.61 | 60.50 | 78.69 |
+| 2 | 99.94 | 105.23 | 96.46 | 116.90 |
+| 4 | 143.21 | withheld | 144.20 | 172.00 |
+
 ## Memory
 
 Weights resident ≈ 21.2 GiB device (20.2 GiB artifact plus dequantized-Q8_0
 dense copies and the Q6_K→Q8_0 head); peak device use 24.7 GiB at 4096 context
 with one session and 26.1 GiB with `--sessions 8` — far inside the carve-out,
-nothing spills to WDDM shared memory.
+nothing spills to WDDM shared memory. The Q8_0 artifact holds 35.2 GiB of
+weights with no dequantized copies beside them: 37.8 GiB device at
+`--sessions 8`, 4096 context, same carve-out margin.
 
 ## TODO
 

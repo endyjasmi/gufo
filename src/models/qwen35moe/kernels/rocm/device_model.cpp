@@ -118,6 +118,9 @@ void DequantizeRow(GgmlType type, const void* src, float* dst,
     case GgmlType::kQ6_K:
       quant::DequantizeQ6_K(src, dst, cols);
       return;
+    case GgmlType::kQ8_0:
+      quant::DequantizeQ8_0(src, dst, cols);
+      return;
     default:
       std::memcpy(dst, src, cols * sizeof(float));
       return;
@@ -225,9 +228,10 @@ struct Uploader {
     return d;
   }
 
-  /// Host-dequantizes Q4_K/Q5_K/Q6_K tensors to Q8_0 rows and uploads them
-  /// as one stacked matrix. Every part shares `cols`; parts concatenate along
-  /// rows, and a routed part contributes experts after its rows.
+  /// Uploads the parts as one stacked Q8_0 matrix. Q8_0 parts stream to the
+  /// device unchanged; Q4_K/Q5_K/Q6_K parts are host-dequantized to Q8_0
+  /// rows. Every part shares `cols`; parts concatenate along rows, and a
+  /// routed part contributes experts after its rows.
   DeviceTensor CopyDequantQ8_0(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -269,50 +273,87 @@ struct Uploader {
     if (ptr == nullptr) {
       return d;
     }
-    std::vector<std::uint8_t> staged(dst_bytes);
-    const std::uint32_t workers =
-        std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::thread> threads;
-    for (std::uint32_t w = 0; w < workers; ++w) {
-      threads.emplace_back([&, w] {
-        std::vector<float> chunk(cols);
-        const std::size_t begin = rows * w / workers;
-        const std::size_t end = rows * (w + 1) / workers;
-        for (const auto& source : sources) {
-          const std::size_t last = source.first + source.rows;
-          const std::size_t lo = std::max(begin, source.first);
-          const std::size_t hi = std::min(end, last);
-          const std::size_t step = RowBytesOf(source.type, cols);
-          for (std::size_t index = lo; index < hi; ++index) {
-            DequantizeRow(source.type,
-                          source.bytes + (index - source.first) * step,
-                          chunk.data(), cols);
-            auto* out = reinterpret_cast<quant::block_q8_0*>(
-                staged.data() + index * row_dst_bytes);
-            for (std::size_t b = 0; b < cols / 32; ++b) {
-              const float* v = chunk.data() + b * 32;
-              float amax = 0.0f;
-              for (std::size_t j = 0; j < 32; ++j) {
-                amax = std::max(amax, std::fabs(v[j]));
-              }
-              const float dblock = amax / 127.0f;
-              const float id = dblock != 0.0f ? 1.0f / dblock : 0.0f;
-              out[b].d = Fp32ToF16(dblock);
-              for (std::size_t j = 0; j < 32; ++j) {
-                out[b].qs[j] = static_cast<std::int8_t>(std::roundf(v[j] * id));
+    // Q8_0 parts are already in the destination layout: their bytes stream
+    // straight to the device, and the dequant+requant round trip (exact but
+    // expensive at load) only runs for the other formats.
+    bool any_host = false;
+    {
+      auto part = parts.begin();
+      for (const auto& source : sources) {
+        const TensorRef* t = *part++;
+        if (source.type != GgmlType::kQ8_0) {
+          any_host = true;
+          continue;
+        }
+        if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
+                         static_cast<std::uint8_t*>(ptr) +
+                             source.first * row_dst_bytes,
+                         error)) {
+          Fail("Q8_0 upload failed for " + std::string(t->name));
+          return d;
+        }
+      }
+    }
+    if (any_host) {
+      std::vector<std::uint8_t> staged(dst_bytes);
+      const std::uint32_t workers =
+          std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+      std::vector<std::thread> threads;
+      for (std::uint32_t w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w] {
+          std::vector<float> chunk(cols);
+          const std::size_t begin = rows * w / workers;
+          const std::size_t end = rows * (w + 1) / workers;
+          for (const auto& source : sources) {
+            if (source.type == GgmlType::kQ8_0) {
+              continue;
+            }
+            const std::size_t last = source.first + source.rows;
+            const std::size_t lo = std::max(begin, source.first);
+            const std::size_t hi = std::min(end, last);
+            const std::size_t step = RowBytesOf(source.type, cols);
+            for (std::size_t index = lo; index < hi; ++index) {
+              DequantizeRow(source.type,
+                            source.bytes + (index - source.first) * step,
+                            chunk.data(), cols);
+              auto* out = reinterpret_cast<quant::block_q8_0*>(
+                  staged.data() + index * row_dst_bytes);
+              for (std::size_t b = 0; b < cols / 32; ++b) {
+                const float* v = chunk.data() + b * 32;
+                float amax = 0.0f;
+                for (std::size_t j = 0; j < 32; ++j) {
+                  amax = std::max(amax, std::fabs(v[j]));
+                }
+                const float dblock = amax / 127.0f;
+                const float id = dblock != 0.0f ? 1.0f / dblock : 0.0f;
+                out[b].d = Fp32ToF16(dblock);
+                for (std::size_t j = 0; j < 32; ++j) {
+                  out[b].qs[j] =
+                      static_cast<std::int8_t>(std::roundf(v[j] * id));
+                }
               }
             }
           }
+        });
+      }
+      for (auto& thread : threads) {
+        thread.join();
+      }
+      // Copy only the dequantized row ranges: the Q8_0 parts' device bytes
+      // are already in place and `staged` holds zeros for them.
+      for (const auto& source : sources) {
+        if (source.type == GgmlType::kQ8_0) {
+          continue;
         }
-      });
-    }
-    for (auto& thread : threads) {
-      thread.join();
-    }
-    if (hipMemcpy(ptr, staged.data(), dst_bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
-      Fail("Q8_0 upload failed");
-      return d;
+        if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
+                          source.first * row_dst_bytes,
+                      staged.data() + source.first * row_dst_bytes,
+                      source.rows * row_dst_bytes, hipMemcpyHostToDevice) !=
+            hipSuccess) {
+          Fail("Q8_0 upload failed");
+          return d;
+        }
+      }
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + dst_bytes, 0,
                          kTailMargin, nullptr);
@@ -331,6 +372,11 @@ struct Uploader {
   }
 
   DeviceTensor CopyDequantOne(const TensorRef& t) {
+    // A Q8_0 source is the decode format already: the raw copy is the
+    // dequantized tensor, and it carries its own decode view.
+    if (t.type == GgmlType::kQ8_0) {
+      return Copy(t);
+    }
     DeviceTensor d = CopyDequantQ8_0({&t});
     if (d.data == nullptr) {
       return d;
@@ -545,10 +591,17 @@ struct Uploader {
       // with a raw byte-identical stack as the decode view when the formats
       // allow it. Mixed formats keep separate parts, each with its own view.
       d.ssm_in = CopyDequantQ8_0({&l.ssm_qkv, &l.ssm_gate});
-      const DeviceTensor native =
-          NativeStack({&l.ssm_qkv, &l.ssm_gate});
-      d.ssm_in.native_data = native.native_data;
-      d.ssm_in.native_type = native.native_type;
+      if (l.ssm_qkv.type == GgmlType::kQ8_0 &&
+          l.ssm_gate.type == GgmlType::kQ8_0) {
+        // The dequantized stack already is the raw Q8_0 layout; reuse it as
+        // the decode view instead of uploading the bytes a second time.
+        d.ssm_in.native_data = d.ssm_in.data;
+        d.ssm_in.native_type = GgmlType::kQ8_0;
+      } else {
+        const DeviceTensor native = NativeStack({&l.ssm_qkv, &l.ssm_gate});
+        d.ssm_in.native_data = native.native_data;
+        d.ssm_in.native_type = native.native_type;
+      }
       d.ssm_conv1d = Copy(l.ssm_conv1d);
       d.ssm_alpha_beta = AlphaBeta(l.ssm_alpha, l.ssm_beta);
       d.ssm_dt = Copy(l.ssm_dt);
@@ -557,10 +610,17 @@ struct Uploader {
       d.ssm_out = CopyDequantOne(l.ssm_out);
     } else {
       d.attn_qkv = CopyDequantQ8_0({&l.attn_q, &l.attn_k, &l.attn_v});
-      const DeviceTensor native =
-          NativeStack({&l.attn_q, &l.attn_k, &l.attn_v});
-      d.attn_qkv.native_data = native.native_data;
-      d.attn_qkv.native_type = native.native_type;
+      if (l.attn_q.type == GgmlType::kQ8_0 &&
+          l.attn_k.type == GgmlType::kQ8_0 &&
+          l.attn_v.type == GgmlType::kQ8_0) {
+        d.attn_qkv.native_data = d.attn_qkv.data;
+        d.attn_qkv.native_type = GgmlType::kQ8_0;
+      } else {
+        const DeviceTensor native =
+            NativeStack({&l.attn_q, &l.attn_k, &l.attn_v});
+        d.attn_qkv.native_data = native.native_data;
+        d.attn_qkv.native_type = native.native_type;
+      }
       d.attn_out = CopyDequantOne(l.attn_out);
       d.attn_q_norm = Copy(l.attn_q_norm);
       d.attn_k_norm = Copy(l.attn_k_norm);
@@ -582,6 +642,15 @@ struct Uploader {
       // columns; a raw decode view of the full tensor is meaningless after
       // the column split, so this projection keeps only the Q8_0 halves.
       const auto combined = CopyDequantQ8_0({&l.nextn_eh_proj});
+      // The split frees the combined buffer, so the streamed upload must be
+      // complete first. This is the final layer upload; the drain costs no
+      // overlap with later work.
+      if (!stager.Finish(error)) {
+        Fail("eh_proj upload failed" +
+             (error != nullptr && !error->empty() ? ": " + *error
+                                                  : std::string()));
+        return d;
+      }
       SplitMtpProjection(combined, d.nextn_fc_embedding, d.nextn_fc_hidden);
     }
     return d;
@@ -600,10 +669,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
                                                  const core::GgufReader& reader,
                                                  const MtpWeights* mtp,
                                                  std::string* error_msg) {
-  // Routed gate/up keep their native Q4_K (the MMQ and F16 WMMA tiers decode
-  // in place); routed Q6_K downs are host-dequantized to Q8_0. Every dense
-  // projection is dequantized to Q8_0, which keeps the whole dense tier
-  // (decode GEMVs, W8A8 and F16 WMMA prefill routes) on its fast paths.
+  // Routed gate/up keep their native format (the MMQ and F16 WMMA tiers
+  // decode in place); routed Q6_K downs are host-dequantized to Q8_0. Every
+  // dense projection is dequantized to Q8_0 unless the artifact already is
+  // Q8_0, in which case its bytes stream through unchanged — this keeps the
+  // whole dense tier (decode GEMVs, W8A8 and F16 WMMA prefill routes) on its
+  // fast paths.
   const auto supported = [&](const TensorRef& t) {
     if (t.experts == 1) {
       switch (t.type) {

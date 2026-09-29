@@ -25,6 +25,31 @@
   reference, chunk-invariance exact) and `qwen35moe.gdn_ops` (32 value
   heads, conv + row-split contracts) pass on gfx1151.
 
+## Q8_0 artifact gates (2026-09-29)
+
+- Upload identity: Q8_0 tensors stream to the device unchanged (no
+  requantization), so the GPU reads the artifact's exact bytes and the
+  float32 oracle dequantizes the same blocks.
+- GPU vs oracle on the identical 9-token prompt: worst cosine +0.9965
+  (Q4_K_M on the same tokens: +0.9890) — the higher-precision artifact
+  tracks the oracle more closely than the Q4_K_M build does.
+- `gufo bench --validate-prefill 8`: cosine 0.99957, scalar_winner_rank 1.
+- `qwen35moe.config`, `qwen35moe.mtp_sampling`, `qwen35moe.gdn_ops` and
+  `qwen38_flash_next.routed_wmma_ops` (which covers the routed F16 Q8_0
+  decode the prefill tier uses) pass. `qwen35moe.attention_ops` fails its
+  graph-replay preparation case at a 2-ulp half difference — it fails
+  identically with the Q8_0 changes stashed, so it is pre-existing on this
+  host and unrelated. The routed_wmma test binary needs the HIP runtime
+  DLLs staged beside it, like the qwen35moe tests get via
+  `gufo_stage_hip_runtime`.
+- llama.cpp b11243's Q8_0 greedy is NOT a ground truth for this artifact:
+  it diverges from the F32 oracle at a 0.6-logit near-tie that the GPU
+  and oracle both resolve the same way. The oracle gates above are the
+  contract.
+- Driver hash gates: single-user AR and MTP completions and the multi-ar
+  C1-C8 cohort all hash-match the isolated AR reference
+  (`artifacts-q8/`).
+
 ## Known gaps
 
 - Serve-path draft-acceptance counters were verified manually (63–79%);

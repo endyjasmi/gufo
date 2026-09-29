@@ -1264,7 +1264,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
                              l.ffn_gate_exps.type == GgmlType::kQ5_K ||
-                             l.ffn_gate_exps.type == GgmlType::kIQ3_S) &&
+                             l.ffn_gate_exps.type == GgmlType::kIQ3_S ||
+                             l.ffn_gate_exps.type == GgmlType::kQ8_0) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0 ||
@@ -1293,6 +1294,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType gate_type =
         l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
+        : l.ffn_gate_exps.type == GgmlType::kQ8_0  ? WeightType::kQ8_0
                                                    : WeightType::kQ4_K;
     // The paired gate/up kernel only stages the Q4_K/Q5_K block layouts;
     // IQ3_S runs the two projections separately with the same fused SwiGLU.
