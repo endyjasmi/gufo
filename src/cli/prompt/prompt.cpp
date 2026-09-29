@@ -31,6 +31,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen35moe/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -671,6 +672,34 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
   return model;
 }
 
+std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  if (opt.force_cpu ||
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp") ||
+      (opt.speculative_backend == "mtp" && opt.min_draft_tokens != 1)) {
+    std::cerr << "Ornith requires ROCm and supports MTP with "
+                 "--min-draft-tokens 1\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !tokenization::QwenChatTemplate::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported Ornith chat template: " << error << '\n';
+    return nullptr;
+  }
+  auto model = models::qwen35moe::Model::Load(
+      opt.model_path,
+      {.max_context = kDefaultContext,
+       .max_draft_tokens = opt.draft_tokens,
+       .vision_model_path = opt.vision_model_path},
+      &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "Ornith load failed: " << error << '\n';
+  return model;
+}
+
 int GenerateFlashNextResponse(const PromptOptions& opt,
                               const models::qwen38_flash_next::Model& model,
                               models::qwen38_flash_next::Session& session,
@@ -696,6 +725,54 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
     if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
                             &decoded, &error)) {
       std::cerr << "Flash-Next decode failed: " << error << '\n';
+      return 1;
+    }
+    for (const auto token : decoded.tokens) {
+      const auto piece = model.TokenText(token);
+      std::cout << piece << std::flush;
+      if (reply)
+        reply->append(piece);
+      generated.push_back(static_cast<tokenization::TokenId>(token));
+    }
+    if (decoded.stop)
+      break;
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
+int GenerateOrnithResponse(const PromptOptions& opt,
+                           const models::qwen35moe::Model& model,
+                           models::qwen35moe::Session& session,
+                           std::span<const tokenization::TokenId> prompt,
+                           std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
+      opt.max_tokens > session.ContextSize() - prompt.size()) {
+    std::cerr << "Ornith prompt and output exceed the 4096-token CLI context\n";
+    return 1;
+  }
+  const std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  std::string error;
+  if (!session.Sync(input, &error)) {
+    std::cerr << "Ornith prefill failed: " << error << '\n';
+    return 1;
+  }
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens) {
+    models::qwen35moe::Session::DecodeResult decoded;
+    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
+                            &decoded, &error)) {
+      std::cerr << "Ornith decode failed: " << error << '\n';
       return 1;
     }
     for (const auto token : decoded.tokens) {
@@ -1024,6 +1101,35 @@ int RunPrompt(std::span<const char* const> args) {
   }
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    auto model = LoadOrnithModel(opt, *reader, model_load_start);
+    if (!model)
+      return 1;
+    auto session =
+        model->CreateSession(opt.speculative_backend.empty()
+                                 ? gufo::core::SessionMode::kAutoregressive
+                                 : gufo::core::SessionMode::kSpeculative,
+                             kDefaultContext, &err);
+    if (!session) {
+      std::cerr << "Ornith session failed: " << err << '\n';
+      return 1;
+    }
+    try {
+      if (!opt.image_paths.empty()) {
+        AttachImages(opt, messages.back());
+        auto vision = PrepareVision(opt, model->tokenizer(), messages,
+                                    model->VisionEncoder());
+        session->ConfigureVision(vision);
+        return GenerateOrnithResponse(opt, *model, *session, vision->tokens);
+      }
+      const auto ids = model->Tokenize(rendered_prompt);
+      const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+      return GenerateOrnithResponse(opt, *model, *session, prompt);
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << '\n';
+      return 1;
+    }
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
@@ -1224,7 +1330,27 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  std::shared_ptr<models::qwen35moe::Model> ornith_model;
+  std::unique_ptr<models::qwen35moe::Session> ornith_session;
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    ornith_model = LoadOrnithModel(opt, *reader, model_load_start);
+    if (!ornith_model)
+      return 1;
+    ornith_session = ornith_model->CreateSession(
+        opt.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
+        kDefaultContext, &err);
+    if (!ornith_session) {
+      std::cerr << "Ornith session failed: " << err << '\n';
+      return 1;
+    }
+    tokenizer = &ornith_model->tokenizer();
+    architecture = "qwen35moe";
+    vision_encoder = ornith_model->VisionEncoder();
+  }
+  if (tokenizer == nullptr &&
+      reader->GetMetadataString("general.architecture") == "qwen4exp") {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
       return 1;
@@ -1342,6 +1468,10 @@ int RunChat(std::span<const char* const> args) {
       if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
                                       prompt_tokens, &assistant_reply) != 0)
+          return 1;
+      } else if (ornith_model) {
+        if (GenerateOrnithResponse(opt, *ornith_model, *ornith_session,
+                                   prompt_tokens, &assistant_reply) != 0)
           return 1;
       } else if (gpu_executor != nullptr) {
         GenerateQwenGpuResponse(opt, *gpu_executor, verifier.get(),
