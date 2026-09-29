@@ -32,4 +32,39 @@
   Flash-Next port applies here too.
 - The MTP cost priors (`mtp_costs.hpp`) still hold the Flash-Next
   measurements; the draft-length controller converges online, but the
-  priors should be re-measured for this model.
+  priors should be re-measured for this model. Do not retune them before
+  the per-draft cost drops: at the measured ~5.9 ms/draft (full head pass
+  plus a stream synchronization per draft), the current priors already
+  steer to the throughput-optimal short chains (forced 7-draft cycles
+  measure 47.9 tok/s against 79 adaptive).
+
+## Benchmark method (2026-09-29, Windows host)
+
+- Driver: `tools/bench/model-bench.py` with
+  `docs/models/ornith-1.5-35b/artifacts/bench.json` (Gufo-only; no llama.cpp
+  reference exists on this host — reference columns are TODO until the Linux
+  qualification run). Server: `gufo serve llm --think off
+  --max-pending-per-client 8 --sessions C`, greedy, seed-free temperature 0.
+- Native numbers: `gufo bench -p 2048 -n 128 -r 3`, AR and
+  `--speculative mtp --min-draft-tokens 1 --draft-tokens 7`.
+- Concurrency cohorts prepare every session with the exact 2040-token prose
+  prompt plus one anchored token, one session at a time, then release the
+  cohort together (`prepared_prefill_sequential`). Decoding one session at a
+  time during preparation is required for exactness: two concurrent 2040-token
+  prefills interleave scheduler chunks, and the width-sensitive prefill routes
+  (the F32 router's hipBLAS sgemv among them) shift logits by ulps, flipping
+  rare near-tie expert selections; the resulting session state decodes to
+  different greedy text than the isolated reference. Sequentially prepared
+  cohorts are hash-identical at every AR width (C1-C8) and for speculative
+  verification up to the 8-row vector-kernel contract.
+- Withheld rows: batched speculative verification co-batching sessions beyond
+  8 total rows leaves the vector kernels for the tiled fallback, which does
+  not reproduce the vector path's arithmetic; mixed text trips the gate at C4,
+  repetitive text (wider logit margins) at C6. See `artifacts/unavailable.json`.
+- Completion hashes: every published Gufo row (single-user AR, single-user
+  MTP both workloads, multi-user AR C1-C8, multi-user MTP C1/C2 mixed and
+  C1-C4 repetitive) matches the isolated AR C1 reference hash exactly.
+- Reproduction: `python tools/bench/model-bench.py --model ornith-1.5-35b
+  --gufo <binary> --gguf <artifact> run --target gufo --table single-ar,
+  single-mtp,multi-ar,multi-mtp`, then `render --no-charts`.
+  Windows needs the `servers.py` terminate fallback (no process groups).

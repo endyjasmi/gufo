@@ -641,6 +641,10 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         cache_prompt=(True if prefill_first else
                                       (False if not spec.get("cache_prompt", False) else None)),
                         prefill_first=prefill_first,
+                        prepared_prefill_sequential=(
+                            prefill_first and users > 1 and
+                            session.target == "gufo" and
+                            session.reference_kind == "llama.cpp"),
                         pin_slots=prefill_first and session.target == "reference" and session.reference_kind != "ds4",
                         preparation_tokens=0 if session.target == "reference" and session.reference_kind == "ds4" else 1,
                         reference=reference,

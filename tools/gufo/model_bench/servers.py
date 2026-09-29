@@ -125,11 +125,18 @@ class Server:
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
-        os.killpg(self.process.pid, signal.SIGTERM)
+        if hasattr(os, "killpg"):
+            os.killpg(self.process.pid, signal.SIGTERM)
+        else:
+            # Windows has no process groups; the servers are single processes.
+            self.process.terminate()
         try:
             self.process.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            if hasattr(os, "killpg"):
+                os.killpg(self.process.pid, signal.SIGKILL)
+            else:
+                self.process.kill()
             self.process.wait()
 
     def __enter__(self) -> "Server":

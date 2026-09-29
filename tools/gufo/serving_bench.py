@@ -16,6 +16,7 @@ import json
 import math
 import os
 import statistics
+from types import SimpleNamespace
 import subprocess
 import tempfile
 import threading
@@ -1146,6 +1147,7 @@ def run_corpus_benchmark(
     prefill_first: bool = False,
     pin_slots: bool = False,
     preparation_tokens: int = 1,
+    prepared_prefill_sequential: bool = False,
 ) -> dict[str, Any]:
     if not model:
         raise ValueError("model must not be empty")
@@ -1206,14 +1208,28 @@ def run_corpus_benchmark(
                     # Antirez accepts zero-token prefill; one generated token
                     # would advance its state beyond the reusable frontier.
                     # Gufo/llama.cpp retain a prompt checkpoint after one token.
-                    prepared = _run_corpus_round(
-                        base_url=base_url, model=model, cases=group,
-                        max_tokens=preparation_tokens, temperature=temperature,
-                        timeout_seconds=timeout_seconds, concurrency=concurrency,
-                        repetition=-(repetition + 1), group_index=group_index,
-                        endpoint_profile=endpoint_profile, cache_prompt=True,
-                        pin_slots=pin_slots,
-                    )
+                    def _prepared_round(cases, concurrency):
+                        return _run_corpus_round(
+                            base_url=base_url, model=model, cases=cases,
+                            max_tokens=preparation_tokens, temperature=temperature,
+                            timeout_seconds=timeout_seconds, concurrency=concurrency,
+                            repetition=-(repetition + 1), group_index=group_index,
+                            endpoint_profile=endpoint_profile, cache_prompt=True,
+                            pin_slots=pin_slots,
+                        )
+
+                    if prepared_prefill_sequential:
+                        # Prefill one session at a time so prompt arithmetic never
+                        # depends on how the scheduler interleaved the cohort's
+                        # chunks; the measured decode cohort is still released
+                        # together afterwards.
+                        prepared_samples: list[Any] = []
+                        for case in group:
+                            prepared_samples.extend(
+                                _prepared_round([case], 1).samples)
+                        prepared = SimpleNamespace(samples=prepared_samples)
+                    else:
+                        prepared = _prepared_round(group, concurrency)
                     if any(sample.completion_tokens != preparation_tokens for sample in prepared.samples):
                         raise RuntimeError("prompt preparation did not complete")
                     preparations.append({

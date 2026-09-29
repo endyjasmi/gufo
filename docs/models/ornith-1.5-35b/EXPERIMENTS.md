@@ -16,3 +16,18 @@
   sync and pipeline-replay probes (WDDM overhead is not on the critical
   path; graph replay confirmed the decode graph itself is GPU-bound at
   ~17 ms/token, i.e. bandwidth).
+- 2026-09-29 benchmark pass (native vs HTTP, concurrency): prepared-cohort
+  HTTP decode lands within 2% of native AR (62.1 vs 63.2 tok/s) and scales
+  to 198.3 tok/s aggregate at C8 with hash-exact completions. Retained
+  (sequential session preparation during cohort setup is required; see
+  QUALITY.md). Two engine findings, unfixed, both reproducible:
+  (1) concurrent prefill requests interleave scheduler chunks and the
+  width-sensitive prefill routes (F32 router hipBLAS sgemv; F16-route
+  threshold at 2048 rows) shift logits by ulps, so a session prefilled
+  alongside another can decode to different greedy text than the isolated
+  reference — fix direction: width-invariant router kernel or chunk-invariant
+  routes; (2) co-batched speculative verification beyond 8 total rows leaves
+  the q8_1 vector kernels for the tiled fallback with different quantization
+  and reduction, tripping the greedy-equivalence gate at C4 (mixed) / C6
+  (repetitive) — fix direction: cap co-batched verify rows at the vector
+  contract or make the tiled path reproduce it.
