@@ -30,3 +30,7 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 add_executable(qwen35moe_gpu_compare EXCLUDE_FROM_ALL gpu_compare.cpp)
 target_link_libraries(qwen35moe_gpu_compare PRIVATE gufo_qwen35moe gufo_qwen35moe_reference)
 set_source_files_properties(gpu_compare.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+add_executable(qwen35moe_vec_bench EXCLUDE_FROM_ALL vec_bench.cpp)
+target_link_libraries(qwen35moe_vec_bench PRIVATE gufo_qwen35moe)
+target_include_directories(qwen35moe_vec_bench SYSTEM PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/kernels/rocm/mmq)

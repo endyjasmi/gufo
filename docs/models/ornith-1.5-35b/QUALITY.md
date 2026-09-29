@@ -15,6 +15,12 @@
   against exact F32 on the original Q4_K).
 - Batched-prefill gate: `gufo bench --validate-prefill 64` passes
   (scalar_winner_rank=1, cosine 0.9977, finite).
+- Native decode views (2026-09-29 perf pass): GPU vs oracle cosine
+  0.979-0.996 across two prompts; 6/8 argmax positions agree exactly and
+  the two disagreements are near-ties (both paths quantize activations;
+  the native path keeps the artifact's own Q4_K weights). Greedy streams
+  are deterministic under repetition. MTP draft acceptance restored at
+  63/88 (72%) after fixing the split-projection view leak.
 - Operator tests: `qwen35moe.attention_ops` (16-head WMMA vs per-token
   reference, chunk-invariance exact) and `qwen35moe.gdn_ops` (32 value
   heads, conv + row-split contracts) pass on gfx1151.

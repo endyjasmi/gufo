@@ -20,6 +20,11 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  /// Raw GGUF view for the decode GEMV tier: native Q4_K bytes at half the
+  /// dequantized width. Empty when `data` already is the raw encoding or no
+  /// vector kernel covers the format (then decode reads `data`).
+  void* native_data{nullptr};
+  core::GgmlType native_type{core::GgmlType::kF32};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {

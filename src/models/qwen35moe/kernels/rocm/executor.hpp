@@ -397,6 +397,8 @@ private:
     // moe
     float* router;
     std::int32_t* ids;
+    /// Expert-slot ids for the dense native GEMV (single expert, always 0).
+    std::int32_t* zero_ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the
     // compact row -> (token, slot) maps and the tiled Q8 gathered rows.
@@ -441,6 +443,7 @@ private:
                      std::string* error) const;
   bool AllocateBatch(std::string* error_msg) const;
   std::vector<void*> allocations_;
+  std::int32_t* zero_ids_{nullptr};
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

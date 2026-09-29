@@ -5,7 +5,6 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -338,6 +337,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.ctx = f32(T * c.AttentionQDim());
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
+  s.zero_ids = Alloc<std::int32_t>(a, kVecBatch, error_msg);
+  if (s.zero_ids != nullptr) {
+    (void)hipMemset(s.zero_ids, 0, kVecBatch * sizeof(std::int32_t));
+  }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
@@ -605,6 +608,9 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  if (!MatrixRows(q.n) && q.n <= kVecBatch && w.native_data != nullptr) {
+    return Dense(w, q.x, out, q.n, error_msg);
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -627,6 +633,20 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      up.native_data != nullptr && gate.native_data != nullptr &&
+      up.native_type == gate.native_type && up.rows == gate.rows &&
+      up.cols == gate.cols) {
+    if (qfn_mmq_moe_gated_vec(
+            static_cast<int>(up.native_type), gate.native_data,
+            up.native_data, x, s_.zero_ids, out, static_cast<int>(up.rows),
+            static_cast<int>(up.cols), static_cast<int>(n_tokens), 1, 1,
+            stream_) != 0) {
+      AssignError(error_msg, "native gated vector projection failed");
+      return false;
+    }
+    return true;
+  }
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
       up.cols == gate.cols) {
@@ -698,6 +718,20 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  // Decode widths read the raw GGUF bytes through the routed vector kernel:
+  // half the traffic of the dequantized Q8_0 view, and the weights match the
+  // artifact exactly.
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      w.native_data != nullptr) {
+    if (qfn_mmq_moe_vec(static_cast<int>(w.native_type), w.native_data, x,
+                        s_.zero_ids, out, static_cast<int>(w.rows),
+                        static_cast<int>(w.cols), static_cast<int>(n_tokens),
+                        1, 1, stream_) != 0) {
+      AssignError(error_msg, "native dense vector projection failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;

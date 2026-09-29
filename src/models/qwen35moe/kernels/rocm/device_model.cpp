@@ -88,6 +88,23 @@ std::size_t RowBytesOf(GgmlType type, std::uint64_t cols) {
   }
 }
 
+/// Formats qfn_mmq_moe_vec decodes natively; a raw copy of these halves the
+/// decode-time bytes next to the Q8_0 wide-batch view.
+bool VecSupported(GgmlType type) {
+  switch (type) {
+    case GgmlType::kQ4_K:
+    case GgmlType::kQ5_K:
+    case GgmlType::kQ5_1:
+    case GgmlType::kQ8_0:
+    case GgmlType::kIQ3_S:
+    case GgmlType::kIQ4_XS:
+    case GgmlType::kIQ4_NL:
+      return true;
+    default:
+      return false;
+  }
+}
+
 /// Dequantizes one GGUF row to F32 through the scalar decode paths.
 void DequantizeRow(GgmlType type, const void* src, float* dst,
                    std::size_t cols) {
@@ -158,12 +175,53 @@ struct Uploader {
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
+    if (VecSupported(t.type)) {
+      d.native_data = ptr;
+      d.native_type = t.type;
+    }
     if (t.type == GgmlType::kBF16 || t.type == GgmlType::kF16) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
     if (t.type == GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
+    return d;
+  }
+
+  /// Concatenates the raw bytes of same-format parts into one decode view
+  /// next to their dequantized stack. Returns an empty native view when the
+  /// parts mix formats or the format has no vector kernel.
+  DeviceTensor NativeStack(std::initializer_list<const TensorRef*> parts) {
+    DeviceTensor d;
+    const GgmlType type = (*parts.begin())->type;
+    std::size_t size = 0;
+    std::size_t rows = 0;
+    for (const TensorRef* t : parts) {
+      if (t->empty() || t->type != type || !VecSupported(type)) {
+        return DeviceTensor{};
+      }
+      size += t->SizeBytes();
+      rows += t->rows;
+    }
+    void* ptr = Allocate(size);
+    if (ptr == nullptr) {
+      return DeviceTensor{};
+    }
+    std::size_t offset = 0;
+    for (const TensorRef* t : parts) {
+      if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
+                       static_cast<std::uint8_t*>(ptr) + offset, error)) {
+        Fail("native stack upload failed for " + std::string(t->name));
+        return DeviceTensor{};
+      }
+      offset += t->SizeBytes();
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
+                         kTailMargin, nullptr);
+    d.native_data = ptr;
+    d.native_type = type;
+    d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
+    d.rows = static_cast<std::uint32_t>(rows);
     return d;
   }
 
@@ -273,7 +331,15 @@ struct Uploader {
   }
 
   DeviceTensor CopyDequantOne(const TensorRef& t) {
-    return CopyDequantQ8_0({&t});
+    DeviceTensor d = CopyDequantQ8_0({&t});
+    if (d.data == nullptr) {
+      return d;
+    }
+    // The decode view: raw bytes beside the dequantized wide-batch copy.
+    const DeviceTensor native = NativeStack({&t});
+    d.native_data = native.native_data;
+    d.native_type = native.native_type;
+    return d;
   }
 
   /// Uploads F32 matrices stacked along rows and queues the device-side
@@ -435,6 +501,12 @@ struct Uploader {
                           DeviceTensor& hidden) {
     if (t.empty() || !ok)
       return;
+    // Each half covers half of every raw row; a whole-row decode view of
+    // the combined tensor must never leak into the split outputs.
+    if (t.native_data != nullptr) {
+      Fail("MTP projection split requires the dequantized tensor");
+      return;
+    }
     const std::size_t total_row_bytes = std::size_t{t.cols} / 32 * 34;
     const std::size_t row_bytes = total_row_bytes / 2;
     const std::size_t part_bytes = row_bytes * t.rows;
@@ -469,8 +541,14 @@ struct Uploader {
     d.attn_norm = Copy(l.attn_norm);
     d.post_attention_norm = Copy(l.post_attention_norm);
     if (l.linear) {
-      // The stacked qkv|gate projection: dequantized parts land in one GEMV.
+      // The stacked qkv|gate projection: dequantized parts land in one GEMV,
+      // with a raw byte-identical stack as the decode view when the formats
+      // allow it. Mixed formats keep separate parts, each with its own view.
       d.ssm_in = CopyDequantQ8_0({&l.ssm_qkv, &l.ssm_gate});
+      const DeviceTensor native =
+          NativeStack({&l.ssm_qkv, &l.ssm_gate});
+      d.ssm_in.native_data = native.native_data;
+      d.ssm_in.native_type = native.native_type;
       d.ssm_conv1d = Copy(l.ssm_conv1d);
       d.ssm_alpha_beta = AlphaBeta(l.ssm_alpha, l.ssm_beta);
       d.ssm_dt = Copy(l.ssm_dt);
@@ -479,6 +557,10 @@ struct Uploader {
       d.ssm_out = CopyDequantOne(l.ssm_out);
     } else {
       d.attn_qkv = CopyDequantQ8_0({&l.attn_q, &l.attn_k, &l.attn_v});
+      const DeviceTensor native =
+          NativeStack({&l.attn_q, &l.attn_k, &l.attn_v});
+      d.attn_qkv.native_data = native.native_data;
+      d.attn_qkv.native_type = native.native_type;
       d.attn_out = CopyDequantOne(l.attn_out);
       d.attn_q_norm = Copy(l.attn_q_norm);
       d.attn_k_norm = Copy(l.attn_k_norm);
@@ -496,7 +578,10 @@ struct Uploader {
     d.nextn_hnorm = Copy(l.nextn_hnorm);
     d.nextn_head_norm = Copy(l.nextn_head_norm);
     if (!l.nextn_eh_proj.empty()) {
-      const auto combined = CopyDequantOne(l.nextn_eh_proj);
+      // The raw eh_proj rows pack [fc_embedding | fc_hidden] across 4096
+      // columns; a raw decode view of the full tensor is meaningless after
+      // the column split, so this projection keeps only the Q8_0 halves.
+      const auto combined = CopyDequantQ8_0({&l.nextn_eh_proj});
       SplitMtpProjection(combined, d.nextn_fc_embedding, d.nextn_fc_hidden);
     }
     return d;

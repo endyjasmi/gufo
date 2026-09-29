@@ -9,11 +9,17 @@ The Linux production numbers land with the Linux qualification run.
 
 | Test  | Workload | Throughput (tok/s) |
 | --- | --- | --- |
-| pp2048 | depth 0, 2048-token prompt | 2957.7 ± 1.8 |
-| tg128 | autoregressive decode | 57.3 ± 0.0 |
-| tg128 + MTP | `--speculative mtp`, 7-draft cap | 89.6 ± 0.8 |
+| pp2048 | depth 0, 2048-token prompt | 2926.5 ± 4.3 |
+| tg128 | autoregressive decode | 63.4 ± 0.3 |
+| tg128 + MTP | `--speculative mtp`, 7-draft cap | 79.0 ± 0.4 |
 
-MTP acceptance on the deterministic bench text: 83/105 drafts (79%).
+Decode rows are the native-decode build (2026-09-29 perf pass): dense
+decode-width projections read the artifact's own Q4_K bytes through the
+routed vector kernel (E=1) instead of a dequantized Q8_0 copy, +11% AR.
+The first MTP measurement (89.6 tok/s, 79% acceptance) ran on a
+hyper-repetitive greedy stream; after the same pass the stream is natural
+text and the like-for-like speedup over AR is +25% at 63/88 drafts (72%).
+Prefill is unchanged (wide-batch Q8_0 views).
 
 ## HTTP serving (`gufo serve llm -c 4096`, server-reported timings)
 
