@@ -6093,6 +6093,28 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                      base, alt, row, dst, width);
 }
 
+__global__ void MtpAdvanceControlKernel(std::uint32_t* mtp_position,
+                                        std::uint32_t* mtp_blocks,
+                                        std::int32_t* hidden_row,
+                                        std::uint32_t count,
+                                        std::uint32_t top_k,
+                                        std::uint32_t compress_ratio) {
+  *mtp_position += count;
+  if (*mtp_position > top_k) {
+    *mtp_blocks = *mtp_position / compress_ratio;
+  }
+  *hidden_row = -1;
+}
+
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
+                       std::int32_t* hidden_row, std::uint32_t count,
+                       std::uint32_t top_k, std::uint32_t compress_ratio,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
+                     mtp_position, mtp_blocks, hidden_row, count, top_k,
+                     compress_ratio);
+}
+
 void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, hipStream_t stream) {
@@ -6162,4 +6184,4 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                                       stream);
 }
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::models::qwen38_flash_next::rocm
