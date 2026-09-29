@@ -431,7 +431,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!item.session->CheckCancellation(nullptr))
         continue;
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
-                   item.output.candidates != nullptr, error) ||
+                   item.output.candidates != nullptr, nullptr, error) ||
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }

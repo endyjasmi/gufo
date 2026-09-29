@@ -13,6 +13,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "qfn_ggml_stubs.h"
 #include "qfn_mmq.h"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -272,6 +273,8 @@ Executor::~Executor() {
         static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
         static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
         static_cast<void*>(mtp_candidates_host_),
+        static_cast<void*>(mtp_chain_host_),
+        static_cast<void*>(mtp_predictions_host_),
         static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
       (void)hipHostFree(p);
@@ -466,6 +469,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    s.mtp_chain =
+        Alloc<std::int32_t>(a, e->options_.max_speculative + 1, error_msg);
+    // All-zero expert ids: the dense Q4_0 draft head rides the routed GEMV
+    // with one "expert" spanning every row.
+    s.mtp_zero_ids =
+        Alloc<std::int32_t>(a, e->options_.max_logit_rows, error_msg);
+    if (Check(hipMemsetAsync(s.mtp_zero_ids, 0,
+                             e->options_.max_logit_rows * sizeof(std::int32_t),
+                             e->stream_),
+              "zero ids", error_msg)) {
+      (void)hipStreamSynchronize(e->stream_);
+    }
     const auto candidate_ids = MtpCandidateWorkspaceSize(c.vocab_size);
     s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
     s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
@@ -476,7 +491,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                "pinned draft token", error_msg) ||
         !Check(
             hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
-            "pinned draft candidates", error_msg)) {
+            "pinned draft candidates", error_msg) ||
+        !Check(hipHostMalloc(
+                   &e->mtp_chain_host_,
+                   (e->options_.max_speculative + 1) * sizeof(std::int32_t)),
+               "pinned draft chain", error_msg) ||
+        !Check(hipHostMalloc(
+                   &e->mtp_predictions_host_,
+                   e->options_.max_speculative * sizeof(ArgmaxCandidate)),
+               "pinned greedy predictions", error_msg)) {
       return nullptr;
     }
     std::construct_at(e->mtp_candidates_host_);
@@ -1005,10 +1028,12 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
         rc = qfn_mmq_iq3_s_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
       case GgmlType::kIQ4_XS:
-        rc = qfn_mmq_iq4_xs_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        rc =
+            qfn_mmq_iq4_xs_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
       case GgmlType::kIQ4_NL:
-        rc = qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        rc =
+            qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
       default:
         break;
@@ -1050,9 +1075,9 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
       AssignError(error_msg, "expert vector pair GEMM failed");
       return false;
     }
-  } else if (same_shape && (a.type == GgmlType::kQ4_K ||
-                            a.type == GgmlType::kIQ3_S ||
-                            a.type == GgmlType::kIQ4_XS)) {
+  } else if (same_shape &&
+             (a.type == GgmlType::kQ4_K || a.type == GgmlType::kIQ3_S ||
+              a.type == GgmlType::kIQ4_XS)) {
     // The wide pair path shares its gather and tiled quantization as well.
     RoutedHints(a, n_tokens);
     int rc = -1;
@@ -1643,7 +1668,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type =
-        l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
+        l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
                                                    : WeightType::kQ4_K;
     // The paired gate/up kernel only stages the Q4_K/Q5_K block layouts;
@@ -1672,7 +1697,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
     const WeightType down_type =
-        l.ffn_down_exps.type == GgmlType::kQ8_0   ? WeightType::kQ8_0
+        l.ffn_down_exps.type == GgmlType::kQ8_0     ? WeightType::kQ8_0
         : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
                                                     : WeightType::kQ5_1;
     // Larger down tiles amortize weight decoding. Reuse the 64-token map
@@ -1744,18 +1769,39 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::string* error_msg) const {
+                       bool candidates, std::int32_t* chain_out,
+                       std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  const DeviceTensor& draft_output = model_->output_draft();
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
+    return false;
+  }
+  if (!draft_output.empty()) {
+    // The Q4_0 draft head rides the routed vector GEMV with one "expert"
+    // spanning every row; its logits only rank proposals, which the target
+    // verifies exactly.
+    if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, s_.mixed,
+                        s_.mtp_zero_ids, s_.logits,
+                        static_cast<int>(output.rows),
+                        static_cast<int>(output.cols), 1, 1, 1, stream_,
+                        nullptr, nullptr) != 0) {
+      AssignError(error_msg, "Q4_0 draft head GEMV failed");
+      return false;
+    }
+  } else if (!Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
     return false;
   }
   if (candidates)
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
                      output.rows, stream_);
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (!Check(
+    // A chained draft step keeps its argmax on the device: the next step
+    // embeds it and the verify pass never needs it on the host.
+    Argmax(s_.logits, s_.mtp_argmax,
+           chain_out != nullptr ? chain_out : s_.mtp_token, 1, output.rows,
+           stream_);
+    if (chain_out == nullptr &&
+        !Check(
             hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
                            hipMemcpyDeviceToHost, stream_),
             "draft token download", error_msg)) {
@@ -1830,7 +1876,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg) const {
-  const bool speculative = mode == ForwardMode::kVerify;
+  const bool speculative =
+      mode == ForwardMode::kVerify || mode == ForwardMode::kVerifyGreedy;
+  const bool greedy_argmax = mode == ForwardMode::kVerifyGreedy;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
   const Config& c = config();
@@ -1903,7 +1951,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{greedy_argmax} << 45);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -1920,9 +1969,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
   }
   const auto body = [&] {
-    return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
-                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg);
+    if (!ForwardBody(session, n, n_logits, logits != nullptr, speculative,
+                     sparse, start_pos, graph ? graph_pool_grid : pool_grid,
+                     first_layer, c.num_layers, error_msg)) {
+      return false;
+    }
+    // Greedy verification also leaves the per-row argmax candidates in the
+    // pinned buffer inside the captured graph; one drain ends the cycle.
+    return !greedy_argmax || GreedyArgmaxNodes(n_logits, error_msg);
   };
   // Only the suffix waits for its pinned n-gram rows. During eager
   // execution and capture, Ple performs this wait at the same boundary.
@@ -2055,7 +2109,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
 }
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,
-                        std::string* error_msg, float* logits) const {
+                        std::string* error_msg, float* logits,
+                        bool synchronize) const {
   const Config& c = config();
   const std::uint32_t n = session.spec_tokens_;
   if (n == 0 || keep == 0 || keep > n) {
@@ -2112,7 +2167,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
             ? 0
             : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
-  if (!Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
+  if (synchronize &&
+      !Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
     return false;
   }
   if (logits != nullptr) {
@@ -2346,8 +2402,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   }
   const bool walked =
       WalkSnapshot(h, &session,
-                   [&](void* device, std::uint64_t offset,
-                       std::uint64_t bytes, const char*) {
+                   [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+                       const char*) {
                      if (!session.CheckCancellation(error_msg))
                        return false;
                      transfer.Enqueue(payload.data() + offset, device, bytes);
@@ -2487,6 +2543,47 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                error_msg);
 }
 
+bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
+                                 std::string* error_msg) const {
+  // Appended to the kVerifyGreedy body: ranks every verified row including
+  // the frontier and parks the candidates in pinned memory for
+  // ReadGreedyPredictions(). Runs inside capture like any other node. The
+  // frontier row's argmax is the next cycle's greedy anchor.
+  if (n_logits < 1 || s_.mtp_ids == nullptr) {
+    return true;
+  }
+  const auto rows = n_logits;
+  if (rows > kArgmaxParts) {
+    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
+    return false;
+  }
+  const auto vocab = config().vocab_size;
+  gufo::hip::LaunchBatchedGPUArgmax(
+      VerificationLogits(), s_.mtp_ids, rows, vocab,
+      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
+       MtpCandidateWorkspaceSize(vocab)},
+      stream_);
+  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
+                         vocab, stream_);
+  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
+                              rows * sizeof(ArgmaxCandidate),
+                              hipMemcpyDeviceToHost, stream_),
+               "greedy MTP predictions download", error_msg);
+}
+
+bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
+                                     std::string* error_msg) const {
+  if (predictions.empty() ||
+      predictions.size_bytes() >
+          options_.max_speculative * sizeof(ArgmaxCandidate)) {
+    AssignError(error_msg, "invalid greedy MTP prediction read");
+    return false;
+  }
+  std::memcpy(predictions.data(), mtp_predictions_host_,
+              predictions.size_bytes());
+  return true;
+}
+
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
                           std::int32_t hidden_row, MtpOutput output,
@@ -2566,10 +2663,132 @@ bool Executor::MtpForward(Session& session,
   return true;
 }
 
+bool Executor::MtpDraftChain(Session& session,
+                             std::span<const std::int32_t> replay,
+                             std::int32_t hidden_row, std::uint32_t proposals,
+                             std::string* error_msg) const {
+  const Config& c = config();
+  const auto m = static_cast<std::uint32_t>(replay.size());
+  if (session.owner_ != this || m == 0 || proposals == 0 ||
+      proposals + 1 > options_.max_speculative ||
+      std::any_of(replay.begin(), replay.end(), [&](auto t) {
+        return t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size;
+      })) {
+    AssignError(error_msg, "invalid MTP draft chain request");
+    return false;
+  }
+  if (!session.CheckCancellation(error_msg))
+    return false;
+  if (!session.mtp_enabled_) {
+    AssignError(error_msg, "no MTP block loaded");
+    return false;
+  }
+  if (hidden_row < 0 ||
+      static_cast<std::uint32_t>(hidden_row) + m > options_.max_speculative) {
+    AssignError(error_msg, "MTP chain outside the kept hidden rows");
+    return false;
+  }
+  const std::uint32_t pos = session.mtp_.position;
+  // The catch-up consumes `m` positions and every chained step one more;
+  // the last proposal needs no further draft position.
+  if (pos + m + proposals - 1 > session.max_context_) {
+    AssignError(error_msg, "MTP context is full");
+    return false;
+  }
+  ++session.mutation_epoch_;
+  // Stage the catch-up tokens; the anchor (their last row) also feeds the
+  // captured chain[0] upload below. Pinned sources the graph nodes point at.
+  std::copy(replay.begin(), replay.end(), tokens_host_);
+  control_host_->position = session.position_;
+  control_host_->blocks = session.blocks_;
+  control_host_->mtp_position = pos;
+  control_host_->mtp_blocks = session.mtp_.blocks;
+  control_host_->hidden_row = hidden_row;
+
+  // The device-side block count only tracks `complete` while positions stay
+  // past the indexer budget. A stage crossing the budget (or a rewind
+  // backlog) needs the wide eager pool grid, so those cycles never capture.
+  // A captured replay also requires one sparse pattern for every stage: the
+  // chain either stays wholly under the budget or starts past it. Every
+  // stage's pool must fit the per-call bound its grid was sized with.
+  const bool sparse = pos + m > c.indexer_top_k;
+  const std::uint32_t pool =
+      sparse ? (pos + m) / c.compress_ratio - session.mtp_.blocks : 0;
+  const std::uint32_t graph_pool = m / c.compress_ratio + 1;
+  bool steady = pool <= graph_pool;
+  std::uint32_t blocks =
+      sparse ? (pos + m) / c.compress_ratio : session.mtp_.blocks;
+  for (std::uint32_t i = 0; steady && i + 1 < proposals; ++i) {
+    const std::uint32_t step_pos = pos + m + i;
+    const bool step_sparse = step_pos + 1 > c.indexer_top_k;
+    const std::uint32_t step_pool =
+        step_sparse ? (step_pos + 1) / c.compress_ratio - blocks : 0;
+    steady = step_pool <= 1;
+    if (step_sparse)
+      blocks = (step_pos + 1) / c.compress_ratio;
+  }
+  const bool graph =
+      steady && (sparse || pos + m + proposals - 1 <= c.indexer_top_k) &&
+      m <= kVecBatch && pos + 1 >= session.VisionLayout().PrefixLength();
+  const std::uint64_t key =
+      static_cast<std::uint64_t>(m) |
+      (static_cast<std::uint64_t>(proposals) << 8) | (std::uint64_t{1} << 40) |
+      (std::uint64_t{1} << 41) | (std::uint64_t{1} << 46) |
+      (std::uint64_t{sparse} << 44);
+  auto* control_words = reinterpret_cast<std::uint32_t*>(session.control_);
+  auto* mtp_position_word = control_words + 2;  ///< Session::Control offset
+  auto* mtp_blocks_word = control_words + 4;
+  auto* hidden_row_word = reinterpret_cast<std::int32_t*>(control_words + 3);
+  const auto body = [&] {
+    // chain[0] is the anchor: the last replay row, staged in pinned memory.
+    if (!Check(hipMemcpyAsync(s_.mtp_chain, tokens_host_ + m - 1,
+                              sizeof(std::int32_t), hipMemcpyHostToDevice,
+                              stream_),
+               "chain anchor upload", error_msg)) {
+      return false;
+    }
+    // Catch-up: the replay rows produce the first proposal's argmax.
+    if (!MtpBody(session, m, pos, true, false, error_msg,
+                 graph ? graph_pool : pool, nullptr, nullptr, nullptr,
+                 s_.mtp_chain + 1)) {
+      return false;
+    }
+    // The catch-up consumed m draft positions; every later step one more.
+    MtpAdvanceControl(mtp_position_word, mtp_blocks_word, hidden_row_word, m,
+                      c.indexer_top_k, c.compress_ratio, stream_);
+    for (std::uint32_t i = 1; i < proposals; ++i) {
+      if (!MtpBody(session, 1, pos + m + i - 1, true, false, error_msg, 1,
+                   nullptr, nullptr, s_.mtp_chain + i, s_.mtp_chain + i + 1)) {
+        return false;
+      }
+      MtpAdvanceControl(mtp_position_word, mtp_blocks_word, hidden_row_word, 1,
+                        c.indexer_top_k, c.compress_ratio, stream_);
+    }
+    return Check(hipMemcpyAsync(mtp_chain_host_, s_.mtp_chain,
+                                (proposals + 1) * sizeof(std::int32_t),
+                                hipMemcpyDeviceToHost, stream_),
+                 "draft chain download", error_msg);
+  };
+  if (!Run(session, key, graph, body, error_msg)) {
+    return false;
+  }
+  // The chain uploads its anchor from tokens_host_[m-1] at replay start.
+  session.mtp_.position = pos + m + proposals - 1;
+  if (session.mtp_.position > c.indexer_top_k)
+    session.mtp_.blocks = session.mtp_.position / c.compress_ratio;
+  return true;
+}
+
+std::span<const std::int32_t> Executor::ChainTokens(
+    std::uint32_t proposals) const noexcept {
+  return std::span(mtp_chain_host_, proposals + 1);
+}
+
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        bool token, bool candidates, std::string* error_msg,
                        std::uint32_t pool_grid, const float* hidden_source,
-                       MtpTrace* trace) const {
+                       MtpTrace* trace, const std::int32_t* embed_tokens,
+                       std::int32_t* chain_out) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -2582,17 +2801,24 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                                 stream_),
                  "MTP trace download", error_msg);
   };
-  if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                            sizeof(Session::Control), hipMemcpyHostToDevice,
-                            stream_),
-             "control upload", error_msg) ||
-      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
-             "token upload", error_msg)) {
-    return false;
+  if (embed_tokens != nullptr) {
+    // A chained step: the control block already advanced on the device and
+    // the token comes from the previous step's argmax. No host staging.
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                embed_tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
+  } else {
+    if (!Check(hipMemcpyAsync(session.control_, control_host_,
+                              sizeof(Session::Control), hipMemcpyHostToDevice,
+                              stream_),
+               "control upload", error_msg) ||
+        !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "token upload", error_msg)) {
+      return false;
+    }
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   // MTP embeds shifted token IDs. Visual information arrives in the trunk
   // hidden stream; image embeddings belong only to the target input.
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
@@ -2695,7 +2921,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates, chain_out, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -77,6 +77,8 @@ public:
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
   const DeviceTensor& output() const noexcept { return output_; }
+  /// Q4_0 copy of the LM head for draft proposals (empty when absent).
+  const DeviceTensor& output_draft() const noexcept { return output_draft_; }
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
@@ -97,6 +99,7 @@ private:
   Config config_;
   DeviceTensor token_embd_;
   DeviceTensor output_;
+  DeviceTensor output_draft_{};
   DeviceMixer hc_head_;
   std::vector<DeviceLayer> layers_;
   DeviceLayer mtp_;

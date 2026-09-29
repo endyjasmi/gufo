@@ -55,12 +55,39 @@ std::uint16_t Fp32ToF16(float value) {
   return static_cast<std::uint16_t>(half);
 }
 
+float Fp16ToF32(std::uint16_t value) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000) << 16;
+  const std::uint32_t exponent = (value >> 10) & 0x1F;
+  const std::uint32_t mantissa = value & 0x3FF;
+  if (exponent == 0) {
+    const auto bits =
+        sign | std::bit_cast<std::uint32_t>(mantissa * 5.960464477539063e-8f);
+    return std::bit_cast<float>(bits);
+  }
+  if (exponent == 0x1F) {
+    return std::bit_cast<float>(sign | 0x7F800000u |
+                                (mantissa != 0 ? 0x400000u : 0u));
+  }
+  return std::bit_cast<float>(sign | ((exponent + 112u) << 23) |
+                              (mantissa << 13));
+}
+
 /// The quantized GEMM tier reads whole 256-element k-iterations, so a row
 /// whose length is only a multiple of 32 over-reads into the next row and,
 /// on the last row, past the tensor. Every upload carries this tail so the
 /// over-read stays inside the allocation (the extra bytes meet zeroed
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
+
+#pragma pack(push, 1)
+/// Q4_0 block: fp16 scale + 16 packed nibbles (QK=32). Quantized values are
+/// zero-based codes; the kernels subtract the 8 offset in the dot product.
+struct BlockQ4_0 {
+  std::uint16_t d;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(BlockQ4_0) == 18, "block_q4_0 must be 18 bytes");
+#pragma pack(pop)
 
 struct Conversion {
   void* source;
@@ -111,8 +138,7 @@ struct Uploader {
     const auto* src =
         static_cast<const std::uint8_t*>(region.data) + t.file_offset;
     const std::size_t row_src_bytes = t.cols / 256 * 210;
-    const std::size_t row_dst_bytes =
-        t.cols / 32 * sizeof(quant::block_q8_0);
+    const std::size_t row_dst_bytes = t.cols / 32 * sizeof(quant::block_q8_0);
     const std::size_t dst_bytes = t.rows * row_dst_bytes;
     void* ptr = nullptr;
     if (hipMalloc(&ptr, dst_bytes + kTailMargin) != hipSuccess) {
@@ -128,12 +154,10 @@ struct Uploader {
     for (std::uint32_t w = 0; w < workers; ++w) {
       threads.emplace_back([&, w] {
         std::vector<float> chunk(t.cols);
-        const std::uint32_t begin =
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(t.rows) *
-                                       w / workers);
-        const std::uint32_t end =
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(t.rows) *
-                                       (w + 1) / workers);
+        const std::uint32_t begin = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(t.rows) * w / workers);
+        const std::uint32_t end = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(t.rows) * (w + 1) / workers);
         for (std::uint32_t row = begin; row < end; ++row) {
           quant::DequantizeQ6_K(src + row * row_src_bytes, chunk.data(),
                                 t.cols);
@@ -149,8 +173,7 @@ struct Uploader {
             const float id = dblock != 0.0f ? 1.0f / dblock : 0.0f;
             out[b].d = Fp32ToF16(dblock);
             for (std::size_t j = 0; j < 32; ++j) {
-              out[b].qs[j] =
-                  static_cast<std::int8_t>(std::roundf(v[j] * id));
+              out[b].qs[j] = static_cast<std::int8_t>(std::roundf(v[j] * id));
             }
           }
         }
@@ -172,6 +195,93 @@ struct Uploader {
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
     max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
+    return d;
+  }
+
+  /// Host-requantizes a Q8_0 tensor to Q4_0 rows and uploads the result.
+  /// The draft head is the only expected caller: its logits only rank
+  /// proposals the target verifies exactly, so the coarser format costs
+  /// nothing but the per-pass weight bytes, which halve.
+  DeviceTensor RequantQ4_0(const TensorRef& t) {
+    DeviceTensor d;
+    if (t.empty() || !ok) {
+      return d;
+    }
+    if (t.type != core::GgmlType::kQ8_0) {
+      Fail("Q4_0 requant needs Q8_0: " + std::string(t.name));
+      return d;
+    }
+    if (t.cols % 32 != 0) {
+      Fail("Q4_0 requant needs 32-aligned columns: " + std::string(t.name));
+      return d;
+    }
+    const auto& region = shards[t.shard];
+    const auto* src =
+        static_cast<const std::uint8_t*>(region.data) + t.file_offset;
+    const std::size_t row_src_bytes = t.cols / 32 * sizeof(quant::block_q8_0);
+    const std::size_t row_dst_bytes = t.cols / 32 * sizeof(BlockQ4_0);
+    const std::size_t dst_bytes = t.rows * row_dst_bytes;
+    void* ptr = nullptr;
+    if (hipMalloc(&ptr, dst_bytes + kTailMargin) != hipSuccess) {
+      Fail("Q4_0 upload allocation failed for " + std::string(t.name));
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += dst_bytes + kTailMargin;
+    std::vector<std::uint8_t> staged(dst_bytes);
+    const std::uint32_t workers =
+        std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    std::vector<std::thread> threads;
+    for (std::uint32_t w = 0; w < workers; ++w) {
+      threads.emplace_back([&, w] {
+        const std::uint32_t begin = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(t.rows) * w / workers);
+        const std::uint32_t end = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(t.rows) * (w + 1) / workers);
+        for (std::uint32_t row = begin; row < end; ++row) {
+          const auto* in = reinterpret_cast<const quant::block_q8_0*>(
+              src + static_cast<std::size_t>(row) * row_src_bytes);
+          auto* out = reinterpret_cast<BlockQ4_0*>(
+              staged.data() + static_cast<std::size_t>(row) * row_dst_bytes);
+          for (std::size_t b = 0; b < t.cols / 32; ++b) {
+            const float dblock = Fp16ToF32(in[b].d);
+            float v[32];
+            for (std::size_t j = 0; j < 32; ++j) {
+              v[j] = dblock * static_cast<float>(in[b].qs[j]);
+            }
+            float amax = 0.0f;
+            for (std::size_t j = 0; j < 32; ++j) {
+              amax = std::max(amax, std::fabs(v[j]));
+            }
+            const float scale = amax / 7.0f;
+            const float id = scale != 0.0f ? 1.0f / scale : 0.0f;
+            out[b].d = Fp32ToF16(scale);
+            for (std::size_t j = 0; j < 16; ++j) {
+              const int lo = std::clamp(
+                  static_cast<int>(std::lroundf(v[j] * id)) + 8, 0, 15);
+              const int hi = std::clamp(
+                  static_cast<int>(std::lroundf(v[j + 16] * id)) + 8, 0, 15);
+              out[b].qs[j] = static_cast<std::uint8_t>(lo | (hi << 4));
+            }
+          }
+        }
+      });
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    if (hipMemcpy(ptr, staged.data(), dst_bytes, hipMemcpyHostToDevice) !=
+        hipSuccess) {
+      Fail("Q4_0 upload failed for " + std::string(t.name));
+      return d;
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + dst_bytes, 0,
+                         kTailMargin, nullptr);
+    d.data = ptr;
+    d.type = core::GgmlType::kQ4_0;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = 1;
     return d;
   }
 
@@ -407,8 +517,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     if (t.type != core::GgmlType::kQ6_K)
       return true;
     if (t.experts != 1)
-      *error_msg = "unsupported HIP expert tensor format Q6_K: " +
-                   std::string(t.name);
+      *error_msg =
+          "unsupported HIP expert tensor format Q6_K: " + std::string(t.name);
     return t.experts == 1;
   };
   const auto layer_supported = [&](const LayerWeights& l) {
@@ -464,6 +574,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     up.shard_base = shard_count;
     m->mtp_ = up.Layer(mtp->block);
     m->has_mtp_ = true;
+    // The draft head only ranks proposals the target verifies exactly, so
+    // a Q4_0 copy halves its weight bytes at no quality cost.
+    m->output_draft_ = w.output.type == core::GgmlType::kQ8_0
+                           ? up.RequantQ4_0(w.output)
+                           : DeviceTensor{};
   }
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

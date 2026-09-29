@@ -620,6 +620,7 @@ struct Session::PendingDecode {
   bool sampled{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
+  bool greedy_pinned{false};
   std::size_t width{0};
   std::optional<sampling::SamplerState> draft_sampler;
   std::uint64_t draft_rng{0};
@@ -689,40 +690,71 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
   const bool gpu_verification = gpu_greedy;
-  if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
-                                   sampled ? &pending->candidates : nullptr)) {
-    return false;
+  bool chained = false;
+  if (!defer_head && gpu_greedy && !sampled) {
+    // Greedy MTP keeps every draft token on the device: the catch-up and
+    // all proposals run as one chained submission and the pinned chain
+    // feeds verification. No per-draft host round trip.
+    std::vector<std::int32_t> replay;
+    std::int32_t replay_row = 0;
+    if (!DraftReplay(anchor, &replay, &replay_row, error_msg)) {
+      return false;
+    }
+    if (!replay.empty() && !exec.MtpDraftChain(*session_, replay, replay_row,
+                                               width - 1, error_msg)) {
+      return false;
+    }
+    if (!replay.empty()) {
+      pending->chain.assign(exec.ChainTokens(width - 1).begin(),
+                            exec.ChainTokens(width - 1).end());
+      chained = true;
+    }
   }
-  // A cycle-local proposal stream needs no pending RNG state in snapshots.
-  // Target verification keeps its own draws after this independent seed.
-  pending->draft_rng =
-      sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
-  pending->draft_sampler = sampler.WithoutConstraint();
-  pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
-  pending->chain = {anchor};
-  pending->draft = draft_token_;
+  if (!chained) {
+    if (!defer_head &&
+        !DraftCatchUp(anchor, true, error_msg,
+                      sampled ? &pending->candidates : nullptr)) {
+      return false;
+    }
+    // A cycle-local proposal stream needs no pending RNG state in snapshots.
+    // Target verification keeps its own draws after this independent seed.
+    pending->draft_rng =
+        sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
+    pending->draft_sampler = sampler.WithoutConstraint();
+    pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
+    pending->chain = {anchor};
+    pending->draft = draft_token_;
+    pending->width = width;
+    pending->base = base;
+    pending->speculative = true;
+    pending->sampled = sampled;
+    pending->gpu_greedy = gpu_greedy;
+    pending->gpu_verification = gpu_verification;
+    if (!gpu_verification && verify_logits_.empty()) {
+      verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
+    }
+    if (!defer_head) {
+      while (pending->chain.size() < width) {
+        AppendDraft(*pending);
+        if (pending->chain.size() < width &&
+            !exec.MtpForward(
+                *session_, std::span<const std::int32_t>(&pending->draft, 1),
+                -1,
+                {.token = sampled ? nullptr : &pending->draft,
+                 .candidates = sampled ? &pending->candidates : nullptr},
+                error_msg)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
   pending->width = width;
   pending->base = base;
   pending->speculative = true;
-  pending->sampled = sampled;
-  pending->gpu_greedy = gpu_greedy;
-  pending->gpu_verification = gpu_verification;
-  if (!gpu_verification && verify_logits_.empty()) {
-    verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
-  }
-  if (!defer_head) {
-    while (pending->chain.size() < width) {
-      AppendDraft(*pending);
-      if (pending->chain.size() < width &&
-          !exec.MtpForward(
-              *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
-              {.token = sampled ? nullptr : &pending->draft,
-               .candidates = sampled ? &pending->candidates : nullptr},
-              error_msg)) {
-        return false;
-      }
-    }
-  }
+  pending->gpu_greedy = true;
+  pending->gpu_verification = true;
+  pending->greedy_pinned = true;
   return true;
 }
 
@@ -753,9 +785,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
-  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
+  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens + 1> greedy{};
   if (gpu_greedy &&
-      !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), error_msg)) {
+      !(pending.greedy_pinned
+            ? exec.ReadGreedyPredictions(std::span(greedy).first(k), error_msg)
+            : exec.GreedyMtpPredictions(std::span(greedy).first(k - 1),
+                                        error_msg))) {
     return false;
   }
   std::uint32_t keep = 1;
@@ -806,8 +841,15 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
-  if (!exec.Rollback(*session_, keep, error_msg,
-                     gpu_verification ? logits_.data() : nullptr)) {
+  if (pending.greedy_pinned) {
+    // The frontier row's argmax rode inside the verify graph: the next
+    // anchor needs no frontier download and no rollback drain, both fold
+    // into the next cycle's launches.
+    if (!exec.Rollback(*session_, keep, error_msg, nullptr, false)) {
+      return false;
+    }
+  } else if (!exec.Rollback(*session_, keep, error_msg,
+                            gpu_verification ? logits_.data() : nullptr)) {
     return false;
   }
   if (!gpu_verification) {
@@ -827,7 +869,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
-  if (correction) {
+  if (pending.greedy_pinned && !result->stop) {
+    sampler.DeferSample(static_cast<sampling::TokenId>(greedy[keep - 1].index));
+  } else if (correction) {
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
@@ -858,8 +902,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
                                              : verify_logits_.data();
   if (!model_->executor_->Forward(
           *session_, pending.chain, pending.chain.size(), logits,
-          pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                              : rocm::Executor::ForwardMode::kDecode,
+          pending.speculative
+              ? (pending.gpu_verification
+                     ? rocm::Executor::ForwardMode::kVerifyGreedy
+                     : rocm::Executor::ForwardMode::kVerify)
+              : rocm::Executor::ForwardMode::kDecode,
           error_msg)) {
     return false;
   }

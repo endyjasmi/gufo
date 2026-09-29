@@ -163,7 +163,7 @@ public:
       std::uint32_t rollback_depth) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
-  enum class ForwardMode { kDecode, kVerify, kPrefill };
+  enum class ForwardMode { kDecode, kVerify, kVerifyGreedy, kPrefill };
 
   /// Appends `tokens` (at most max_batch) to the session and returns the
   /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
@@ -193,10 +193,11 @@ public:
 
   /// Keeps the first `keep` (1..n) tokens of the last speculative batch and
   /// discards the rest. If `logits` is supplied, copies the kept frontier
-  /// into it using the same synchronization as rollback.
+  /// into it and synchronizes. With `synchronize` cleared the caller keeps
+  /// its frontier elsewhere and the drain folds into its next launch.
   [[nodiscard]] bool Rollback(Session& session, std::uint32_t keep,
-                              std::string* error_msg,
-                              float* logits = nullptr) const;
+                              std::string* error_msg, float* logits = nullptr,
+                              bool synchronize = true) const;
 
   /// Runs the draft block over `tokens` (at most max_batch) at the session's
   /// MTP position. The hidden input of token i is the trunk residual of row
@@ -231,6 +232,23 @@ public:
                                 std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg,
                                 const float* hidden_source = nullptr) const;
+
+  /// Runs the draft block's catch-up over `replay` (whose last token is the
+  /// cycle's anchor) and then chains `proposals` greedy draft steps in one
+  /// submission, each embedding the previous step's device-side argmax. No
+  /// draft token ever reaches the host between steps. After the call
+  /// returns, the pinned chain (anchor + proposals tokens) is readable via
+  /// ChainTokens(). The greedy cycle pairs this with a kVerifyGreedy
+  /// Forward, whose per-row argmax candidates are read by
+  /// ReadGreedyPredictions().
+  [[nodiscard]] bool MtpDraftChain(Session& session,
+                                   std::span<const std::int32_t> replay,
+                                   std::int32_t hidden_row,
+                                   std::uint32_t proposals,
+                                   std::string* error_msg) const;
+  /// Pinned anchor + proposals tokens written by MtpDraftChain.
+  [[nodiscard]] std::span<const std::int32_t> ChainTokens(
+      std::uint32_t proposals) const noexcept;
   /// Leading kept trunk rows, for independent predictor qualification.
   [[nodiscard]] bool CopyTrunkHidden(const Session& session,
                                      std::span<float> hidden,
@@ -238,6 +256,11 @@ public:
 
   /// Plain greedy verification keeps full logit rows on the GPU.
   [[nodiscard]] bool GreedyMtpPredictions(
+      std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
+
+  /// Copies the per-row argmax candidates a kVerifyGreedy Forward left in
+  /// its pinned buffer (no device work, no synchronization).
+  [[nodiscard]] bool ReadGreedyPredictions(
       std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
 
   /// A session's complete context as one host byte payload: recurrent and
@@ -379,17 +402,24 @@ private:
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
+  /// A non-null `chain_out` keeps the argmax on the device (chained drafts).
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool candidates, std::string* error_msg) const;
+               bool candidates, std::int32_t* chain_out,
+               std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
                    std::uint32_t start_pos, std::uint32_t pool_grid,
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg) const;
+  /// Appends the verify pass's per-row argmax and its pinned download to
+  /// the kVerifyGreedy body (also its captured graph).
+  bool GreedyArgmaxNodes(std::uint32_t n_logits, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
-               const float* hidden_source, MtpTrace* trace) const;
+               const float* hidden_source, MtpTrace* trace,
+               const std::int32_t* embed_tokens = nullptr,
+               std::int32_t* chain_out = nullptr) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -481,6 +511,10 @@ private:
     float* mtp_res;
     ArgmaxCandidate* mtp_argmax;
     std::int32_t* mtp_token;
+    /// Chained draft tokens: [0] the anchor upload, [i+1] step i's argmax.
+    std::int32_t* mtp_chain;
+    /// All-zero expert ids for the dense Q4_0 draft head's routed GEMV.
+    std::int32_t* mtp_zero_ids;
     std::uint32_t* mtp_ids;
     std::uint32_t* mtp_scratch_ids;
     float* mtp_scores;
@@ -536,6 +570,10 @@ private:
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
+  /// Pinned anchor + draft proposals written by the captured MtpDraftChain
+  /// graph, and the verify pass's per-row greedy argmax candidates.
+  std::int32_t* mtp_chain_host_{nullptr};
+  ArgmaxCandidate* mtp_predictions_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

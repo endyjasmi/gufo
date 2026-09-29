@@ -459,6 +459,15 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
 
+/// Advances the draft control block after one chained draft stage: the draft
+/// position moves by `count` tokens and, once past the indexer budget, the
+/// pooled block count tracks it. `hidden_row` falls back to the carried
+/// residual.
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
+                       std::int32_t* hidden_row, std::uint32_t count,
+                       std::uint32_t top_k, std::uint32_t compress_ratio,
+                       hipStream_t stream);
+
 /// Add the projected embedding once to each projected hidden branch.
 void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
