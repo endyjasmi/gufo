@@ -658,11 +658,22 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
     std::cerr << "Unsupported Flash-Next chat template: " << error << '\n';
     return nullptr;
   }
+  std::string mtp_model_path;
+  if (opt.speculative_backend == "mtp") {
+    mtp_model_path =
+        opt.mtp_model_path.empty()
+            ? models::qwen38_flash_next::DiscoverMtpSidecar(opt.model_path)
+            : opt.mtp_model_path;
+    if (mtp_model_path.empty()) {
+      std::cerr << "Flash-Next MTP requires --mtp-model or a shared MTP "
+                   "sidecar beside the model\n";
+      return nullptr;
+    }
+  }
   auto model = models::qwen38_flash_next::Model::Load(
       opt.model_path,
       {.max_context = kDefaultContext,
-       .mtp_model_path =
-           opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
+       .mtp_model_path = mtp_model_path,
        .max_draft_tokens = opt.draft_tokens,
        .vision_model_path = opt.vision_model_path},
       &error);
@@ -944,11 +955,10 @@ static std::optional<PromptOptions> ParseTextOptions(
       *error_msg = "DFlash2 requires --dflash-model";
     return std::nullopt;
   }
-  if (backend == "mtp" && opt.mtp_model_path.empty()) {
-    if (error_msg != nullptr)
-      *error_msg = "MTP requires --mtp-model";
-    return std::nullopt;
-  }
+  // MTP without --mtp-model stays allowed here: Flash-Next resolves a shared
+  // sidecar beside the artifact and Ornith carries the predictor in-file.
+  // RunPrompt/RunChat reject the remaining architectures once the GGUF
+  // architecture is known.
 
   if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
       opt.min_draft_tokens > opt.draft_tokens) {
@@ -1062,6 +1072,17 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
+    // Flash-Next resolves a shared sidecar beside the artifact and Ornith
+    // carries the predictor in-file; every other architecture needs an
+    // explicit --mtp-model.
+    const auto architecture = reader->GetMetadataString("general.architecture");
+    if (architecture != "qwen4exp" && architecture != "qwen35moe") {
+      std::cerr << "Error: MTP requires --mtp-model\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 1;
+    }
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1305,6 +1326,17 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
+    // Flash-Next resolves a shared sidecar beside the artifact and Ornith
+    // carries the predictor in-file; every other architecture needs an
+    // explicit --mtp-model.
+    const auto architecture = reader->GetMetadataString("general.architecture");
+    if (architecture != "qwen4exp" && architecture != "qwen35moe") {
+      std::cerr << "Error: MTP requires --mtp-model\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 1;
+    }
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {

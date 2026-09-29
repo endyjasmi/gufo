@@ -906,8 +906,13 @@ int RunQwen38FlashNextBenchmark(
                  "or off\n";
     return 1;
   }
-  if (mtp && options.mtp_model_path.empty()) {
-    std::cerr << "Error: --speculative mtp requires --mtp-model\n";
+  const std::string mtp_model_path =
+      mtp && options.mtp_model_path.empty()
+          ? qfn::DiscoverMtpSidecar(options.model_path)
+          : options.mtp_model_path;
+  if (mtp && mtp_model_path.empty()) {
+    std::cerr << "Error: --speculative mtp requires --mtp-model or a "
+                 "shared MTP sidecar beside the model\n";
     return 1;
   }
   if (options.concurrency != std::vector<std::size_t>{1}) {
@@ -929,7 +934,7 @@ int RunQwen38FlashNextBenchmark(
       options.model_path,
       qfn::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
-          .mtp_model_path = mtp ? options.mtp_model_path : "",
+          .mtp_model_path = mtp ? mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
       },
       &error);

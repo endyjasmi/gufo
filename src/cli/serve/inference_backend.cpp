@@ -3621,22 +3621,32 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+    TextSpeculativeConfig resolved_speculative_config = speculative_config;
+    if (resolved_speculative_config.backend !=
+            TextSpeculativeBackend::kDisabled &&
+        resolved_speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
                "Qwen3.8-Flash-Next HTTP models support only MTP speculative "
                "decoding (--speculative mtp --mtp-model)");
       return false;
     }
-    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
-        speculative_config.draft_model_path.empty()) {
+    if (resolved_speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        resolved_speculative_config.draft_model_path.empty()) {
+      // The shared MTP sidecar is discovered beside the target, like the
+      // vision sidecar; --mtp-model is only required when it lives elsewhere.
+      resolved_speculative_config.draft_model_path =
+          models::qwen38_flash_next::DiscoverMtpSidecar(model_path);
+    }
+    if (resolved_speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        resolved_speculative_config.draft_model_path.empty()) {
       SetError(error,
-               "Qwen3.8-Flash-Next MTP HTTP decoding requires --mtp-model");
+               "Qwen3.8-Flash-Next MTP HTTP decoding requires --mtp-model "
+               "or a shared MTP sidecar beside the model");
       return false;
     }
-    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
-        (speculative_config.max_draft_tokens == 0 ||
-         speculative_config.min_draft_tokens != 1)) {
+    if (resolved_speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        (resolved_speculative_config.max_draft_tokens == 0 ||
+         resolved_speculative_config.min_draft_tokens != 1)) {
       SetError(error,
                "Flash-Next MTP requires a positive draft limit and "
                "--min-draft-tokens 1");
@@ -3655,11 +3665,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
         model_path,
         models::qwen38_flash_next::ModelOptions{
             .max_context = max_context,
-            .mtp_model_path =
-                speculative_config.backend == TextSpeculativeBackend::kMtp
-                    ? speculative_config.draft_model_path
-                    : std::string{},
-            .max_draft_tokens = speculative_config.max_draft_tokens,
+            .mtp_model_path = resolved_speculative_config.backend ==
+                                      TextSpeculativeBackend::kMtp
+                                  ? resolved_speculative_config.draft_model_path
+                                  : std::string{},
+            .max_draft_tokens = resolved_speculative_config.max_draft_tokens,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
@@ -3678,16 +3688,17 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config) &&
-        speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        resolved_speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
-            "Qwen3.8-Flash-Next MTP", speculative_config.draft_model_path,
+            "Qwen3.8-Flash-Next MTP",
+            resolved_speculative_config.draft_model_path,
             &resolved_disk_cache_config.draft_model_artifact_fingerprint,
             error)) {
       return false;
     }
     return load(std::move(model), error, max_context, session_count,
-                prefill_policy, scheduler_policy, speculative_config,
+                prefill_policy, scheduler_policy, resolved_speculative_config,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {

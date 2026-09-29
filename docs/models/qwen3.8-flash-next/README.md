@@ -22,9 +22,12 @@ MTP=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
   --mtp-model "$MTP" --sessions 2 --context 32768
 ```
 
-The loader discovers the remaining shards. Omit the speculative options for AR;
-AR sessions allocate no predictor state even if a shared model has MTP loaded.
-Adaptive MTP is default, with `--draft-tokens` capping 1–7 proposals. Sampled
+The loader discovers the remaining shards and, with `--speculative mtp`, the
+shared MTP sidecar: like the vision sidecar it is found beside the target or in
+its `MTP/` subdirectory, so `--mtp-model` is only needed when it lives
+elsewhere. Omit the speculative options for AR; AR sessions allocate no
+predictor state even if a shared model has MTP loaded. Adaptive MTP is default,
+with `--draft-tokens` capping 1–7 proposals. Sampled
 requests use deterministic acceptance/cost control for seeded replay; all-greedy
 C>1 batches may use measured cycle costs. Each request keeps private caches,
 rollback and RNG. See [MTP qualification](QUALITY.md).

@@ -345,8 +345,7 @@ struct Encoder::Impl {
     expect("clip.vision.attention.head_count", kHeads);
     expect("clip.vision.spatial_merge_size", 2);
     expect("clip.vision.image_size", 768);
-    if ((width != 5120 && width != 2560) ||
-        reader->GetMetadataString("general.architecture") != "clip" ||
+    if (reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
         reader->GetMetadataBool("clip.has_vision_encoder") != true ||
         reader->GetMetadataBool("clip.use_gelu") != true ||
@@ -523,6 +522,21 @@ std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
     const auto path = directory / "mmproj-BF16.gguf";
     if (std::filesystem::is_regular_file(path))
       return std::make_shared<Encoder>(path, width);
+    std::error_code ec;
+    // Hugging Face repositories ship the projector under artifact-specific
+    // names (e.g. mmproj-Ornith-1.5-35B-BF16.gguf); accept one unique
+    // mmproj*.gguf beside the target when the canonical name is absent.
+    std::vector<std::filesystem::path> found;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory, ec)) {
+      if (!entry.is_regular_file(ec))
+        continue;
+      const auto name = entry.path().filename().string();
+      if (name.starts_with("mmproj") && name.ends_with(".gguf"))
+        found.push_back(entry.path());
+    }
+    if (found.size() == 1)
+      return std::make_shared<Encoder>(found.front(), width);
     directory = directory.parent_path();
   }
   return {};
