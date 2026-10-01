@@ -1,0 +1,161 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk:
+        description: TheRock nightly gfx1151 Windows tarball to build with
+        required: false
+        default: therock-dist-windows-gfx1151-10.2.0a20261001.tar.gz
+      publish:
+        description: Publish the build to a GitHub release
+        type: boolean
+        required: false
+        default: true
+  push:
+    tags:
+      - "windows-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: true
+
+jobs:
+  windows-release:
+    name: Build and package Windows release
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      SDK_TARBALL: ${{ github.event.inputs.sdk || 'therock-dist-windows-gfx1151-10.2.0a20261001.tar.gz' }}
+      SDK_ROOT: C:/TheRock/build
+      BUILD_DIR: build\windows-release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify this is the Windows port branch
+        shell: pwsh
+        run: |
+          if ((Get-Content CMakePresets.json -Raw) -notmatch '"windows-release"') {
+            throw "CMakePresets.json has no windows-release preset; this checkout is not the Windows port. Run this workflow on the feature/window-native branch (or a windows-v* tag pointing at it)."
+          }
+
+      - name: Download TheRock HIP SDK
+        shell: pwsh
+        run: |
+          $url = "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+          curl.exe --fail --location --retry 3 --output "$env:RUNNER_TEMP\sdk.tar.gz" "$url"
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE for $url" }
+
+      - name: Extract TheRock HIP SDK
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:SDK_ROOT | Out-Null
+          tar -xzf "$env:RUNNER_TEMP\sdk.tar.gz" -C $env:SDK_ROOT
+          Remove-Item "$env:RUNNER_TEMP\sdk.tar.gz" -Force
+          foreach ($path in @(
+              "$env:SDK_ROOT\lib\llvm\bin\clang-cl.exe",
+              "$env:SDK_ROOT\bin\hipcc.exe",
+              "$env:SDK_ROOT\bin\rocblas\library",
+              "$env:SDK_ROOT\bin\hipblaslt\library"
+            )) {
+            if (-not (Test-Path $path)) {
+              throw "TheRock SDK is missing $path; the tarball layout may have changed"
+            }
+          }
+
+      - name: Patch SDK HIP math headers for MSVC
+        shell: pwsh
+        run: python tools/windows/patch_sdk_math.py "C:/TheRock/build"
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Prepare vcpkg
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_ROOT -or
+              -not (Test-Path "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+            & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+            "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $toolchain = "$($env:VCPKG_ROOT -replace '\\', '/')/scripts/buildsystems/vcpkg.cmake"
+          cmake --preset windows-release "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage Tensile kernel libraries
+        shell: pwsh
+        run: |
+          Copy-Item "C:\TheRock\build\bin\rocblas"   "$env:BUILD_DIR" -Recurse -Force
+          Copy-Item "C:\TheRock\build\bin\hipblaslt" "$env:BUILD_DIR" -Recurse -Force
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          & ".\$env:BUILD_DIR\gufo.exe" --version
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          $name = "gufo-$version-windows-gfx1151"
+          $pkg = "$env:RUNNER_TEMP\$name"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "$env:BUILD_DIR\gufo.exe" $pkg
+          Copy-Item "$env:BUILD_DIR\gufo-server.exe" $pkg
+          Copy-Item "$env:BUILD_DIR\*.dll" $pkg
+          Copy-Item "$env:BUILD_DIR\rocblas" $pkg -Recurse
+          Copy-Item "$env:BUILD_DIR\hipblaslt" $pkg -Recurse
+          tar --format zip -cf "$pkg.zip" -C $pkg .
+          $entries = tar -tf "$pkg.zip"
+          foreach ($required in @('gufo.exe', 'gufo-server.exe', 'MIOpen.dll',
+                                  'rocblas/library/', 'hipblaslt/library/')) {
+            if (-not ($entries | Where-Object { $_ -like "*$required*" })) {
+              throw "package is missing $required"
+            }
+          }
+          if ($entries | Where-Object { $_ -like '*\*' }) {
+            throw "package contains backslash entry names"
+          }
+          $sdkVersion = $env:SDK_TARBALL -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', ''
+          @"
+          Native Windows build of Gufo for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151).
+
+          - Gufo $version (commit $env:GITHUB_SHA)
+          - Built with TheRock HIP SDK $sdkVersion
+
+          Unzip the archive and run ``gufo.exe`` from the extracted folder (``gufo-server.exe`` starts the OpenAI-compatible HTTP server). An AMD graphics driver with ROCm support is required; the build targets gfx1151 only. See BUILD-WINDOWS.md in the repository for build-from-source instructions.
+          "@ | Out-File -FilePath "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "zip=$pkg.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ github.event_name == 'push' || github.event.inputs.publish == 'true' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'windows' }}
+          files: ${{ steps.package.outputs.zip }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          make_latest: "true"
