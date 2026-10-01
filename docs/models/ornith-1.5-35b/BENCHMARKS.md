@@ -9,7 +9,14 @@ every published row matches. The llama.cpp reference columns are TODO on this
 host (the pinned reference runtime is Nix/Linux only; the Linux qualification
 run fills them).
 
-[Quality and measurement details](QUALITY.md) · [Experiments](EXPERIMENTS.md)
+[Quality and measurement details](QUALITY.md)
+
+> 2026-10-01: the Q6_K decode pass supersedes the single-user AR/MTP rows
+> below (tables are driver-rendered and not yet re-rendered on Windows):
+> native pp2048 2922 +/- 27, tg128 AR 64.79 +/- 0.44, tg128 MTP 88.48 +/-
+> 1.36 (d0) and 86.5 (d4096), DFlash2 open-ended 88.9; HTTP serve MTP
+> decodes 67-70 tok/s at 56-63% acceptance. A/B against 479175f and the
+> full measurement record: [Experiments](EXPERIMENTS.md). · [Experiments](EXPERIMENTS.md)
 
 ## Native vs HTTP (single user, depth 0)
 

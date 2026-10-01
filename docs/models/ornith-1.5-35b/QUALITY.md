@@ -93,3 +93,31 @@
   --gufo <binary> --gguf <artifact> run --target gufo --table single-ar,
   single-mtp,multi-ar,multi-mtp`, then `render --no-charts`.
   Windows needs the `servers.py` terminate fallback (no process groups).
+
+## Q6_K decode kernel gates (2026-10-01)
+
+- Kernel vs exact host dequant over real artifact weights: the LM head's
+  first 64 rows (Q6_K, extracted from the GGUF) through
+  `qfn_mmq_moe_vec` E=1 land at worst 0.55% of row peak against the
+  F64 accumulate of `DequantizeQ6_K` (Q4_K attn_q on the same harness:
+  0.50%); a 5-token batched call with distinct activations per row is
+  0.43% — the y-dim token batching shares the per-row reduction, so
+  batching does not change the sum.
+- `qwen38_flash_next.routed_wmma_ops` extends to Q6_K blocks (random
+  ql/qh/scales with a real F16 scale; scalar, paired, batched widths
+  2-640 including ragged 2561-row tails; inactive-expert zeroes and the
+  nonfinite-scale-to-zero contract via the block's own scale field at
+  byte 208). The run still aborts at the two pre-existing Windows
+  failures first (vector-grouping width 2, paired SwiGLU 1 ulp) with
+  byte-identical signatures to baseline; with those gated exactly as on
+  base, the suite passes including all Q6_K cases.
+- Decode faithfulness improves: the Q6_K parts are the artifact's own
+  bytes now, where the previous build read a Q6_K→Q8_0 requantization.
+  End-to-end evidence: greedy AR, MTP and DFlash2 completions are
+  sha-identical to each other; the BF16-trained DFlash draft's
+  acceptance on open-ended text rises from 25% to 61%; MTP acceptance
+  on prose holds at 63%.
+- `gufo bench --validate-prefill 1` at pp2048: rmse 0, cosine 1.0,
+  max_error 0 (prefill keeps the Q8_0/WMMA tier unchanged).
+- `qwen35moe.gdn_ops` passes; `qwen35moe.attention_ops` shows only its
+  documented pre-existing 2-ulp replay signature.

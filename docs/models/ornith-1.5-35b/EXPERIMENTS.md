@@ -52,3 +52,30 @@
   ground truth for this artifact: it diverges from our F32 oracle at a
   0.6-logit near-tie where the GPU matches the oracle; use the oracle
   gates in QUALITY.md for Q8_0 comparisons.
+- 2026-10-01 Q6_K decode GEMV pass (retained): the vendored mmvq gained
+  Q6_K (vec_dot, VDR, `mul_mat_vec_moe_dispatch`, `qfn_mmq_moe_vec`
+  whitelist) and `VecSupported` admits Q6_K, so `CopyDequantOne` parts
+  (LM head, routed Q6_K downs, mixed shared-expert downs) keep a raw
+  native view beside their Q8_0 wide-batch copy, and `Executor::Experts`
+  reads the native view below the tiled threshold. The Q4_K_M artifact
+  stores its head (417 MB) and 20/40 routed down stacks as Q6_K; decode
+  previously read requantized Q8_0 copies of them. A/B, same prompt,
+  greedy, internal bench, baseline 479175f vs this change: pp2048
+  2903 ± 49 → 2922 ± 27 (prefill keeps the Q8_0/WMMA tier, unchanged);
+  tg128 AR 62.16 ± 0.52 → 64.79 ± 0.44 (+4.2%); tg128 MTP 77.56 ± 0.47 →
+  88.48 ± 1.36 (+14.1%); MTP d4096 85.1 → 86.5; DFlash2 open-ended
+  48.7 → 88.9 (+82%) because acceptance jumped 25% → 61% — the draft is
+  trained against the BF16 target and the exact Q6_K decode tracks it
+  better than the requantized copy did. Greedy AR == MTP == DFlash2
+  sha-identical per build (lossless property intact). Flash-Next
+  Q4_K_XL sha ffa993c8 and the Ornith Q8_0 artifact sha e552e58b are
+  byte-identical across the change; Flash-Next pp/tg move within noise.
+  Device memory at sessions 4 rises ~4.6 GiB (native copies of the
+  routed Q6_K downs and head) to 30.7 GiB. Rejected variant: per-part
+  native stacks for the mixed-format attention projections (14/30 GDN
+  qkv and 6/10 GQA v are Q6_K beside Q4_K parts, ~1.6% more AR) — the
+  MTP draft block consumes projections across calls at different widths
+  with `projections_ready`, so a width-dependent combined/per-part
+  split breaks the producer-consumer layout agreement; per-part tensors
+  would also need Q8_0 prefill copies. The head dominates the win
+  (microbench: head shape 2.34 → 1.86 ms/token at 225 GB/s).

@@ -428,6 +428,112 @@ Experts MakeQ8_0(std::size_t e, std::size_t m, std::size_t k,
 
 
 
+/// Random Q6_K blocks: 128 low-nibble bytes, 64 high-bit bytes, 16 int8
+
+/// scales and one scale, matching ggml's dequantize_row_q6_K layout.
+
+Experts MakeQ6K(std::size_t e, std::size_t m, std::size_t k,
+
+                std::uint32_t seed) {
+
+  Experts w;
+
+  const std::size_t blocks = e * m * (k / 256);
+
+  w.packed.resize(blocks * 210);
+
+  w.values.resize(e * m * k);
+
+  for (std::size_t b = 0; b < blocks; ++b) {
+
+    std::uint8_t* blk = w.packed.data() + b * 210;
+
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+
+    std::memcpy(blk + 208, &d, 2);
+
+    std::uint8_t* ql = blk;
+
+    std::uint8_t* qh = blk + 128;
+
+    std::int8_t* sc = reinterpret_cast<std::int8_t*>(blk + 192);
+
+    for (int i = 0; i < 128; ++i) {
+
+      ql[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+
+    }
+
+    for (int i = 0; i < 64; ++i) {
+
+      qh[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+
+    }
+
+    for (int i = 0; i < 16; ++i) {
+
+      sc[i] = static_cast<std::int8_t>(NextRandom(&seed) & 0xFF);
+
+    }
+
+    const float df = __half2float(d);
+
+    for (int n = 0; n < 256; n += 128) {
+
+      const std::uint8_t* qln = ql + n / 2;
+
+      const std::uint8_t* qhn = qh + n / 4;
+
+      const std::int8_t* scn = sc + n / 16;
+
+      for (int l = 0; l < 32; ++l) {
+
+        const int is = l / 16;
+
+        const int q1 = static_cast<std::int8_t>((qln[l] & 0xF) |
+
+                                                ((qhn[l] & 0x03) << 4)) - 32;
+
+        const int q2 = static_cast<std::int8_t>((qln[l + 32] & 0xF) |
+
+                                                ((qhn[l] & 0x0c) << 2)) - 32;
+
+        const int q3 = static_cast<std::int8_t>((qln[l] >> 4) |
+
+                                                ((qhn[l] & 0x30) << 0)) - 32;
+
+        const int q4 = static_cast<std::int8_t>((qln[l + 32] >> 4) |
+
+                                                ((qhn[l] & 0xc0) >> 2)) - 32;
+
+        w.values[b * 256 + n + l] = df * static_cast<float>(scn[is]) *
+
+                                     static_cast<float>(q1);
+
+        w.values[b * 256 + n + l + 32] = df * static_cast<float>(scn[is + 2]) *
+
+                                         static_cast<float>(q2);
+
+        w.values[b * 256 + n + l + 64] = df * static_cast<float>(scn[is + 4]) *
+
+                                         static_cast<float>(q3);
+
+        w.values[b * 256 + n + l + 96] = df * static_cast<float>(scn[is + 6]) *
+
+                                         static_cast<float>(q4);
+
+      }
+
+    }
+
+  }
+
+  return w;
+
+}
+
+
+
 // IQ3_S grid codes and the IQ4_NL codebook (vendored from llama.cpp,
 
 // ggml-common.h) for the host-side reference dequantization.
@@ -1386,11 +1492,15 @@ void CheckVectorGrouping(bool down = false) {
 
   const std::vector<q::WeightType> formats =
 
-      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0}
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0,
+
+                         q::WeightType::kQ6_K}
 
            : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
 
-                         q::WeightType::kQ5_1, q::WeightType::kQ8_0};
+                         q::WeightType::kQ5_1, q::WeightType::kQ8_0,
+
+                         q::WeightType::kQ6_K};
 
   std::vector<float> x(tokens * cols);
 
@@ -1438,11 +1548,15 @@ void CheckVectorGrouping(bool down = false) {
 
       weights = {MakeQ5_1(experts, rows, cols, 17),
 
-                 MakeQ8_0(experts, rows, cols, 23)};
+                 MakeQ8_0(experts, rows, cols, 23),
+
+                 MakeQ6K(experts, rows, cols, 29)};
 
       paired_weights = {MakeQ5_1(experts, rows, cols, 79),
 
-                        MakeQ8_0(experts, rows, cols, 83)};
+                        MakeQ8_0(experts, rows, cols, 83),
+
+                        MakeQ6K(experts, rows, cols, 89)};
 
     } else {
 
@@ -1450,13 +1564,17 @@ void CheckVectorGrouping(bool down = false) {
 
           MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
 
-          MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+          MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23),
+
+          MakeQ6K(experts, rows, cols, 29)};
 
       paired_weights = {
 
           MakeQ4K(experts, rows, cols, 71), MakeQ5K(experts, rows, cols, 73),
 
-          MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83)};
+          MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83),
+
+          MakeQ6K(experts, rows, cols, 89)};
 
     }
 
@@ -1508,19 +1626,25 @@ void CheckVectorGrouping(bool down = false) {
 
     for (std::size_t f = 0; f < weights.size(); ++f) {
 
-      // Every format starts with an F16 scale. A nonfinite projection must
+      // Every format starts with an F16 scale — except Q6_K, whose scale
 
-      // still produce zero, just as an inactive expert does.
+      // sits at the end of the block behind ql/qh/scales. A nonfinite
+
+      // projection must still produce zero, just as an inactive expert does.
 
       const __half infinite_scale = __float2half(INFINITY);
 
-      std::memcpy(weights[f].packed.data(), &infinite_scale,
+      const std::size_t scale_offset =
+
+          formats[f] == q::WeightType::kQ6_K ? 208 : 0;
+
+      std::memcpy(weights[f].packed.data() + scale_offset, &infinite_scale,
 
                   sizeof(infinite_scale));
 
-      std::memcpy(paired_weights[f].packed.data(), &infinite_scale,
+      std::memcpy(paired_weights[f].packed.data() + scale_offset,
 
-                  sizeof(infinite_scale));
+                  &infinite_scale, sizeof(infinite_scale));
 
       auto* wb = Upload(paired_weights[f].packed);
 

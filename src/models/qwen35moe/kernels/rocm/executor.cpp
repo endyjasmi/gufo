@@ -943,7 +943,11 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   }
   int rc = -1;
   if (!tiled) {
-    rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
+    // Decode widths read the raw GGUF bytes when the format has a vector
+    // kernel; the dequantized Q8_0 view remains for the tiled tiers.
+    const void* weights = w.native_data != nullptr ? w.native_data : w.data;
+    const GgmlType type = w.native_data != nullptr ? w.native_type : w.type;
+    rc = qfn_mmq_moe_vec(static_cast<int>(type), weights, x, ids, out, M, K, T,
                          E, U, stream_);
   } else {
     switch (w.type) {

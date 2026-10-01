@@ -95,6 +95,7 @@ bool VecSupported(GgmlType type) {
     case GgmlType::kQ4_K:
     case GgmlType::kQ5_K:
     case GgmlType::kQ5_1:
+    case GgmlType::kQ6_K:
     case GgmlType::kQ8_0:
     case GgmlType::kIQ3_S:
     case GgmlType::kIQ4_XS:
