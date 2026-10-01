@@ -76,15 +76,22 @@ jobs:
         with:
           arch: x64
 
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          ninja --version
+
       - name: Prepare vcpkg
         shell: pwsh
         run: |
-          if (-not $env:VCPKG_ROOT -or
-              -not (Test-Path "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
-            & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-            "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
+          # vcvars points VCPKG_ROOT at the VS-bundled copy, which is not a
+          # full git clone; a fresh clone keeps the manifest baseline
+          # resolvable and the dependency versions deterministic.
+          if (Test-Path C:\vcpkg) { Remove-Item -Recurse -Force C:\vcpkg }
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure
         shell: pwsh
