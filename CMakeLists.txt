@@ -32,6 +32,13 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
+if (WIN32)
+  # Windows has no system pkg-config; locate the pkgconf tool vcpkg installs.
+  # .pc files resolve via CMAKE_PREFIX_PATH, which the vcpkg toolchain already
+  # points at the manifest install tree.
+  find_program(PKG_CONFIG_EXECUTABLE pkgconf REQUIRED
+    HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/pkgconf")
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
