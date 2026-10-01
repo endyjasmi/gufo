@@ -38,6 +38,15 @@ struct QwenDFlashConfig {
 
   /// Number of transformer blocks in the draft model.
   std::uint32_t num_layers{0};
+
+  /// Per-layer causal masking inside the diffusion block. Empty for DFlash-2,
+  /// which keeps every layer fully non-causal. V1 checkpoints (no dynamic
+  /// convolutions, no path selector) mark their sliding-attention layers
+  /// causal and their trailing full-attention layers bidirectional.
+  std::vector<std::uint32_t> layer_causal;
+
+  /// True when the checkpoint predates the DFlash-2 convolutions and selector.
+  [[nodiscard]] bool IsV1() const noexcept { return conv_kernel_size == 0; }
 };
 
 /// DFlash-2 transformer weights plus the layer-local dynamic convolutions.

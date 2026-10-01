@@ -695,11 +695,18 @@ std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
   std::string error;
+  const bool dflash = opt.speculative_backend == "dflash2";
   if (opt.force_cpu ||
-      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp") ||
-      (opt.speculative_backend == "mtp" && opt.min_draft_tokens != 1)) {
-    std::cerr << "Ornith requires ROCm and supports MTP with "
-                 "--min-draft-tokens 1\n";
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp" &&
+       !dflash) ||
+      ((opt.speculative_backend == "mtp" || dflash) &&
+       opt.min_draft_tokens != 1)) {
+    std::cerr << "Ornith requires ROCm and supports --speculative mtp or "
+                 "dflash2 with --min-draft-tokens 1\n";
+    return nullptr;
+  }
+  if (dflash && opt.dflash_model_path.empty()) {
+    std::cerr << "Ornith DFlash requires --dflash-model\n";
     return nullptr;
   }
   if (opt.use_chat_template &&
@@ -707,12 +714,22 @@ std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
     std::cerr << "Unsupported Ornith chat template: " << error << '\n';
     return nullptr;
   }
-  auto model = models::qwen35moe::Model::Load(
-      opt.model_path,
-      {.max_context = kDefaultContext,
-       .max_draft_tokens = opt.draft_tokens,
-       .vision_model_path = opt.vision_model_path},
-      &error);
+  models::qwen35moe::ModelOptions options{
+      .max_context = kDefaultContext,
+      .max_draft_tokens = opt.draft_tokens,
+      .vision_model_path = opt.vision_model_path,
+      .dflash_model_path = dflash ? opt.dflash_model_path : std::string{},
+  };
+  if (dflash && !opt.draft_policy.empty()) {
+    try {
+      options.dflash_policy =
+          speculative::ParseDFlashDraftPolicy(opt.draft_policy);
+    } catch (const std::exception& ex) {
+      std::cerr << ex.what() << '\n';
+      return nullptr;
+    }
+  }
+  auto model = models::qwen35moe::Model::Load(opt.model_path, options, &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
     std::cerr << "Ornith load failed: " << error << '\n';

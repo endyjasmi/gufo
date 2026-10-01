@@ -277,6 +277,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
       options.max_speculative, 1, e->options_.max_logit_rows);
+  // DFlash tap slots: one per trunk layer, or -1 when the layer is not tapped.
+  e->dflash_tap_slots_.assign(e->model_->config().num_layers, -1);
+  for (std::uint32_t slot = 0; slot < e->options_.dflash_tap_layers.size();
+       ++slot) {
+    const auto layer = e->options_.dflash_tap_layers[slot];
+    if (layer >= e->dflash_tap_slots_.size() ||
+        e->dflash_tap_slots_[layer] >= 0) {
+      AssignError(error_msg,
+                  "DFlash tap layers must be unique trunk layer indices");
+      return nullptr;
+    }
+    e->dflash_tap_slots_[layer] = static_cast<std::int32_t>(slot);
+  }
   if (qfn_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -431,7 +444,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
 
 std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                                                  std::uint32_t max_context,
-                                                 std::string* error_msg) const {
+                                                 std::string* error_msg,
+                                                 bool enable_dflash) const {
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
   s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
@@ -481,6 +495,20 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                       error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.hidden_size, error_msg, &s->allocated_bytes_);
+  }
+  if (enable_dflash) {
+    if (options_.dflash_tap_layers.empty()) {
+      AssignError(error_msg, "DFlash capture requires tap layers");
+      return nullptr;
+    }
+    s->dflash_.enabled = true;
+    s->dflash_.num_taps =
+        static_cast<std::uint32_t>(options_.dflash_tap_layers.size());
+    s->dflash_.rows =
+        Alloc<float>(a,
+                     static_cast<std::size_t>(options_.max_batch) *
+                         s->dflash_.num_taps * c.hidden_size,
+                     error_msg, &s->allocated_bytes_);
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -637,11 +665,11 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
       up.native_data != nullptr && gate.native_data != nullptr &&
       up.native_type == gate.native_type && up.rows == gate.rows &&
       up.cols == gate.cols) {
-    if (qfn_mmq_moe_gated_vec(
-            static_cast<int>(up.native_type), gate.native_data,
-            up.native_data, x, s_.zero_ids, out, static_cast<int>(up.rows),
-            static_cast<int>(up.cols), static_cast<int>(n_tokens), 1, 1,
-            stream_) != 0) {
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(up.native_type),
+                              gate.native_data, up.native_data, x, s_.zero_ids,
+                              out, static_cast<int>(up.rows),
+                              static_cast<int>(up.cols),
+                              static_cast<int>(n_tokens), 1, 1, stream_) != 0) {
       AssignError(error_msg, "native gated vector projection failed");
       return false;
     }
@@ -725,8 +753,8 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       w.native_data != nullptr) {
     if (qfn_mmq_moe_vec(static_cast<int>(w.native_type), w.native_data, x,
                         s_.zero_ids, out, static_cast<int>(w.rows),
-                        static_cast<int>(w.cols), static_cast<int>(n_tokens),
-                        1, 1, stream_) != 0) {
+                        static_cast<int>(w.cols), static_cast<int>(n_tokens), 1,
+                        1, stream_) != 0) {
       AssignError(error_msg, "native dense vector projection failed");
       return false;
     }
@@ -1390,6 +1418,24 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
 }
 
+bool Executor::CopyDFlashFeatures(const Session& session, std::uint32_t rows,
+                                  std::span<float> features,
+                                  std::string* error_msg) const {
+  const Config& c = config();
+  const std::size_t width =
+      static_cast<std::size_t>(DFlashTapWidth()) * c.hidden_size;
+  if (!session.dflash_.enabled || session.owner_ != this || rows == 0 ||
+      rows > options_.max_batch || features.size() != rows * width) {
+    AssignError(error_msg, "invalid DFlash feature download request");
+    return false;
+  }
+  return Check(hipMemcpyAsync(features.data(), session.dflash_.rows,
+                              features.size_bytes(), hipMemcpyDeviceToHost,
+                              stream_),
+               "DFlash feature download", error_msg) &&
+         Check(hipStreamSynchronize(stream_), "DFlash features", error_msg);
+}
+
 bool Executor::MtpHead(const DeviceTensor& head_norm, const float* res,
                        bool token, bool candidates,
                        std::string* error_msg) const {
@@ -1604,6 +1650,21 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
     Combine(s_.res, nullptr, n);
+    if (session.dflash_.enabled) {
+      const auto slot = dflash_tap_slots_[il];
+      if (slot >= 0 &&
+          !Check(hipMemcpy2DAsync(
+                     session.dflash_.rows +
+                         static_cast<std::size_t>(slot) * c.hidden_size,
+                     static_cast<std::size_t>(session.dflash_.num_taps) *
+                         c.hidden_size * sizeof(float),
+                     s_.res, c.hidden_size * sizeof(float),
+                     c.hidden_size * sizeof(float), n, hipMemcpyDeviceToDevice,
+                     stream_),
+                 "DFlash tap capture", error_msg)) {
+        return false;
+      }
+    }
   }
   if (end_layer < c.num_layers) {
     return true;

@@ -333,8 +333,8 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
 
 std::vector<std::uint8_t> Qwen35MoeCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
-    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency) {
+    bool has_mtp, bool has_dflash, std::uint32_t max_context,
+    std::uint32_t max_draft_tokens, std::uint32_t decode_concurrency) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Ornith disk cache requires an artifact fingerprint");
@@ -342,6 +342,11 @@ std::vector<std::uint8_t> Qwen35MoeCompatibilityIdentity(
   if (has_mtp && !IsSha256Hex(mtp_fingerprint)) {
     throw std::invalid_argument(
         "Ornith MTP disk cache requires a draft artifact "
+        "fingerprint");
+  }
+  if (has_dflash && !IsSha256Hex(mtp_fingerprint)) {
+    throw std::invalid_argument(
+        "Ornith DFlash disk cache requires a draft artifact "
         "fingerprint");
   }
   std::ostringstream identity;
@@ -360,7 +365,13 @@ std::vector<std::uint8_t> Qwen35MoeCompatibilityIdentity(
            << "context_tokens=" << max_context << '\n'
            << "position_policy=absolute-v1\n"
            << "adapters=none\n";
-  if (has_mtp) {
+  if (has_dflash) {
+    identity << "draft_backend=q35-dflash-v1\n"
+             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
+             << mtp_fingerprint << '\n'
+             << "draft_max_tokens=" << max_draft_tokens << '\n'
+             << "draft_cost_concurrency=" << decode_concurrency << '\n';
+  } else if (has_mtp) {
     identity << "draft_backend=q35-mtp-v1\n"
              << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
              << mtp_fingerprint << '\n'
@@ -3024,7 +3035,7 @@ public:
                       std::uint32_t max_context, bool use_mtp,
                       std::uint32_t max_draft_tokens,
                       std::string artifact_fingerprint = {},
-                      std::string mtp_fingerprint = {})
+                      std::string mtp_fingerprint = {}, bool use_dflash = false)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
@@ -3032,7 +3043,7 @@ public:
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = Qwen35MoeCompatibilityIdentity(
-              artifact_fingerprint, artifact_fingerprint, use_mtp_,
+              artifact_fingerprint, mtp_fingerprint, use_mtp_, use_dflash,
               max_context_, max_draft_tokens_, model_->DecodeConcurrency()),
           .payload_version =
               models::qwen35moe::Session::kSnapshotPayloadVersion,
@@ -3737,11 +3748,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    const bool ornith_dflash =
+        speculative_config.backend == TextSpeculativeBackend::kDFlash;
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+        speculative_config.backend != TextSpeculativeBackend::kMtp &&
+        !ornith_dflash) {
       SetError(error,
-               "Ornith HTTP models support only MTP speculative decoding "
-               "(--speculative mtp)");
+               "Ornith HTTP models support only MTP or DFlash speculative "
+               "decoding (--speculative mtp or dflash2)");
       return false;
     }
     if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
@@ -3751,12 +3765,21 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "--mtp-model");
       return false;
     }
-    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+    if (ornith_dflash && speculative_config.draft_model_path.empty()) {
+      SetError(error, "Ornith DFlash requires --dflash-model");
+      return false;
+    }
+    if ((speculative_config.backend == TextSpeculativeBackend::kMtp ||
+         ornith_dflash) &&
         (speculative_config.max_draft_tokens == 0 ||
          speculative_config.min_draft_tokens != 1)) {
       SetError(error,
-               "Ornith MTP requires a positive draft limit and "
+               "Ornith speculation requires a positive draft limit and "
                "--min-draft-tokens 1");
+      return false;
+    }
+    if (ornith_dflash && session_count > 1) {
+      SetError(error, "Ornith DFlash requires --sessions 1");
       return false;
     }
     if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
@@ -3772,6 +3795,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .dflash_model_path = ornith_dflash
+                                     ? speculative_config.draft_model_path
+                                     : std::string{},
+            .dflash_policy = speculative_config.dflash_policy,
         },
         &load_error);
     if (model == nullptr) {
@@ -3785,10 +3812,25 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    // The draft block shares the model file, so both cache fingerprints
-    // are the artifact's.
-    resolved_disk_cache_config.draft_model_artifact_fingerprint =
-        resolved_disk_cache_config.model_artifact_fingerprint;
+    if (ornith_dflash) {
+      // The DFlash draft is its own artifact; the cache identity must
+      // distinguish it from both MTP runs of this target and other drafts.
+      if (DiskCacheEnabled(resolved_disk_cache_config) &&
+          !FingerprintArtifactFile(
+              "Ornith DFlash", speculative_config.draft_model_path,
+              &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+              error)) {
+        return false;
+      }
+      if (!DiskCacheEnabled(resolved_disk_cache_config)) {
+        resolved_disk_cache_config.draft_model_artifact_fingerprint =
+            resolved_disk_cache_config.model_artifact_fingerprint;
+      }
+    } else {
+      // The MTP draft block shares the model file.
+      resolved_disk_cache_config.draft_model_artifact_fingerprint =
+          resolved_disk_cache_config.model_artifact_fingerprint;
+    }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
@@ -4172,12 +4214,17 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
              "HTTP context exceeds the loaded Ornith-1.5-35B model context");
     return false;
   }
-  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-      (speculative_config.backend != TextSpeculativeBackend::kMtp ||
-       !model->HasMtp())) {
+  if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+      !model->HasMtp()) {
     SetError(error,
              "Ornith MTP requires the in-file nextn block, which this "
              "artifact lacks");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+      !model->HasDFlash()) {
+    SetError(error,
+             "Ornith DFlash requires --dflash-model, which was not loaded");
     return false;
   }
   if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
@@ -4202,10 +4249,12 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<Qwen35MoeTextRunner>(
         std::move(model), max_context,
-        speculative_config.backend == TextSpeculativeBackend::kMtp,
+        speculative_config.backend == TextSpeculativeBackend::kMtp ||
+            speculative_config.backend == TextSpeculativeBackend::kDFlash,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        speculative_config.backend == TextSpeculativeBackend::kDFlash);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

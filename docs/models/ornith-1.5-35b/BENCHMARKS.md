@@ -92,6 +92,38 @@ withheld (see `artifacts/unavailable.json`). The engine fix is tracked in
 | 8 | TODO | N/A | N/A | TODO | N/A | N/A |
 <!-- /bench -->
 
+## Single user, DFlash (2026-10-01)
+
+`--speculative dflash2` with the converted
+[Ornith-1.5-35B-A3B-DFlash](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-DFlash)
+draft (Q8_0 GGUF, `tools/ornith/convert_dflash_gguf.py`), Q4_K_M target, same
+host and build as the tables above. The draft was trained against the BF16
+target; verification stays lossless (greedy completions hash-match the AR
+reference on every measured point, including natural prose).
+
+| Metric | AR | MTP | DFlash adaptive (<=7) | DFlash fixed 2 |
+| --- | ---: | ---: | ---: | ---: |
+| pp2048 d0 (tok/s) | 2915.6 | 2864.9 | 2241.5 | — |
+| tg128 d0 (tok/s) | 62.57 ± 0.41 | 78.76 ± 0.46 | 52.08 ± 0.69 | 61.85 |
+| tg128 d4096 (tok/s) | 59.80 ± 0.11 | 85.69 ± 0.12 | 127.09 ± 2.74 | — |
+| tg192 natural prose d0 (tok/s) | 62.60 | 73.60 | 53.70 | — |
+
+DFlash prefill injects the tapped trunk rows into the draft ring after each
+chunk (one host round trip per 2048-token chunk), a ~20% prefill cost that
+MTP does not pay.
+
+Acceptance (accepted/drafted): d0 repetitive bench 25% adaptive (59% at
+width 1, 27% at position 2, 13% at position 3), d4096 repetitive bench 100%
+(7/7 every cycle), natural prose lower than the bench rows. The d4096 row
+regurgitates the repeated pattern, which flatters any drafter; treat it as an
+upper bound rather than a general-text result. Conclusions:
+
+- MTP (quantization-aware in-file draft) is the general-purpose winner for
+  this model: +18-26% tg on mixed text at every depth.
+- DFlash trades blows with AR at shallow depth on open-ended text and pays a
+  ~20% prefill tax for the feature injection; it wins decisively when the
+  continuation is highly predictable (2.1x AR, 1.5x MTP on the d4096 row).
+
 ## Q8_0 artifact (2026-09-29)
 
 The `Ornith-1.5-35B-Q8_0.gguf` artifact (37.8 GB, 35.2 GiB resident — no

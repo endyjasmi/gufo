@@ -30,6 +30,46 @@ gufo bench -m ... -p 2048 -n 128 -r 2
 Speculative decoding (`--speculative mtp`) uses the in-file draft block; no
 sidecar or `--mtp-model` is needed.
 
+## DFlash draft decoding
+
+`--speculative dflash2` runs the block-diffusion
+[Ornith-1.5-35B-A3B-DFlash](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-DFlash)
+drafter instead of the in-file MTP block. The draft is a 6-layer Qwen3-style
+transformer (5 causal sliding-window layers + 1 bidirectional layer) that taps
+8 trunk layer outputs, drafts 16-token blocks, and borrows the target's
+embedding table and LM head. Convert the safetensors checkpoint to Gufo's
+`dflash` GGUF:
+
+```sh
+python tools/ornith/convert_dflash_gguf.py \
+  --checkpoint models/ornith-1.5-35b/dflash-src \
+  --output models/ornith-1.5-35b/Ornith-1.5-35B-DFlash-Q8_0.gguf --q8
+# Drop --q8 to keep the draft BF16 (larger, same acceptance).
+```
+
+```sh
+gufo prompt -m models/ornith-1.5-35b/Ornith-1.5-35B-Q4_K_M.gguf -p "Hello" \
+  --speculative dflash2 \
+  --dflash-model models/ornith-1.5-35b/Ornith-1.5-35B-DFlash-Q8_0.gguf
+```
+
+Verification stays lossless: greedy output is identical to AR (hash-checked on
+Strix Halo), and sampled decoding uses target/draft rejection with residual
+correction. Serving and benchmarks accept the same flags (`--draft-tokens`
+caps proposals, `--draft-policy fixed|adaptive`; serve additionally requires
+`--sessions 1`). The draft borrows the target tables in their native
+quantized layout so shared weights stay bit-faithful.
+
+When to prefer which backend on this model (single Strix Halo host,
+Q4_K_M target, measured points in [BENCHMARKS.md](BENCHMARKS.md)):
+
+- `--speculative mtp` is the default choice: +18–26% tg in every measured
+  regime, and the draft block is quantization-aware (trained with the model).
+- `--speculative dflash2` was trained against the BF16 target, so acceptance
+  on the Q4_K_M target is modest on open-ended text (-14% tg at shallow
+  depth). It wins when continuations are highly predictable: on the deep
+  repetitive bench row it reaches 2.1× AR and 1.5× MTP at 100% acceptance.
+
 ## Notes
 
 - Dense Q4_K/Q6_K projections are host-dequantized to Q8_0 at load; routed

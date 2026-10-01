@@ -26,7 +26,7 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t causal = 0);
 
 /// Thread-per-key reference route of the call above. Exposed so an equivalence
 /// test can run both routes in one process; the production entry point picks
@@ -38,7 +38,7 @@ void LaunchDFlashNonCausalAttentionScalar(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t causal = 0);
 
 /// Wave-per-key route of the call above. Requires `head_dim` to be a multiple
 /// of four so a K row can be read as `float4`.
@@ -49,7 +49,7 @@ void LaunchDFlashNonCausalAttentionWave(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, std::uint32_t causal = 0);
 
 /// Quantizes a BF16 weight matrix into a Q8_0 copy for the draft-only LM head.
 /// `total_elements` must be a multiple of the Q8_0 block size.
@@ -60,6 +60,16 @@ void LaunchDFlashQuantizeBf16ToQ8_0(const void* bf16_source,
 
 [[nodiscard]] std::size_t DFlashSelectorScratchElements(
     std::uint32_t vocab_size) noexcept;
+
+/// Extracts the descending top-k of every logits row. V1 drafts build their
+/// proposals from these candidates instead of walking a selector chain.
+/// `partial_scores`/`partial_ids` need DFlashSelectorScratchElements(vocab)
+/// floats per row.
+void LaunchDFlashBlockTopK(const float* logits, float* partial_scores,
+                           std::uint32_t* partial_ids, std::uint32_t* out_ids,
+                           float* out_logits, std::uint32_t rows,
+                           std::uint32_t vocab_size, std::uint32_t top_k,
+                           hipStream_t stream);
 
 void LaunchDFlashSelectorStep(
     const float* logits, const float* projected_hidden,

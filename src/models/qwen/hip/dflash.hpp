@@ -27,6 +27,16 @@ namespace gufo::hip {
 using DFlashTrace =
     std::function<void(std::string_view, std::span<const float>)>;
 
+/// V1 block-head output: the descending top-k of every proposal row's draft
+/// logits. Row r's first entry is the greedy token. Sampled proposals draw a
+/// categorical from the downloaded logits host-side; there is no selector
+/// chain to walk on the device.
+struct QwenDFlashBlockCandidates {
+  std::uint32_t top_k{0};
+  std::vector<tokenization::TokenId> ids;
+  std::vector<float> logits;
+};
+
 class QwenDFlashGpuExecutor;
 
 struct QwenDFlashContextRequest {
@@ -91,9 +101,26 @@ public:
   QwenDFlashGpuModel(QwenDFlashGpuModel&&) = delete;
   QwenDFlashGpuModel& operator=(QwenDFlashGpuModel&&) = delete;
 
+  /// The target-side tied weights a draft borrows: device pointers for the
+  /// shared embedding table and LM head plus the topology they must match.
+  struct TiedTarget {
+    core::ModelConfig config;
+    models::QwenTensorRef token_embedding;
+    models::QwenTensorRef output;
+  };
+
   [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
       std::shared_ptr<const core::GgufReader> dflash_reader,
       std::shared_ptr<const QwenGpuModel> target_model,
+      std::string* error_msg = nullptr);
+
+  /// General target entry point: any resident model that exposes its embedding
+  /// table and output head as device tensors can host the draft. The lifetime
+  /// token keeps the owner alive for as long as the draft model exists.
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
+      std::shared_ptr<const core::GgufReader> dflash_reader,
+      const TiedTarget& target,
+      std::shared_ptr<const void> target_lifetime = nullptr,
       std::string* error_msg = nullptr);
 
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
@@ -113,13 +140,13 @@ public:
 
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
-                     std::shared_ptr<const QwenGpuModel> target_model,
+                     std::shared_ptr<const void> target_lifetime,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
-  std::shared_ptr<const QwenGpuModel> target_model_;
+  std::shared_ptr<const void> target_lifetime_;
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
@@ -160,7 +187,8 @@ public:
       std::vector<float>* out_confidences = nullptr,
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
       std::vector<float>* out_candidate_probabilities = nullptr,
-      const DFlashTrace& trace = {});
+      const DFlashTrace& trace = {},
+      QwenDFlashBlockCandidates* out_candidates = nullptr);
 
   /// Shared projections with independent attention, convolution and selector
   /// boundaries. A single request retains the ordinary block execution.

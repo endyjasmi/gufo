@@ -1172,8 +1172,9 @@ int RunOrnithBenchmark(const BenchOptions& options,
                 std::max<std::size_t>(max_depth, 16) + max_generation + 1,
                 options.validate_prefill_tokens + 1});
   const bool mtp = options.speculative_backend == "mtp";
-  if (!options.speculative_backend.empty() && !mtp) {
-    std::cerr << "Error: Ornith-1.5-35B supports only --speculative mtp "
+  const bool dflash = options.speculative_backend == "dflash2";
+  if (!options.speculative_backend.empty() && !mtp && !dflash) {
+    std::cerr << "Error: Ornith-1.5-35B supports --speculative mtp, dflash2, "
                  "or off\n";
     return 1;
   }
@@ -1182,13 +1183,17 @@ int RunOrnithBenchmark(const BenchOptions& options,
                  "pass --mtp-model\n";
     return 1;
   }
+  if (dflash && options.dflash_model_path.empty()) {
+    std::cerr << "Error: Ornith DFlash requires --dflash-model\n";
+    return 1;
+  }
   if (options.concurrency != std::vector<std::size_t>{1}) {
     std::cerr << "Error: Ornith bench supports C1; use the serving "
                  "benchmark for concurrent requests\n";
     return 1;
   }
-  if (mtp && options.min_draft_tokens != 1) {
-    std::cerr << "Error: Ornith MTP requires --min-draft-tokens 1\n";
+  if ((mtp || dflash) && options.min_draft_tokens != 1) {
+    std::cerr << "Error: Ornith speculation requires --min-draft-tokens 1\n";
     return 1;
   }
   if (required_context > std::numeric_limits<std::uint32_t>::max()) {
@@ -1202,6 +1207,8 @@ int RunOrnithBenchmark(const BenchOptions& options,
       q35::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+          .dflash_model_path =
+              dflash ? options.dflash_model_path : std::string{},
       },
       &error);
   if (model == nullptr) {
@@ -1230,16 +1237,21 @@ int RunOrnithBenchmark(const BenchOptions& options,
 
   if (options.validate_prefill_tokens != 0) {
     // Batched prefill against one-token-at-a-time evaluation of the same
-    // prefix; both run on the GPU, so this checks the batched kernels.
+    // prefix; both run on the GPU, so this checks the batched kernels. The
+    // validation only exercises trunk prefill, so DFlash sessions stay out
+    // of it (the draft allows one session at a time).
+    const auto validation_mode =
+        dflash ? std::optional{gufo::core::SessionMode::kAutoregressive}
+               : std::nullopt;
     auto sequential = model->CreateSession(
-        options.speculative_backend.empty()
-            ? gufo::core::SessionMode::kAutoregressive
-            : gufo::core::SessionMode::kSpeculative,
+        validation_mode.value_or(options.speculative_backend.empty()
+                                     ? gufo::core::SessionMode::kAutoregressive
+                                     : gufo::core::SessionMode::kSpeculative),
         static_cast<std::uint32_t>(required_context), &error);
     auto batched = model->CreateSession(
-        options.speculative_backend.empty()
-            ? gufo::core::SessionMode::kAutoregressive
-            : gufo::core::SessionMode::kSpeculative,
+        validation_mode.value_or(options.speculative_backend.empty()
+                                     ? gufo::core::SessionMode::kAutoregressive
+                                     : gufo::core::SessionMode::kSpeculative),
         static_cast<std::uint32_t>(required_context), &error);
     const auto prefix =
         std::span(tokens).first(options.validate_prefill_tokens);

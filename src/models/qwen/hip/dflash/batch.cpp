@@ -44,8 +44,10 @@ struct BlockWorkspace {
     const auto hidden_size = config.hidden_size;
     const auto kv_size =
         static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
-    const auto dynamic_size =
-        2U * draft.conv_kernel_size * (hidden_size / draft.conv_group_size);
+    const auto dynamic_size = draft.IsV1()
+                                  ? 0
+                                  : 2U * draft.conv_kernel_size *
+                                        (hidden_size / draft.conv_group_size);
     hidden = take(rows * hidden_size);
     normed = take(rows * hidden_size);
     conv = take(rows * hidden_size);
@@ -265,6 +267,9 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   const auto& config = coordinator.model_->GetConfig();
   const auto& draft = coordinator.model_->GetDFlashConfig();
   const auto& weights = coordinator.model_->GetWeights();
+  if (draft.IsV1())
+    throw std::invalid_argument(
+        "v1 DFlash drafts do not support batched block execution");
   std::array<std::size_t, 9> offsets{};
   std::array<std::uint32_t, 8> counts{};
   for (std::size_t index = 0; index < requests.size(); ++index) {

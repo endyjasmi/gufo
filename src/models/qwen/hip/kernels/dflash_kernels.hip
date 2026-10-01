@@ -118,7 +118,8 @@ __global__ void dflash_noncausal_attention_wave_kernel(
     const float* __restrict__ block_v, float* __restrict__ out,
     uint32_t current_pos, uint32_t history_length, uint32_t block_count,
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, float scale, uint32_t history_capacity) {
+    uint32_t head_dim, float scale, uint32_t history_capacity,
+    uint32_t causal) {
   constexpr uint32_t kPrefetch = 32;
   const uint32_t tok = blockIdx.x, h = blockIdx.y * QueryHeads;
   if (tok >= block_count || h + QueryHeads > num_q_heads)
@@ -189,10 +190,13 @@ __global__ void dflash_noncausal_attention_wave_kernel(
       const uint32_t distance = query_position > key_position
                                     ? query_position - key_position
                                     : key_position - query_position;
+      // V1 sliding-attention layers mask the block causal; DFlash-2 keeps
+      // every block key visible to every query.
+      const bool visible = distance < sliding_window && (!causal || p <= tok);
 #pragma unroll
       for (unsigned g = 0; g < QueryHeads; ++g)
         scores[g * total_k + history_count + p] =
-            distance < sliding_window ? dot[g] * scale : -1e20F;
+            visible ? dot[g] * scale : -1e20F;
     }
   }
   __syncthreads();
@@ -302,7 +306,8 @@ __global__ void dflash_noncausal_attention_kernel(
     const float* __restrict__ block_v, float* __restrict__ out,
     uint32_t current_pos, uint32_t history_length, uint32_t block_count,
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, float scale, uint32_t history_capacity) {
+    uint32_t head_dim, float scale, uint32_t history_capacity,
+    uint32_t causal) {
   const uint32_t tok = blockIdx.x;
   const uint32_t h = blockIdx.y;
   if (tok >= block_count || h >= num_q_heads)
@@ -351,7 +356,8 @@ __global__ void dflash_noncausal_attention_kernel(
                                   ? query_position - key_position
                                   : key_position - query_position;
     s_scores[history_count + p] =
-        distance < sliding_window ? dot * scale : -1e20F;
+        distance < sliding_window && (!causal || p <= tok) ? dot * scale
+                                                           : -1e20F;
   }
   __syncthreads();
 
@@ -777,14 +783,14 @@ void LaunchDFlashNonCausalAttentionScalar(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t causal) {
   const auto geometry = DFlashAttentionGeometry(
       current_pos, history_length, block_count, sliding_window, num_q_heads);
   dflash_noncausal_attention_kernel<<<geometry.grid, 256, geometry.shared_bytes,
                                       stream>>>(
       q, injected_k, injected_v, block_k, block_v, out, current_pos,
       history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-      head_dim, scale, history_capacity);
+      head_dim, scale, history_capacity, causal);
 }
 
 void LaunchDFlashNonCausalAttentionWave(
@@ -794,7 +800,7 @@ void LaunchDFlashNonCausalAttentionWave(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t causal) {
   const auto geometry = DFlashAttentionGeometry(
       current_pos, history_length, block_count, sliding_window, num_q_heads);
   // Wider blocks benefit from two query heads per CTA. Keep narrow blocks
@@ -808,14 +814,14 @@ void LaunchDFlashNonCausalAttentionWave(
         <<<grid, 256, 2U * geometry.shared_bytes, stream>>>(
             q, injected_k, injected_v, block_k, block_v, out, current_pos,
             history_length, block_count, sliding_window, num_q_heads,
-            num_kv_heads, head_dim, scale, history_capacity);
+            num_kv_heads, head_dim, scale, history_capacity, causal);
     return;
   }
   dflash_noncausal_attention_wave_kernel<1>
       <<<geometry.grid, 256, geometry.shared_bytes, stream>>>(
           q, injected_k, injected_v, block_k, block_v, out, current_pos,
           history_length, block_count, sliding_window, num_q_heads,
-          num_kv_heads, head_dim, scale, history_capacity);
+          num_kv_heads, head_dim, scale, history_capacity, causal);
 }
 
 void LaunchDFlashNonCausalAttention(
@@ -825,19 +831,83 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, std::uint32_t causal) {
   // Coalesced float4 reads cover all shipped DFlash2 head dimensions.
   if ((head_dim % 4U) == 0U) {
     LaunchDFlashNonCausalAttentionWave(
         q, injected_k, injected_v, block_k, block_v, out, current_pos,
         history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-        head_dim, scale, stream, history_capacity);
+        head_dim, scale, stream, history_capacity, causal);
     return;
   }
   LaunchDFlashNonCausalAttentionScalar(
       q, injected_k, injected_v, block_k, block_v, out, current_pos,
       history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-      head_dim, scale, stream, history_capacity);
+      head_dim, scale, stream, history_capacity, causal);
+}
+
+/// Merges the partial top-k lists of one logits row into the row's final
+/// candidates. V1 drafts stop here: the host builds its proposal
+/// distributions from the downloaded ids and logits.
+__global__ void dflash_block_topk_finalize_kernel(
+    const float* __restrict__ partial_scores,
+    const uint32_t* __restrict__ partial_ids, uint32_t* __restrict__ out_ids,
+    float* __restrict__ out_logits, uint32_t partial_count, uint32_t top_k) {
+  const uint32_t row = blockIdx.x;
+  partial_scores += uint64_t(row) * partial_count * top_k;
+  partial_ids += uint64_t(row) * partial_count * top_k;
+  out_ids += uint64_t(row) * top_k;
+  out_logits += uint64_t(row) * top_k;
+  __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
+  __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
+
+  float local_scores[kMaxSelectorTopK];
+  uint32_t local_ids[kMaxSelectorTopK];
+#pragma unroll
+  for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
+    local_scores[index] = -INFINITY;
+    local_ids[index] = 0;
+  }
+  const uint32_t candidate_count = partial_count * top_k;
+  for (uint32_t index = threadIdx.x; index < candidate_count;
+       index += blockDim.x) {
+    InsertSelectorCandidate(partial_scores[index], partial_ids[index],
+                            local_scores, local_ids, top_k);
+  }
+
+  const uint32_t shared_offset = threadIdx.x * kMaxSelectorTopK;
+#pragma unroll
+  for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
+    shared_scores[shared_offset + index] = local_scores[index];
+    shared_ids[shared_offset + index] = local_ids[index];
+  }
+
+  MergeSelectorLists(shared_scores, shared_ids, top_k);
+
+  for (uint32_t index = threadIdx.x; index < top_k; index += blockDim.x) {
+    out_ids[index] = shared_ids[index];
+    out_logits[index] = shared_scores[index];
+  }
+}
+
+void LaunchDFlashBlockTopK(const float* logits, float* partial_scores,
+                           std::uint32_t* partial_ids, std::uint32_t* out_ids,
+                           float* out_logits, std::uint32_t rows,
+                           std::uint32_t vocab_size, std::uint32_t top_k,
+                           hipStream_t stream) {
+  if (logits == nullptr || partial_scores == nullptr ||
+      partial_ids == nullptr || out_ids == nullptr || out_logits == nullptr ||
+      rows == 0 || vocab_size == 0 || top_k == 0 || top_k > kMaxSelectorTopK ||
+      top_k > vocab_size) {
+    throw std::invalid_argument("invalid DFlash block top-k request");
+  }
+  const std::uint32_t partial_count =
+      (vocab_size + kSelectorTokensPerBlock - 1U) / kSelectorTokensPerBlock;
+  dflash_selector_partial_topk_kernel<<<dim3(partial_count, rows),
+                                        kSelectorThreads, 0, stream>>>(
+      logits, partial_scores, partial_ids, vocab_size, top_k);
+  dflash_block_topk_finalize_kernel<<<rows, kSelectorThreads, 0, stream>>>(
+      partial_scores, partial_ids, out_ids, out_logits, partial_count, top_k);
 }
 
 std::size_t DFlashSelectorScratchElements(std::uint32_t vocab_size) noexcept {

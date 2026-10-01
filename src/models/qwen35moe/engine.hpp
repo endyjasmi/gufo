@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN35MOE_ENGINE_HPP_
 #define GUFO_MODELS_QWEN35MOE_ENGINE_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/models/qwen/dflash_policy.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -21,6 +23,11 @@
 namespace gufo::core {
 class GgufReader;
 }
+
+namespace gufo::hip {
+class QwenDFlashGpuModel;
+class QwenDFlashGpuExecutor;
+}  // namespace gufo::hip
 
 namespace gufo::models::qwen35moe {
 
@@ -42,6 +49,12 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// DFlash v1 draft GGUF (block-diffusion drafter borrowing this model's
+  /// embedding and LM head). Empty keeps MTP as the speculative backend.
+  std::string dflash_model_path;
+  /// DFlash proposal length policy; only used with dflash_model_path.
+  speculative::DFlashDraftPolicy dflash_policy =
+      speculative::DFlashDraftPolicy::kAdaptive;
 };
 
 class Session;
@@ -74,6 +87,11 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// True when a DFlash draft was loaded; speculative sessions then use the
+  /// DFlash backend instead of the in-file MTP block.
+  [[nodiscard]] bool HasDFlash() const noexcept {
+    return dflash_model_ != nullptr;
+  }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -99,11 +117,15 @@ private:
   std::shared_ptr<core::GgufReader> reader_;
   std::unique_ptr<ModelWeights> weights_;
   std::unique_ptr<MtpWeights> mtp_weights_;
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  /// DFlash keeps one private draft context; a second concurrent session is
+  /// rejected at creation.
+  std::atomic<std::size_t> dflash_sessions_{0};
 
   friend class Session;
 };
@@ -190,7 +212,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 2;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
@@ -209,7 +231,8 @@ public:
 
 private:
   friend class Model;
-  Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
+  Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session,
+          std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_executor);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false);
@@ -245,12 +268,19 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  /// DFlash state: a private draft context plus its length policy. Non-null
+  /// only in DFlash sessions; the ring always matches committed tokens.
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_executor_;
+  speculative::DFlashLengthController dflash_length_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;
   bool valid_{true};
   [[nodiscard]] bool MtpEnabled() const noexcept;
+  [[nodiscard]] bool DFlashEnabled() const noexcept {
+    return dflash_executor_ != nullptr;
+  }
 };
 
 /// Immutable host copy of a session context. The same bytes restore in

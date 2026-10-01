@@ -91,6 +91,15 @@ private:
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
   };
+  /// DFlash target-feature capture: the residual rows of the tap layers of
+  /// every trunk batch, laid out [row][tap][hidden]. Filled by the trunk
+  /// forward and read by the host after the batch is committed; rollback
+  /// never rewrites it, so the accepted prefix stays valid.
+  struct DFlashTapState {
+    bool enabled{false};
+    std::uint32_t num_taps{0};
+    float* rows{nullptr};  ///< [max_batch][num_taps][hidden]
+  };
 
   mutable bool cancelled_{false};
   std::uint64_t mutation_epoch_{0};
@@ -104,6 +113,7 @@ private:
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
+  DFlashTapState dflash_;
   Control* control_{nullptr};
   /// Captured decode graphs by batch shape, and the shapes that ran eagerly
   /// once (the GEMM tier's arena must be grown before capture).
@@ -128,6 +138,9 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Trunk layer outputs (zero-based) captured for the DFlash draft.
+    /// Empty disables capture; sessions still choose per-session use.
+    std::vector<std::uint32_t> dflash_tap_layers;
   };
 
   ~Executor();
@@ -141,7 +154,7 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
-      std::string* error_msg = nullptr) const;
+      std::string* error_msg = nullptr, bool enable_dflash = false) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
   [[nodiscard]] std::size_t SessionBytes(
@@ -220,6 +233,16 @@ public:
   [[nodiscard]] bool CopyTrunkHidden(const Session& session,
                                      std::span<float> hidden,
                                      std::string* error_msg) const;
+
+  /// The captured DFlash tap rows [0, rows) of the last trunk batch:
+  /// rows * num_taps * hidden floats. The session must have capture enabled.
+  [[nodiscard]] bool CopyDFlashFeatures(const Session& session,
+                                        std::uint32_t rows,
+                                        std::span<float> features,
+                                        std::string* error_msg) const;
+  [[nodiscard]] std::uint32_t DFlashTapWidth() const noexcept {
+    return static_cast<std::uint32_t>(options_.dflash_tap_layers.size());
+  }
 
   /// Plain greedy verification keeps full logit rows on the GPU.
   [[nodiscard]] bool GreedyMtpPredictions(
@@ -363,6 +386,8 @@ private:
 
   const DeviceModel* model_{nullptr};
   Options options_;
+  /// Per-layer DFlash tap slot (into the captured feature rows), or -1.
+  std::vector<std::int32_t> dflash_tap_slots_;
   hipStream_t stream_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
