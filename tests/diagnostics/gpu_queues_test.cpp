@@ -1,6 +1,10 @@
 #include "src/core/diagnostics/gpu_queues.h"
 
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +15,14 @@
 #include <vector>
 
 namespace {
+
+int HostProcessId() {
+#if defined(_WIN32)
+  return ::_getpid();
+#else
+  return ::getpid();
+#endif
+}
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -25,7 +37,7 @@ class FakeKfd {
 public:
   FakeKfd()
       : root_(std::filesystem::temp_directory_path() /
-              ("gufo-queues-" + std::to_string(::getpid()))) {
+              ("gufo-queues-" + std::to_string(HostProcessId()))) {
     std::filesystem::remove_all(root_);
     std::filesystem::create_directories(proc_root());
   }
