@@ -23,6 +23,13 @@
 
 #include "src/cli/serve/logging.hpp"
 
+#if defined(_WIN32)
+// The log-tier tests reuse the upstream POSIX environment helper.
+static void setenv(const char* name, const char* value, int) {
+  (void)_putenv_s(name, value);
+}
+#endif
+
 namespace {
 namespace net = gufo::net;
 

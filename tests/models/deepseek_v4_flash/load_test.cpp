@@ -16,6 +16,12 @@
 #include <string_view>
 
 #include "src/models/deepseek_v4_flash/runtime/model.h"
+#if defined(_WIN32)
+// Upstream's POSIX environment helper, for the redirected-sink assertions.
+static int setenv(const char* name, const char* value, int) {
+  return _putenv_s(name, value);
+}
+#endif
 
 namespace {
 void Integer(std::ostream& out, std::uint64_t value, unsigned bytes) {

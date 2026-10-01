@@ -26,6 +26,12 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
+#if defined(_WIN32)
+// Upstream's POSIX environment helper, for the redirected-sink assertions.
+static void setenv(const char* name, const char* value, int) {
+  (void)_putenv_s(name, value);
+}
+#endif
 
 namespace {
 
