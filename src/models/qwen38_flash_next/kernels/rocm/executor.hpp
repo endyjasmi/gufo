@@ -98,6 +98,7 @@ private:
     float* h{nullptr};  ///< [hc_dim] wide residual handed to the next draft
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
+    bool residual_valid{false};
   };
 
   mutable bool cancelled_{false};
@@ -213,6 +214,9 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
+    /// Prefill needs only persistent KV. A subsequent full forward with
+    /// known trunk hidden rows is required before heads/recursive proposals.
+    bool kv_only{false};
   };
   struct MtpHeadItem {
     Session* session;
@@ -257,9 +261,11 @@ public:
                                      std::span<float> hidden,
                                      std::string* error_msg) const;
 
-  /// Plain greedy verification keeps full logit rows on the GPU.
+  /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
-      std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
+      std::span<ArgmaxCandidate> predictions,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
   /// Copies the per-row argmax candidates a kVerifyGreedy Forward left in
   /// its pinned buffer (no device work, no synchronization).
@@ -291,6 +297,8 @@ public:
 
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {
+    if (session.mtp_.position != position)
+      session.mtp_.residual_valid = false;
     session.mtp_.position = position;
     session.mtp_.blocks =
         std::min(session.mtp_.blocks, position / config().compress_ratio);
@@ -420,7 +428,7 @@ private:
   bool GreedyArgmaxNodes(std::uint32_t n_logits, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
-               const float* hidden_source, MtpTrace* trace,
+               const float* hidden_source, MtpTrace* trace, bool kv_only,
                const std::int32_t* embed_tokens = nullptr,
                std::int32_t* chain_out = nullptr) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
@@ -534,6 +542,9 @@ private:
   bool QuantizeBatch(const float* x, std::uint32_t rows, std::uint32_t cols,
                      std::string* error) const;
   bool AllocateBatch(std::string* error_msg) const;
+  /// Shared transient storage, grown only for penalty-aware verification.
+  mutable sampling::TokenPenalty* verification_penalties_{nullptr};
+  mutable std::size_t verification_penalty_capacity_{0};
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

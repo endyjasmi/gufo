@@ -59,7 +59,7 @@ class CheckResults(dict):
         self.save()
 
 
-def chat_result(client, request, streaming=False):
+def chat_result(client, request, streaming=False, on_chunk=None, on_open=None):
     """Accumulate typed SDK chunks, including Gufo's reasoning/usage extensions."""
     result = client.chat.completions.create(
         **request, stream=streaming,
@@ -75,7 +75,11 @@ def chat_result(client, request, streaming=False):
         }
     text, reasoning, tools, finish, usage = "", "", [], None, None
     with result:
+        if on_open:
+            on_open()
         for chunk in result:
+            if on_chunk:
+                on_chunk(chunk)
             if chunk.usage:
                 usage = chunk.usage.to_dict()
             for choice in chunk.choices:
@@ -477,7 +481,7 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
                 record("completions_" + label, first)
 
 
-def completion_result(client, request, streaming=False):
+def completion_result(client, request, streaming=False, on_chunk=None):
     # Use the SDK's ordinary legacy stream path, then validate the wire shape
     # with only its in-progress finish_reason made nullable. Keep the original
     # shared client immutable; other threads still use strict Chat/Responses.
@@ -490,6 +494,8 @@ def completion_result(client, request, streaming=False):
     text, finish, usage = "", None, None
     with result:
         for chunk in result:
+            if on_chunk:
+                on_chunk(chunk)
             CompletionStreamFrame.model_validate(chunk.to_dict())
             if chunk.usage:
                 usage = chunk.usage.to_dict()
@@ -514,10 +520,12 @@ def check_sampling_ranges(client, model, checks):
     invalid = (
         ("temperature", -1), ("temperature", 2.01),
         ("temperature", "hot"), ("temperature", True),
-        ("top_p", 0), ("top_p", -0.1), ("top_p", 1.01), ("top_p", "0.9"),
+        ("top_p", -0.1), ("top_p", 1.01), ("top_p", "0.9"),
+        ("top_p", 1.00000001), ("temperature", 2.00000001),
         ("top_k", -1), ("top_k", 1.5), ("min_p", -0.1), ("min_p", 1.1),
         ("repeat_penalty", 0), ("repeat_last_n", -1), ("seed", -2),
         ("presence_penalty", 2.1), ("frequency_penalty", -2.1),
+        ("presence_penalty", 2.00000001), ("frequency_penalty", -2.00000001),
         ("draft_temperature", .7), ("typical_p", .9),
     )
     for endpoint, (create, body) in endpoints.items():
@@ -534,9 +542,11 @@ def check_sampling_ranges(client, model, checks):
                         response.close()
                     raise AssertionError(f"{endpoint} accepted invalid {name}={value!r}")
         # Boundaries are valid; use greedy selection to avoid probabilistic assertions.
-        for top_p in (.0001, 1.):
+        for top_p in (0., .0001, 1.):
             response = create(**body, temperature=0, top_p=top_p)
             checks[f"range_{endpoint}_valid_{top_p}"] = response.to_dict()
+        response = create(**body, temperature=.7, top_p=0, extra_body={"seed": 42})
+        checks[f"range_{endpoint}_sampled_zero"] = response.to_dict()
 
 
 def check_batches(client, model, checks, width, vision=False, speculative="off"):
@@ -663,7 +673,7 @@ def check_batches(client, model, checks, width, vision=False, speculative="off")
         if index:
             return cross_endpoint(index)
         try:
-            client.chat.completions.create(**{**cases[0], "top_p": 0}, stream=True)
+            client.chat.completions.create(**{**cases[0], "top_p": -0.1}, stream=True)
         except openai.BadRequestError:
             return None
         raise AssertionError("invalid peer entered generation")
@@ -1833,6 +1843,29 @@ def check_structured_limits(client, model, checks, vision=False):
         assert not result["text"] and not result["tools"], result
         record(f"schema_tool_limit_{n}", result)
 
+    # Greedy GPU winners include penalties, but still obey the tool grammar.
+    # Invalid speculative proposals must not mutate its state while staging
+    # conditional penalty histories.
+    for choice in ("auto", "required"):
+        request = dict(model=model, temperature=0, seed=79,
+            presence_penalty=1.5, frequency_penalty=.2,
+            max_completion_tokens=96, tool_choice=choice, parallel_tool_calls=False,
+            messages=[{"role": "user", "content": "Call echo with text alpha."}],
+            tools=[{"type": "function", "function": {"name": "echo", "strict": True,
+                "parameters": {"type": "object", "properties": {
+                    "text": {"type": "string", "const": "alpha"}},
+                    "required": ["text"], "additionalProperties": False}}}],
+            extra_body={"repeat_penalty": 1.1,
+                        "chat_template_kwargs": {"enable_thinking": False}})
+        first = chat_result(client, request, True)
+        replay = chat_result(client, request)
+        for result in (first, replay):
+            assert result["finish"] == "tool_calls" and len(result["tools"]) == 1, result
+            call = result["tools"][0]["function"]
+            assert call["name"] == "echo" and json.loads(call["arguments"]) == {"text": "alpha"}, result
+        assert replay["usage"]["cached_tokens"] > 0, replay
+        record(f"schema_greedy_tool_penalties_{choice}", [first, replay])
+
     # A non-strict tool schema can be broader than the response-format subset.
     result = chat_result(client, {**common, "tools": [{
         "type": "function", "function": {"name": "optional_tool", "strict": False,
@@ -2053,9 +2086,249 @@ def check_responses(client, model, checks, options, async_local_only, expect_rea
     checks["async_concurrent"] = asyncio.run(concurrent())
 
 
+def check_prompt_progress(client, model, checks, width, vision, allow_missing):
+    from progress import ProgressTrace
+    from server_metrics import ServerMetrics, assert_accounting
+
+    metrics = ServerMetrics(client.base_url)
+    before = metrics.idle()
+    request_start = len(checks.recorder.rows)
+
+    prompt = "Count from one to one hundred, separated by commas."
+    common = dict(model=model, temperature=0, seed=42, max_completion_tokens=24,
+                  messages=[{"role": "system", "content": "Follow the user's instructions. " * 48},
+                            {"role": "user", "content": prompt}],
+                  extra_body={"presence_penalty": 0, "cache_prompt": False,
+                              "chat_template_kwargs": {"enable_thinking": False}})
+
+    def chat(name, request, enabled=True):
+        trace = ProgressTrace(enabled is True, allow_missing)
+        result = chat_result(client, {**request, "extra_body": {
+            **request.get("extra_body", {}), "return_progress": enabled}}, True, trace)
+        trace.finish(checks.recorder.rows[-1]["metrics"])
+        checks[name] = {**result, "progress": trace.updates}
+        return result
+
+    def signature(result):
+        return result["text"], result["reasoning"], result["tools"], result["finish"]
+
+    off = chat("progress_cold_off", common, False)
+    on = chat("progress_cold_on", common)
+    assert signature(off) == signature(on), (off, on)
+    cached = {**common, "extra_body": {**common["extra_body"], "cache_prompt": True}}
+    replay = chat("progress_cached", cached)
+    assert signature(on) == signature(replay)
+    assert replay["usage"]["gufo"]["prefill_tokens"] == 0
+    sampled = {**cached, "temperature": .7, "top_p": .85, "presence_penalty": .3,
+               "frequency_penalty": .2, "extra_body": {
+                   **cached["extra_body"], "presence_penalty": .3, "top_k": 20, "min_p": .05}}
+    a = chat("progress_sampled_off", sampled, False)
+    b = chat("progress_sampled_on", sampled)
+    assert signature(a) == signature(b), (a, b)
+    thinking = {**cached, "max_completion_tokens": 2, "reasoning_effort": "high",
+                "extra_body": {**cached["extra_body"], "chat_template_kwargs": {"enable_thinking": True}}}
+    a = chat("progress_thinking_limit_off", thinking, False)
+    b = chat("progress_thinking_limit_on", thinking)
+    assert signature(a) == signature(b) and b["usage"]["completion_tokens"] == 2
+    assert off["text"], off
+    stopped = chat("progress_stop", {**cached, "stop": off["text"][:1]})
+    assert stopped["finish"] == "stop"
+    assert signature(chat("progress_after_stop", cached, None)) == signature(on)
+
+    trace = ProgressTrace(True, allow_missing)
+    result = completion_result(client, dict(
+        model=model, prompt="One, two, three,", max_tokens=16, temperature=0,
+        extra_body={"return_progress": True}), True, trace)
+    trace.finish(checks.recorder.rows[-1]["metrics"])
+    checks["progress_completions"] = {**result, "progress": trace.updates}
+    trace = ProgressTrace(True, allow_missing)
+    with client.responses.create(model=model, input=prompt, max_output_tokens=16,
+                                 temperature=0, reasoning={"effort": "none"}, stream=True,
+                                 extra_body={"return_progress": True}) as stream:
+        events = []
+        for event in stream:
+            trace(event)
+            events.append(event)
+    trace.finish(checks.recorder.rows[-1]["metrics"])
+    checks["progress_responses"] = {"result": check_events(events, False), "progress": trace.updates}
+
+    if vision:
+        image_request = {**cached, "messages": [{"role": "user", "content": [
+            image_content("red"), {"type": "text", "text": "Name the color of this image."}]}]}
+        a = chat("progress_image_off", image_request, False)
+        b = chat("progress_image_on_cached", image_request)
+        assert signature(a) == signature(b) and "red" in b["text"].lower()
+        assert b["usage"]["cached_tokens"] > 0
+
+    # Response headers precede model output, unlike coalesced body chunks.
+    # Use them to order admissions while still overlapping prefills, so
+    # main/PR timings compare the same queue position.
+    admitted = [threading.Event() for _ in range(width)]
+
+    def peer(index):
+        if index:
+            assert admitted[index - 1].wait(30), "peer stream did not start"
+        trace = ProgressTrace(index % 2 == 0, allow_missing)
+
+        request = {**cached, "extra_body": {**cached["extra_body"],
+                                          "return_progress": index % 2 == 0}}
+        result = chat_result(client, request, True, trace, admitted[index].set)
+        return result, trace
+    with ThreadPoolExecutor(width) as pool:
+        results = list(pool.map(peer, range(width)))
+    for result, trace in results:
+        assert signature(result) == signature(on)
+        # Usage is request-local; recorder completion order is concurrent here.
+        trace.finish({"prompt_tokens": result["usage"]["prompt_tokens"],
+                      "cached_tokens": result["usage"]["cached_tokens"]})
+    assert_accounting(before, metrics.idle(), checks.recorder.rows[request_start:])
+    checks["progress_batch"] = [{"result": result, "progress": trace.updates}
+                               for result, trace in results]
+
+    # Cancel during prompt processing, before text/reasoning; then retry the
+    # same history. A revision without progress uses its first output chunk as
+    # the control cancellation point and is never a feature qualification.
+    interrupted = {**common, "max_completion_tokens": 256, "extra_body": {
+        **common["extra_body"], "return_progress": True},
+        "messages": [{"role": "system", "content": "Remember this context. " * 512},
+                     {"role": "user", "content": prompt}]}
+    received = False
+    with client.chat.completions.create(**interrupted, stream=True) as stream:
+        for chunk in stream:
+            if getattr(chunk, "prompt_progress", None) is not None:
+                received = True
+                break
+            if allow_missing and any(choice.delta.content for choice in chunk.choices):
+                break
+        else:
+            raise AssertionError("did not reach cancellation point")
+    assert received or allow_missing
+    checks["progress_cancel"] = {"progress_received": received}
+    recovered = chat("progress_cancel_resume", {
+        **interrupted, "max_completion_tokens": 8,
+        "extra_body": {**interrupted["extra_body"], "cache_prompt": True}})
+    replay = chat("progress_cancel_replay", {
+        **interrupted, "max_completion_tokens": 8,
+        "extra_body": {**interrupted["extra_body"], "cache_prompt": True}})
+    assert signature(recovered) == signature(replay)
+    assert replay["usage"]["gufo"]["prefill_tokens"] == 0
+
+
+def check_server_metrics(client, model, checks, width):
+    from server_metrics import (ServerMetrics, assert_accounting, PROMPT, GENERATED,
+                                PROCESSING, DEFERRED, PROMPT_SPEED, GENERATED_SPEED)
+
+    metrics = ServerMetrics(client.base_url)
+    initial = metrics.idle()
+    assert metrics.read("/v1/metrics") == initial
+    prompt = "Count from one to one hundred, with no explanation."
+    common = dict(model=model, temperature=0, seed=42, max_completion_tokens=16,
+                  messages=[{"role": "user", "content": prompt}],
+                  extra_body={"presence_penalty": 0, "cache_prompt": True,
+                              "chat_template_kwargs": {"enable_thinking": False}})
+
+    def completed(name, operation):
+        before = metrics.idle()
+        start = len(checks.recorder.rows)
+        result = operation()
+        after = metrics.idle()
+        rows = checks.recorder.rows[start:]
+        assert rows, "accounting check performed no requests"
+        assert_accounting(before, after, rows)
+        checks[name] = {"before": before, "after": after, "result": result}
+        return result, rows, after
+
+    first, _, cold = completed(
+        "metrics_chat_cold", lambda: chat_result(client, common))
+    replay, rows, warm = completed(
+        "metrics_chat_stream_cached", lambda: chat_result(client, common, True))
+    assert first["text"] == replay["text"] and first["reasoning"] == replay["reasoning"]
+    assert rows[0]["metrics"]["cached_tokens"] > 0 and rows[0]["metrics"]["prefill_tokens"] == 0
+    assert warm[PROMPT_SPEED] == cold[PROMPT_SPEED] > 0
+    assert warm[GENERATED_SPEED] > 0
+
+    for streaming in (False, True):
+        def response():
+            request = dict(model=model, input=prompt, temperature=0, max_output_tokens=16,
+                           reasoning={"effort": "none"}, store=False,
+                           extra_body={"seed": 42, "presence_penalty": 0})
+            if streaming:
+                with client.responses.create(**request, stream=True) as stream:
+                    events = list(stream)
+                return check_events(events, False)
+            return check_response(client.responses.create(**request), False)
+        completed(f"metrics_responses_stream{streaming}", response)
+        completed(f"metrics_completions_stream{streaming}", lambda: completion_result(
+            client, dict(model=model, prompt="One, two, three,", temperature=0,
+                         seed=42, max_tokens=16), streaming))
+
+    # Stop-filtered text still accounts for generated tokens, including the
+    # withheld stop sequence. Match server usage, not retokenized visible text.
+    assert first["text"], first
+    completed("metrics_stop", lambda: chat_result(
+        client, {**common, "stop": first["text"][:1]}, True))
+
+    def rejected():
+        try:
+            client.chat.completions.create(**{**common, "top_p": 2})
+        except openai.BadRequestError as error:
+            return {"status": error.status_code}
+        raise AssertionError("invalid sampling request was accepted")
+    completed("metrics_rejected_request", rejected)
+
+    # Exercise live totals and the deferred gauge with every session occupied.
+    # A long constrained value prevents model-specific early EOS. Disconnect
+    # after observing admission; do not finish generating this value.
+    before = metrics.idle()
+    ready = [threading.Event() for _ in range(width)]
+    release = threading.Event()
+    live = {**common, "max_completion_tokens": 2048, "response_format": {
+        "type": "json_schema", "json_schema": {"name": "busy", "strict": True,
+        "schema": {"type": "object", "properties": {"text": {
+            "type": "string", "const": "tick " * 2048}},
+            "required": ["text"], "additionalProperties": False}}}}
+
+    def hold(index):
+        request = {**live, "messages": [{"role": "user", "content":
+                   f"Request {index}: emit the required JSON object."}]}
+        with client.chat.completions.create(**request, stream=True) as stream:
+            for chunk in stream:
+                if any(choice.delta.content for choice in chunk.choices):
+                    ready[index].set()
+                if release.is_set():
+                    return {"cancelled": True}
+        raise AssertionError("live accounting request finished before cancellation")
+
+    with ThreadPoolExecutor(width + 1) as pool:
+        active = [pool.submit(hold, index) for index in range(width)]
+        try:
+            for event in ready:
+                assert event.wait(30), "live stream did not start"
+            busy = metrics.wait(lambda m: m[PROCESSING] == width and m[GENERATED] > before[GENERATED]
+                                and m[PROMPT] > before[PROMPT], "live token accounting")
+            assert busy[DEFERRED] == 0, busy
+            queued_start = len(checks.recorder.rows)
+            queued = pool.submit(chat_result, client, common, True)
+            waiting = metrics.wait(lambda m: m[DEFERRED] == 1 and m[PROCESSING] == width,
+                                   "one queued request")
+        finally:
+            release.set()
+        cancelled = [future.result(timeout=30) for future in active]
+        result = queued.result(timeout=30)
+    after = metrics.idle()
+    assert after[GENERATED] >= waiting[GENERATED]
+    assert all(row["status"] == "complete" for row in checks.recorder.rows[queued_start:])
+    checks["metrics_live_queue_cancel"] = {
+        "before": before, "busy": busy, "queued": waiting, "after": after,
+        "cancelled": cancelled, "completed_peer": result}
+    # Cancellation must not leave stale gauge ownership or double-count the
+    # completed peer when the next request reuses its prompt.
+    completed("metrics_after_cancel_cached", lambda: chat_result(client, common))
+
+
 SDK_SUITES = ("responses", "stops", "conversation", "structured", "structured-limits",
               "tools", "auto-tools", "tool-edges", "sampling-defaults", "sampling-ranges", "batch",
-              "long-context", "state-edges")
+              "long-context", "state-edges", "progress", "metrics")
 
 
 def main():
@@ -2075,6 +2348,8 @@ def main():
     parser.add_argument("--output", type=Path, help="Write a partial report after every case")
     parser.add_argument("--through-case",
                         help="Replay the suite prefix and stop before the next request")
+    parser.add_argument("--allow-missing-progress", action="store_true",
+                        help="Timing control only for revisions predating return_progress")
     parser.add_argument("--concurrency", type=int, default=4,
                         help="Requests in the batch suite; must fit server --sessions")
     parser.add_argument("--context", type=int, default=8192,
@@ -2137,6 +2412,10 @@ def main():
                 client, args.model, checks, args.concurrency, args.vision, args.speculative),
             "long-context": lambda: check_long_context(
                 client, args.model, checks, args.context, args.vision),
+            "progress": lambda: check_prompt_progress(
+                client, args.model, checks, args.concurrency, args.vision,
+                args.allow_missing_progress),
+            "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency),
         }
         selected = (list(suites) if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])

@@ -11,6 +11,7 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -26,7 +27,36 @@ namespace {
 namespace net = gufo::net;
 
 using gufo::server::HttpServer;
+using gufo::server::Logger;
+using gufo::server::LogLevel;
+using gufo::server::LogLevelFromName;
+using gufo::server::LogLevelName;
 using gufo::server::TextGenerationBackend;
+
+/// Reports fixed prompt progress before delegating token generation.
+class ProgressRequest final : public TextGenerationBackend::GenerationRequest {
+public:
+  ProgressRequest(std::shared_ptr<GenerationRequest> inner,
+                  std::vector<TextGenerationBackend::PromptProgress> progress)
+      : inner_(std::move(inner)), progress_(std::move(progress)) {}
+
+  TextGenerationBackend::Result Wait(
+      const TextGenerationBackend::TokenCallback& on_token,
+      const TextGenerationBackend::ProgressCallback& on_progress) override {
+    for (const auto& value : progress_) {
+      if (on_progress && !on_progress(value)) {
+        inner_->Cancel();
+        break;
+      }
+    }
+    return inner_->Wait(on_token, on_progress);
+  }
+  void Cancel() noexcept override { inner_->Cancel(); }
+
+private:
+  std::shared_ptr<GenerationRequest> inner_;
+  std::vector<TextGenerationBackend::PromptProgress> progress_;
+};
 
 class FakeBackend final : public TextGenerationBackend {
 public:
@@ -54,11 +84,14 @@ public:
       const gufo::sampling::SamplingConfig& sampling,
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
-      const std::vector<std::string>& stop_sequences) override {
+      const std::vector<std::string>& stop_sequences,
+      bool return_progress) override {
     last_ignore_eos = ignore_eos;
-    return TextGenerationBackend::start_complete(prompt, max_tokens, sampling,
-                                                 cancellation, stream, false,
-                                                 client_id, stop_sequences);
+    return std::make_shared<ProgressRequest>(
+        TextGenerationBackend::start_complete(
+            prompt, max_tokens, sampling, cancellation, stream, false,
+            client_id, stop_sequences, return_progress),
+        progress);
   }
   SamplingDefaults sampling_defaults() const override { return defaults; }
   SamplingDefaults defaults;
@@ -133,6 +166,7 @@ public:
   }
   std::atomic<int> calls{0};
   std::atomic<bool> last_ignore_eos{false};
+  std::vector<PromptProgress> progress;
   std::atomic<int> failure{0};
   std::string forced_stop_sequence;
   gufo::ReasoningOptions reasoning;
@@ -179,6 +213,28 @@ public:
               },
           .stream_log = log,
       };
+    });
+    server.add("POST", "/sse-idle", [](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body =
+              [](const auto& write) {
+                (void)write("data: first\n\n");
+                std::this_thread::sleep_for(std::chrono::milliseconds(90));
+                (void)write("data: last\n\n");
+                (void)write("data: [DONE]\n\n");
+              },
+      };
+    });
+    server.add("POST", "/sse-finish", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body = [fail = !request.body.empty()](const auto& write) {
+            (void)write("data: first\n\n");
+            if (fail)
+              throw std::runtime_error("injected SSE failure");
+            (void)write("data: [DONE]\n\n");
+          }};
     });
     std::string error;
     assert(server.start(&error));
@@ -290,10 +346,19 @@ void TestAuthorization() {
   assert(secured.backend->calls == 1);
 }
 
-void TestRequestLogging() {
-  std::ostringstream output;
-  auto* previous = std::clog.rdbuf(output.rdbuf());
+struct CapturedLogs {
+  std::string text;
   std::string request_id;
+};
+
+// Drives one pass of traffic at a fixed verbosity. The process-wide filter is
+// shared by every test in this binary, so the previous level is restored.
+CapturedLogs CaptureTraffic(LogLevel level) {
+  const LogLevel previous = Logger::Level();
+  Logger::SetLevel(level);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  CapturedLogs captured;
   {
     RunningServer server;
     ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
@@ -304,28 +369,139 @@ void TestRequestLogging() {
     const auto header = response.find("X-Request-ID: ");
     assert(header != std::string::npos);
     const auto begin = header + std::string("X-Request-ID: ").size();
-    request_id = response.substr(begin, response.find("\r\n", begin) - begin);
+    captured.request_id =
+        response.substr(begin, response.find("\r\n", begin) - begin);
 
     const auto failed = server.Post("/stream-error", "");
     ExpectStatus(failed, 200);
     assert(failed.find("first chunk") != std::string::npos);
     assert(failed.find("HTTP/1.1", 1) == std::string::npos);
+
+    ExpectStatus(server.Send("GET /not-a-route HTTP/1.1\r\n\r\n"), 404);
   }
-  gufo::server::Logger::Info("test", "escaped\n\x1b[31m");
-  std::clog.rdbuf(previous);
-  const auto log = output.str();
-  assert(log.find("request=" + request_id + " event=received") !=
+  Logger::Info("test", "escaped\n\x1b[31m");
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous);
+  captured.text = output.str();
+  return captured;
+}
+
+void TestRequestLogging() {
+  const CapturedLogs info = CaptureTraffic(LogLevel::kInfo);
+  const std::string& log = info.text;
+  assert(log.find("request=" + info.request_id + " event=received") !=
          std::string::npos);
-  assert(log.find("request=" + request_id + " event=completed") !=
+  assert(log.find("request=" + info.request_id + " event=completed") !=
          std::string::npos);
   assert(log.find("cache=memory") != std::string::npos);
   assert(log.find("acceptance_pct=50.0") != std::string::npos);
   assert(log.find("rss_mib=") != std::string::npos);
   assert(log.find("error_code=server_exception") != std::string::npos);
+  // A successful poll is quiet at the default level, and so is the received
+  // line for a GET that is not on the inference list.
   assert(log.find("path=/health") == std::string::npos);
+  // Statuses never are: 4xx keeps escalating to WARN under any filter.
+  assert(log.find("path=/not-a-route status=404") != std::string::npos);
+  assert(log.find("[WARN]") != std::string::npos);
   assert(log.find("private-query") == std::string::npos);
   assert(log.find("private-prompt") == std::string::npos);
   assert(log.find("escaped\\x0a\\x1b[31m") != std::string::npos);
+  // The startup confirmation is INFO-tier, so the default level reports it.
+  // TestQuietTiersSuppressLifecycle covers the tiers that do not.
+  assert(log.find("event=listening") != std::string::npos);
+
+  const CapturedLogs debug = CaptureTraffic(LogLevel::kDebug);
+  assert(debug.text.find("[DEBUG]") != std::string::npos);
+  assert(debug.text.find("event=received method=GET path=/health") !=
+         std::string::npos);
+  assert(debug.text.find("path=/health status=200") != std::string::npos);
+  // Debug adds lines; it must not downgrade an inference completion to DEBUG,
+  // nor pull a refused 4xx back under the threshold.
+  assert(debug.text.find("[INFO] [http] request=" + debug.request_id +
+                         " event=completed") != std::string::npos);
+  assert(debug.text.find("path=/not-a-route status=404") != std::string::npos);
+  // The higher tier must still hide every byte of the request.
+  assert(debug.text.find("private-query") == std::string::npos);
+  assert(debug.text.find("private-prompt") == std::string::npos);
+  // Options are echoed by `gufo serve`, not by the HTTP layer itself.
+  assert(debug.text.find("event=options") == std::string::npos);
+}
+
+// The threshold covers the lifecycle lines too: `--log-level=warn|error` boots
+// and stops without a word, which docs/SERVER.md states, while an escalation
+// keeps its own tier and a filtered INFO receipt line never reaches the log.
+void TestQuietTiersSuppressLifecycle() {
+  const CapturedLogs warn = CaptureTraffic(LogLevel::kWarn);
+  assert(warn.text.find("event=listening") == std::string::npos);
+  assert(warn.text.find("event=received") == std::string::npos);
+  assert(warn.text.find("path=/not-a-route status=404") != std::string::npos);
+
+  const CapturedLogs error = CaptureTraffic(LogLevel::kError);
+  assert(error.text.find("event=listening") == std::string::npos);
+  assert(error.text.find("event=received") == std::string::npos);
+  assert(error.text.find("path=/not-a-route status=404") == std::string::npos);
+}
+
+void TestLogLevelFilter() {
+  const LogLevel previous = Logger::Level();
+  assert(previous == LogLevel::kInfo);
+
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  Logger::SetLevel(LogLevel::kError);
+  Logger::Debug("probe", "hidden-debug");
+  Logger::Info("probe", "hidden-info");
+  Logger::Warn("probe", "hidden-warn");
+  Logger::Error("probe", "visible-error");
+  // The printf-style entry point the imported DeepSeek runtime uses has to
+  // filter before it formats: an INFO loader line stays silent at an absolute
+  // threshold while an ERROR line survives.
+  Logger::LogFormatted(LogLevel::kInfo, "ds4", "hidden-ds4-info %d", 1);
+  Logger::LogFormatted(LogLevel::kError, "ds4", "visible-ds4-error %d", 2);
+  Logger::LogRequest("r-quiet", "GET", "/health", 200, 1.0, "", "completed",
+                     LogLevel::kDebug);
+  Logger::LogRequest("r-404", "GET", "/missing", 404, 1.0);
+  Logger::LogRequest("r-500", "POST", "/boom", 500, 1.0);
+  Logger::SetLevel(LogLevel::kWarn);
+  Logger::Debug("probe", "still-hidden-debug");
+  Logger::Warn("probe", "visible-at-warn");
+  Logger::LogFormatted(LogLevel::kInfo, "ds4", "still-hidden-ds4-info");
+  Logger::LogFormatted(LogLevel::kWarn, "ds4", "visible-ds4-warn");
+  Logger::LogRequest("r-404b", "GET", "/missing", 404, 1.0);
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous);
+
+  const std::string log = output.str();
+  assert(log.find("hidden-debug") == std::string::npos);
+  assert(log.find("hidden-info") == std::string::npos);
+  assert(log.find("hidden-warn") == std::string::npos);
+  assert(log.find("still-hidden-debug") == std::string::npos);
+  assert(log.find("hidden-ds4-info") == std::string::npos);
+  assert(log.find("still-hidden-ds4-info") == std::string::npos);
+  assert(log.find("visible-error") != std::string::npos);
+  assert(log.find("visible-at-warn") != std::string::npos);
+  assert(log.find("visible-ds4-error 2") != std::string::npos);
+  assert(log.find("visible-ds4-warn") != std::string::npos);
+  assert(log.find("[DEBUG]") == std::string::npos);
+  // A poll that is quiet by default stays filtered, while an escalation keeps
+  // its own tier: `--log-level error` means errors only, not "hide failures".
+  assert(log.find("request=r-quiet event=completed") == std::string::npos);
+  assert(log.find("request=r-404 event=completed") == std::string::npos);
+  assert(log.find("request=r-500 event=completed") != std::string::npos);
+  assert(log.find("request=r-404b event=completed") != std::string::npos);
+  assert(Logger::Level() == LogLevel::kInfo);
+}
+
+void TestLogLevelNames() {
+  assert(LogLevelFromName("debug") == LogLevel::kDebug);
+  assert(LogLevelFromName("info") == LogLevel::kInfo);
+  assert(LogLevelFromName("warn") == LogLevel::kWarn);
+  assert(LogLevelFromName("error") == LogLevel::kError);
+  assert(!LogLevelFromName("trace").has_value());
+  assert(!LogLevelFromName("DEBUG").has_value());
+  assert(!LogLevelFromName("").has_value());
+  assert(LogLevelName(LogLevel::kDebug) == "debug");
+  assert(LogLevelName(LogLevel::kError) == "error");
 }
 
 void TestFramingAndMetrics() {
@@ -367,6 +543,65 @@ void TestFramingAndMetrics() {
   assert(timings->member_double("cache_n") == 8);
   assert(timings->member_double("prompt_per_second") == 500);
   assert(timings->member_double("prompt_per_token_ms") == 2);
+}
+
+void TestFallbackBackendMetrics() {
+  namespace metrics = gufo::server::detail;
+  RunningServer server;
+  struct Endpoint {
+    const char* path;
+    const char* body;
+  };
+  for (const auto& endpoint : {
+           Endpoint{"/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}]})"},
+           Endpoint{"/v1/completions", R"({"prompt":"hi"})"},
+           Endpoint{"/v1/responses", R"({"input":"hi"})"},
+       }) {
+    for (const bool stream : {false, true}) {
+      const auto prompt_before = metrics::TotalPromptTokens().load();
+      const auto generated_before = metrics::TotalGenTokens().load();
+      auto body = gufo::json::parse(endpoint.body);
+      body["model"] = "test";
+      body["stream"] = stream;
+      ExpectStatus(server.Post(endpoint.path, body.dump()), 200);
+      const auto response = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+      ExpectStatus(response, 200);
+      // The backend reports 10 prompt tokens, of which 8 were cached.
+      assert(response.find("llamacpp:prompt_tokens_total " +
+                           std::to_string(prompt_before + 2) + "\n") !=
+             std::string::npos);
+      assert(response.find("llamacpp:tokens_predicted_total " +
+                           std::to_string(generated_before + 1) + "\n") !=
+             std::string::npos);
+    }
+  }
+  struct Case {
+    std::size_t prefill, cached;
+    bool cancelled;
+    std::size_t expected_prompt;
+  };
+  for (const auto& test : {
+           Case{6, 4, false, 6},
+           Case{0, 4, false, 6},
+           Case{0, 10, false, 0},
+           Case{0, 20, false, 0},
+           Case{0, 0, true, 0},
+           Case{3, 0, true, 3},
+       }) {
+    const auto prompt_before = metrics::TotalPromptTokens().load();
+    const auto generated_before = metrics::TotalGenTokens().load();
+    TextGenerationBackend::Result result;
+    result.prompt_tokens = 10;
+    result.cached_prompt_tokens = test.cached;
+    result.prefill_tokens = test.prefill;
+    result.completion_tokens = 2;
+    result.cancelled = test.cancelled;
+    gufo::server::RecordServerMetrics(result);
+    assert(metrics::TotalPromptTokens().load() ==
+           prompt_before + test.expected_prompt);
+    assert(metrics::TotalGenTokens().load() == generated_before + 2);
+  }
 }
 
 void TestCompatibilityRequests() {
@@ -915,6 +1150,53 @@ void TestStreamingFraming() {
          std::string("a\0bend", 6));
 }
 
+void TestSseHeartbeat() {
+  RunningServer server(
+      {.sse_heartbeat_interval = std::chrono::milliseconds(20)});
+  const auto response = server.Post("/sse-idle", "");
+  ExpectStatus(response, 200);
+  const auto first = response.find("data: first\n\n");
+  const auto ping = response.find(": ping\n\n", first);
+  const auto second_ping = response.find(": ping\n\n", ping + 1);
+  const auto last = response.find("data: last\n\n", second_ping);
+  assert(first != std::string::npos);
+  assert(ping != std::string::npos);
+  assert(second_ping != std::string::npos);
+  assert(last != std::string::npos);
+  assert(response.find("data: [DONE]\n\n", last) != std::string::npos);
+  assert(response.ends_with("0\r\n\r\n"));
+
+  const auto legacy = server.Send("POST /sse-idle HTTP/1.0\r\n\r\n");
+  assert(legacy.find("Transfer-Encoding:") == std::string::npos);
+  assert(legacy.find(": ping\n\n") != std::string::npos);
+  assert(legacy.ends_with("data: [DONE]\n\n"));
+
+  RunningServer disabled({.sse_heartbeat_interval = {}});
+  assert(disabled.Post("/sse-idle", "").find(": ping") == std::string::npos);
+}
+
+void TestSseHeartbeatShutdown() {
+  // Quick completion and exceptions can request stop while the heartbeat
+  // thread is entering its wait. Cleanup must not wait for this deadline:
+  // Send() has a three-second socket timeout.
+  RunningServer server({.sse_heartbeat_interval = std::chrono::seconds(30)});
+  std::vector<std::jthread> clients;
+  for (int client = 0; client < 8; ++client) {
+    clients.emplace_back([&] {
+      for (int request = 0; request < 16; ++request) {
+        const bool fail = request % 2 != 0;
+        const auto response = server.Post("/sse-finish", fail ? "fail" : "");
+        ExpectStatus(response, 200);
+        assert(response.find("data: first\n\n") != std::string::npos);
+        assert(response.find(": ping") == std::string::npos);
+        assert(response.ends_with("0\r\n\r\n") == !fail);
+        assert((response.find("data: [DONE]\n\n") != std::string::npos) ==
+               !fail);
+      }
+    });
+  }
+}
+
 void TestSignalShutdown() {
 #if defined(_WIN32)
   // fork/kill/waitpid process semantics are POSIX; Windows console-event
@@ -966,10 +1248,49 @@ void TestSignalShutdown() {
 }
 }  // namespace
 
+void TestRawCompletionPromptProgress() {
+  RunningServer server;
+  server.backend->progress = {
+      {.total = 4, .cache = 1, .processed = 4, .time_ms = 2}};
+  const auto response =
+      server.Post("/v1/completions",
+                  R"({"prompt":"hello","stream":true,"return_progress":true})");
+  ExpectStatus(response, 200);
+  const auto progress = response.find(
+      R"("choices":[{"text":"","index":0,"logprobs":null,"finish_reason":null}],)"
+      R"("prompt_progress":{"total":4,"cache":1,"processed":4,"time_ms":2}})");
+  assert(progress != std::string::npos);
+  assert(progress < response.find(R"("text":"ok")"));
+
+  const auto plain =
+      server.Post("/v1/completions", R"({"prompt":"hello","stream":true})");
+  ExpectStatus(plain, 200);
+  assert(plain.find("prompt_progress") == std::string::npos);
+  const auto null_progress =
+      server.Post("/v1/completions",
+                  R"({"prompt":"hello","stream":true,"return_progress":null})");
+  ExpectStatus(null_progress, 200);
+  assert(null_progress.find("prompt_progress") == std::string::npos);
+  const auto buffered = server.Post(
+      "/v1/completions", R"({"prompt":"hello","return_progress":true})");
+  ExpectStatus(buffered, 200);
+  assert(buffered.find("prompt_progress") == std::string::npos);
+  ExpectStatus(server.Post("/v1/completions",
+                           R"({"prompt":"hello","return_progress":1})"),
+               400);
+}
+
 int main() {
+  // The log assertions below match "[LEVEL] [component]" text written to a
+  // redirected stderr sink, so the real stderr's TTY state must not add ANSI
+  // tint around the level tag.
+  ::setenv("NO_COLOR", "1", 1);
   std::fprintf(stderr, "hst: TestRequestLogging\n");
   std::fflush(stderr);
   TestRequestLogging();
+  TestQuietTiersSuppressLifecycle();
+  TestLogLevelFilter();
+  TestLogLevelNames();
   std::fprintf(stderr, "hst: TestInvalidBindSettings\n");
   std::fflush(stderr);
   TestInvalidBindSettings();
@@ -984,12 +1305,14 @@ int main() {
   TestFramingAndMetrics();
   std::fprintf(stderr, "hst: TestCompatibilityRequests\n");
   std::fflush(stderr);
+  TestFallbackBackendMetrics();
   TestCompatibilityRequests();
   std::fprintf(stderr, "hst: TestRawCompletionStreaming\n");
   std::fflush(stderr);
   TestRawCompletionStreaming();
   std::fprintf(stderr, "hst: TestCompatibilityStopSequences\n");
   std::fflush(stderr);
+  TestRawCompletionPromptProgress();
   TestCompatibilityStopSequences();
   std::fprintf(stderr, "hst: TestCompatibilityThinkingDefaults\n");
   std::fflush(stderr);
@@ -1004,6 +1327,10 @@ int main() {
   std::fprintf(stderr, "hst: TestStreamingFraming\n");
   std::fflush(stderr);
   TestStreamingFraming();
+  std::fprintf(stderr, "hst: TestSseHeartbeat\n");
+  std::fflush(stderr);
+  TestSseHeartbeat();
+  TestSseHeartbeatShutdown();
   std::fprintf(stderr, "hst: TestSignalShutdown\n");
   std::fflush(stderr);
   TestSignalShutdown();

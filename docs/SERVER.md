@@ -173,7 +173,9 @@ work can batch across ready requests. See the
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 
-Prompt reuse is enabled by default. `cache_prompt: false` on
+Prompt reuse is enabled by default; how the cache finds, retains and
+evicts that state is described in [the KV cache](KV-CACHE.md).
+`cache_prompt: false` on
 `/v1/chat/completions` or `/v1/responses` bypasses memory and disk lookup for
 that request; the result can still populate the cache. DeepSeek and Qwen tool
 requests retain a checkpoint before the assistant-generation suffix, including
@@ -248,7 +250,9 @@ ceiling on one device, gufo or otherwise.
 Each server reads the queues already in use from
 `/sys/class/kfd/kfd/proc/*/queues/*/type`, which is world-readable and so
 includes processes gufo does not own, then exports `GPU_MAX_HW_QUEUES` before
-loading a model and logs a `queue_budget` event:
+loading a model and logs a `queue_budget` event. That event is INFO-tier and
+follows `--log-level` like the rest of the startup diagnostics; the
+`queue_budget_exceeded` warning below is WARN-tier:
 
 | Server | `GPU_MAX_HW_QUEUES` | Resident compute queues |
 | --- | ---: | ---: |
@@ -594,6 +598,7 @@ ordinary continuation.
 - `stop`: null, one string, or an array of up to four strings
 - `stream`
 - `stream_options.include_usage`
+- `return_progress` (see [Prompt progress](#prompt-progress))
 - `tools` and `tool_choice` when supported. Function tools accept the nested
   Chat Completions shape and the flat Responses-style `{type,name,parameters}`
   shape. Missing or null `parameters` become `{}`. `parametersJsonSchema` is
@@ -613,6 +618,24 @@ ordinary continuation.
 Streaming objects use `chat.completion.chunk` and end with the compatibility
 sentinel expected by common clients.
 
+### Prompt progress
+
+Streaming `/v1/chat/completions`, `/v1/completions` and `/v1/responses` requests accept
+llama-server's `return_progress: true`. Before the first token, the stream
+carries chunks with an empty delta (Chat) or empty text (Completions) and a
+top-level `prompt_progress` object:
+
+```json
+{"prompt_progress": {"total": 4096, "cache": 1024, "processed": 2048, "time_ms": 850}}
+```
+
+`processed` includes cached tokens; a full cache hit reports `processed == total`.
+`time_ms` measures prompt-processing wall time. Updates follow prefill chunks;
+a slow client receives only the newest pending update. Responses uses
+`response.in_progress` events. Omitted, false or null disables progress;
+other non-boolean values return 400. Buffered requests ignore the flag.
+Disabled progress adds no progress queue updates or consumer wakeups.
+
 The adapter must not implement a second inference path. It converts messages
 into the same prompt and sampling structures used by `/v1/responses`.
 
@@ -621,6 +644,11 @@ current request, excluding its prompt. Repetition penalties use `repeat_last_n`
 and may include prompt tokens. Setting that window to zero disables only the
 repetition penalty. Speculative rejection discards tentative counts; seeded
 sampling replay retains independent request histories.
+
+API ranges: temperature `[0, 2]`, top-p/min-p `[0, 1]`, frequency/presence
+penalties `[-2, 2]`. Top-p zero keeps the highest-probability token (or
+`min_keep` tokens). Setting temperature to zero retains configured penalties;
+omitted controls keep their model/CLI defaults.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
@@ -788,8 +816,13 @@ conversations are not implemented.
 ## Metrics
 
 `/metrics` exposes total prompt/generated tokens and the latest prompt/decode
-speeds. `Server-Timing`, generation `timings`, and Chat Completions
-`usage.gufo` provide request-level measurements. The legacy KV-utilization
+speeds. The token counters advance as each prefill chunk and generated token
+executes, so their rates show live throughput; prompt tokens exclude cache
+hits. `llamacpp:requests_processing` counts admitted requests, including cache
+preparation and cleanup; `llamacpp:requests_deferred` counts requests waiting
+for a session. The speed gauges retain the latest nonzero request rates.
+`Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
+provide request-level measurements. The legacy KV-utilization
 metric and `/slots`/`/props` metadata are placeholders; do not use them for
 capacity or admission decisions.
 
@@ -806,12 +839,65 @@ and automatic recovery after device reset or suspend/resume.
 Server lifecycle and request logs go to stderr. Each request gets an
 `X-Request-ID` response header matching its `request=rN` log entries. Inference
 requests log receipt and completion; streaming completion is logged after the
-stream ends. Successful health/metrics and video-status polls are quiet.
+stream ends. Successful health/metrics and video-status polls are quiet at the
+default level.
+
+Set verbosity with `--log-level <error|warn|info|debug>` (default `info`);
+`-v`/`--verbose` is shorthand for `--log-level=debug` and cannot combine with
+the canonical spelling — passing both is a usage error rather than a precedence
+to guess at. Each tier is a threshold, not only an addition:
+`--log-level error` shows ERROR lines alone, so a 5xx response or stream
+failure still logs while a 4xx refusal, which logs at WARN (a 429 admission
+refusal included), is filtered out.
+
+The threshold also covers the lifecycle lines. `event=listening` (the bound
+address, auth mode and connection limits) and `event=shutdown_requested` (the
+signal that asked for a stop) are INFO-tier, so `--log-level=warn` and
+`--log-level=error` start and stop with no output at all. Keep the default
+`info` for systemd units and CI that read the startup banner, or confirm boot
+with `GET /health` or `GET /ready`.
+
+The `debug` tier adds:
+
+- the resolved server options as `event=options` before the model opens, with
+  `api_key=set` rather than the key. This line and the `event=listening` banner
+  are separate on purpose: the banner only appears once the model has loaded and
+  the listener is accepting, so a load that fails or hangs leaves
+  `event=options` as the sole record of what was asked for;
+- completion logs for the polls that are quiet by default, and `event=received`
+  for GET requests;
+- scheduler decisions: `event=admitted` with the pending queue depth and the
+  per-client depth the request joined, `event=admission_refused` naming the limit
+  that rejected it and the client, and `event=backpressure` once per stream
+  naming which output budget refused a token (`request_buffer` or
+  `total_buffer`) with the byte counts;
+- cache candidate detail behind the summarised lines: `event=candidate_skip`
+  gives the entry index, its token length and the first guard that failed
+  (`unavailable`, `input_identity`, `stable_prefix_boundary` or
+  `token_prefix`), and `event=capture_evicts` names the checkpoint a capture is
+  about to overwrite. A request that finds every slot busy emits its skip
+  records once, so a long wait does not repeat them on every 10ms poll.
+
+Loader phases stay at INFO: the weight-mapping and session-preallocation work is
+HIP-only code, so deeper sub-phases there need a GPU build to verify and are not
+part of this tier. The imported DeepSeek V4 Flash runtime logs through the same
+threshold rather than writing to stderr directly, so its informational startup
+lines (the ROCm model-cache and managed-KV lines, DSpark attachment, the shared
+batch workspace) are suppressed by `--log-level=warn`/`error` too.
+
+Prompt text, message bodies and API keys stay unlogged at every level, and debug
+lines use the same escaping and redaction as the rest of the log. Client
+identity is the exception: scheduler admission lines name a client by the peer
+address of its socket (`client_id=127.0.0.1` on the default loopback bind), so a
+public `--host` writes client IP addresses into the debug tier.
 
 Pass `--log-progress` to `gufo serve llm` to log each prefill chunk, each
 50-token decode boundary, and the final decode remainder. Each line includes the
 request ID, completed and total tokens, percentage, current speed and average
-speed. Speculative requests also include accepted and proposed drafts.
+speed. Speculative requests also include accepted and proposed drafts. Progress
+lines are INFO-tier: `--log-level=warn` or `--log-level=error` would discard
+them, so the server rejects that combination at startup instead of ignoring the
+flag.
 
 Text completion logs include stop/length/cancellation, queue and first-token
 latency, prefill/decode speed, execution width, memory/disk cache hits and reused
@@ -853,9 +939,12 @@ lazily in the worker. Control characters are escaped in log lines.
 
 - `json_test`: number precision, Unicode escapes, malformed input and depth limits.
 - `http_server_test`: transport framing, authentication, compatibility validation,
-  sampling forwarding, request logs and streaming failures without loading a model.
+  sampling forwarding, request logs at the default and debug tiers, and streaming
+  failures without loading a model.
+- `serve_cli_test`: executable help, argument wiring and rejected configurations,
+  including that `--log-level` and `-v` change the emitted log rather than only
+  parsing.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
-- `serve_cli_test`: executable help, argument wiring and rejected configurations.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
   cancellation. Use the affected model's benchmark README for commands and limits.
 

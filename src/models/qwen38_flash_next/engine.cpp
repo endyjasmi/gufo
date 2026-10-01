@@ -688,14 +688,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
-  const bool gpu_greedy = sampler.config().temperature == 0.0F &&
-                          !sampler.config().penalties_enabled();
+  const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
   bool chained = false;
-  if (!defer_head && gpu_greedy && !sampled) {
+  if (!defer_head && gpu_greedy && !sampled &&
+      !sampler.config().penalties_enabled()) {
     // Greedy MTP keeps every draft token on the device: the catch-up and
     // all proposals run as one chained submission and the pinned chain
-    // feeds verification. No per-draft host round trip.
+    // feeds verification. No per-draft host round trip. Active penalties
+    // change the greedy winner, and the pinned chain's device argmax is
+    // raw — those requests verify through the penalty-aware path instead.
     std::vector<std::int32_t> replay;
     std::int32_t replay_row = 0;
     if (!DraftReplay(anchor, &replay, &replay_row, error_msg)) {
@@ -791,7 +793,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (gpu_greedy &&
       !(pending.greedy_pinned
             ? exec.ReadGreedyPredictions(std::span(greedy).first(k), error_msg)
-            : exec.GreedyMtpPredictions(std::span(greedy).first(k - 1),
+            : exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), sampler,
+                                        std::span(chain).subspan(1),
                                         error_msg))) {
     return false;
   }
@@ -805,7 +808,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
         AssignError(error_msg, "logit distribution contains no finite values");
         return false;
       }
-      if (!sampler.CanSelectArgmax(prediction.index)) {
+      if (!sampler.CanSelectArgmax(prediction.index,
+                                   /*penalties_applied=*/true)) {
         // Most native tool tokens already obey the grammar. On the first
         // forbidden argmax, download the remaining rows once and use exact
         // masked selection. Avoid one synchronization per rejected candidate.

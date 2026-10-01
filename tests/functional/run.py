@@ -29,7 +29,7 @@ from metrics import compare, comparison_status, join_server_timings, timing_meas
 TESTS = Path(__file__).resolve().parent
 SUITES = ("responses", "stops", "conversation", "structured", "structured-limits",
           "tools", "auto-tools", "tool-edges", "sampling-defaults", "sampling-ranges", "batch",
-          "long-context", "state-edges", "cache")
+          "long-context", "state-edges", "progress", "metrics", "cache")
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
     "--top-k": ("top_k", int), "--min-p": ("min_p", float),
@@ -45,7 +45,7 @@ COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_override
 
 def provenance():
     source = hashlib.sha256()
-    for name in ("run.py", "metrics.py", "openai_sdk.py", "continuation.py"):
+    for name in ("run.py", "metrics.py", "progress.py", "server_metrics.py", "openai_sdk.py", "continuation.py"):
         source.update((TESTS / name).read_bytes())
     lock = TESTS.parents[1] / "flake.lock"
     kernel_command = Path("/proc/cmdline")
@@ -204,8 +204,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="New report directory; existing results are never overwritten")
     parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"), required=True)
-    parser.add_argument("--suite", action="append", choices=("all", *SUITES),
-                        help="Repeat to select focused suites; default: all")
+    parser.add_argument("--suite", action="append", choices=("all", *SUITES), required=True,
+                        help="Repeat to select affected suites; use all for an explicit full run")
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--suite-timeout", type=float, default=900)
     qualification = parser.add_mutually_exclusive_group(required=True)
@@ -215,9 +215,13 @@ def main():
                                help="Explicitly capture the reference; no regression claim yet")
     parser.add_argument("--through-case", metavar="SUITE:CASE",
                         help="Replay preceding suites/cases, then stop; focused investigation only")
+    parser.add_argument("--allow-missing-progress", action="store_true",
+                        help="Baseline only: older revisions without progress events")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="-- ./result/bin/gufo serve llm --model PATH [server options]")
     args = parser.parse_args()
+    if args.allow_missing_progress and not args.record_baseline:
+        parser.error("--allow-missing-progress is only for --record-baseline")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if len(command) < 3 or command[1] != "serve" or "llm" not in command:
         parser.error("pass a gufo serve llm command after --")
@@ -227,7 +231,7 @@ def main():
             parser.error(f"the test runner owns {reserved}; omit it from the server command")
     if option(command, "--api-key") is not None:
         parser.error("omit --api-key for the isolated loopback test server")
-    selected = args.suite or ["all"]
+    selected = args.suite
     if "all" in selected:
         if len(selected) != 1:
             parser.error("all cannot be combined with other suites")
@@ -283,6 +287,7 @@ def main():
               "sampling_preset": args.sampling_preset, "sampling_overrides": overrides,
               "vision": vision, "speculative": speculative,
               "suites": {}, "through_case": args.through_case,
+              "allow_missing_progress": args.allow_missing_progress,
               "started_ns": time.time_ns(), "status": "running"}
     report_path = output / "report.json"
     write_json(report_path, report)
@@ -357,6 +362,8 @@ def main():
                     sdk_args += ["--server-thinking", option(command, "--think")]
                 if suite == through_suite:
                     sdk_args += ["--through-case", through_case]
+                if args.allow_missing_progress:
+                    sdk_args += ["--allow-missing-progress"]
                 run(suite, "openai_sdk.py", sdk_args)
             if "cache" in selected:
                 for label, extra in cache_cases:
@@ -386,7 +393,11 @@ def main():
     try:
         join_server_timings(output)
         report["execution"] = execution_coverage(output, speculative)
-    except (ValueError, OSError) as error:
+        if ("metrics" in selected and through_suite != "metrics"
+                and report["suites"]["metrics"]["status"] == "passed"):
+            from server_metrics import validate_metrics_report
+            report["metric_accounting"] = validate_metrics_report(output)
+    except (ValueError, OSError, KeyError, AssertionError) as error:
         report.update(status="failed", measurements_error=str(error))
     report["functional_status"] = report["status"]
     report["completed_ns"] = time.time_ns()

@@ -19,9 +19,98 @@ functional = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(functional)
 from metrics import (CaseComplete, Recorder, canonical, compare, join_server_timings,
                      qualify, summarize, validate_tool_events)
+from progress import ProgressTrace
+from server_metrics import (COUNTERS, TYPES, PROMPT, GENERATED, PROCESSING,
+                            parse_metrics, assert_accounting, validate_metrics_report)
 
 
 class FunctionalRunnerTest(unittest.TestCase):
+    def test_prompt_progress_contract_and_output_order(self):
+        def event(processed, elapsed=0):
+            return {"prompt_progress": {"total": 10, "cache": 2,
+                                        "processed": processed, "time_ms": elapsed},
+                    "choices": [{"delta": {}, "finish_reason": None}]}
+        trace = ProgressTrace(True)
+        trace(event(2))
+        trace(event(10, 5))
+        trace({"choices": [{"delta": {"content": "ok"}}]})
+        trace.finish({"prompt_tokens": 10, "cached_tokens": 2})
+        with self.assertRaises(AssertionError):
+            trace(event(10, 6))
+        for invalid in (event(1), event(11), event(3, -1)):
+            with self.subTest(event=invalid), self.assertRaises(AssertionError):
+                ProgressTrace(True)(invalid)
+        with self.assertRaises(AssertionError):
+            ProgressTrace(False)(event(2))
+        with self.assertRaises(AssertionError):
+            ProgressTrace(True).finish({"prompt_tokens": 10, "cached_tokens": 2})
+        ProgressTrace(True, allow_missing=True).finish({})
+
+    def test_prometheus_contract_rejects_missing_and_invalid_metrics(self):
+        text = "".join(f"# HELP {name} Description\n# TYPE {name} {kind}\n{name} 0\n"
+                       for name, kind in TYPES.items())
+        self.assertEqual(parse_metrics(text), dict.fromkeys(TYPES, 0))
+        large = str(2**60 + 1)
+        self.assertEqual(parse_metrics(text.replace(f"{PROMPT} 0", f"{PROMPT} {large}"))[PROMPT],
+                         int(large))
+        for bad in (
+            text.replace(f"{PROMPT} 0\n", ""),
+            text + f"{GENERATED} 1\n",
+            text.replace(f"# TYPE {PROMPT} counter", f"# TYPE {PROMPT} gauge"),
+            text.replace(f"{PROCESSING} 0", f"{PROCESSING} -1"),
+            text.replace(f"{PROCESSING} 0", f"{PROCESSING} 0.5"),
+            text.replace(f"{GENERATED} 0", f"{GENERATED} nan"),
+            text.replace(f"{GENERATED} 0", f"{GENERATED} inf"),
+        ):
+            with self.subTest(text=bad), self.assertRaises(ValueError):
+                parse_metrics(bad)
+
+    def test_prometheus_accounting_uses_uncached_work_once(self):
+        before = dict.fromkeys(COUNTERS, 10)
+        rows = [
+            {"http_status": 200, "status": "complete", "metrics": {
+                "prompt_tokens": 100, "cached_tokens": 98,
+                "prefill_tokens": 2, "completion_tokens": 7}},
+            {"http_status": 200, "status": "complete", "metrics": {
+                "prompt_tokens": 100, "cached_tokens": 100,
+                "prefill_tokens": 0, "completion_tokens": 3}},
+            {"http_status": 400, "status": "complete", "metrics": {}},
+        ]
+        after = {PROMPT: 12, GENERATED: 20}
+        assert_accounting(before, after, rows)
+        for bad in ({PROMPT: 210, GENERATED: 20}, {PROMPT: 14, GENERATED: 30},
+                    {PROMPT: 12, GENERATED: 19}):
+            with self.subTest(after=bad), self.assertRaises(AssertionError):
+                assert_accounting(before, bad, rows)
+        rows[0]["status"] = "disconnected"
+        with self.assertRaisesRegex(AssertionError, "missing completed"):
+            assert_accounting(before, after, rows)
+
+    def test_prometheus_cancelled_work_matches_terminal_server_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "metrics.requests.json").write_text(json.dumps({"requests": [
+                {"request_id": "r1", "http_status": 200, "status": "disconnected"},
+                {"request_id": "r2", "http_status": 200, "status": "complete"},
+                {"request_id": "r3", "http_status": 400, "status": "complete"}]}))
+            (root / "metrics.json").write_text(json.dumps({"checks": {
+                "metrics_chat_cold": {"before": {PROMPT: 100, GENERATED: 200}},
+                "metrics_live_queue_cancel": {"cancelled": [{"cancelled": True}]},
+                "metrics_after_cancel_cached": {"after": {PROMPT: 112, GENERATED: 207}}}}))
+            log = (
+                "[http] request=r1 event=completed status=200 prefill_tokens=12 "
+                "generated_tokens=3 finish=cancelled\n"
+                "[http] request=r2 event=completed status=200 prefill_tokens=0 "
+                "generated_tokens=4 finish=length\n"
+                "[http] request=r3 event=completed status=400\n")
+            (root / "server.log").write_text(log)
+            self.assertEqual(validate_metrics_report(root), {"requests": 2, "cancelled": 1})
+            # A disconnect can hide its final usage from the client; its tokens
+            # must still be counted exactly once in the process-wide total.
+            (root / "server.log").write_text(log.replace("generated_tokens=3", "generated_tokens=0"))
+            with self.assertRaises(AssertionError):
+                validate_metrics_report(root)
+
     def test_fingerprints_preserve_schema_payload_ids(self):
         for key in ("schema", "parameters", "metadata", "arguments"):
             self.assertNotEqual(canonical({key: {"id": "a", "call_id": "x"}}),
@@ -193,6 +282,11 @@ class FunctionalRunnerTest(unittest.TestCase):
         measured, fingerprint = summarize([(1, data[:split]), (7, data[split:])], True, True)
         self.assertEqual(measured["client_ttft_ms"], 7)
         self.assertEqual(measured["decode_ms_per_token"], 4)
+        progress = b'data: {"choices":[{"index":0,"delta":{},"finish_reason":null}],"prompt_progress":{"total":10,"cache":0,"processed":5,"time_ms":1}}\n\n'
+        with_progress, same_output = summarize(
+            [(.5, progress), (1, data[:split]), (7, data[split:])], True, True)
+        self.assertEqual(with_progress, measured)
+        self.assertEqual(same_output, fingerprint)
         buffered = json.dumps({"choices": [{"index": 0, "message": {"content": "é"},
                                            "finish_reason": "stop"}], "usage": usage}).encode()
         self.assertEqual(summarize([(9, buffered)], False, True)[1], fingerprint)
@@ -385,6 +479,16 @@ class FunctionalRunnerTest(unittest.TestCase):
              "presence_penalty": 0, "seed": 123})
         with self.assertRaises(ValueError):
             functional.sampling_overrides(["--temperature", "0", "--temperature=1"])
+
+    def test_runner_requires_explicit_suites_before_starting_server(self):
+        args = ["run.py", "--record-baseline", "--output", "/unused",
+                "--sampling-preset", "qwen38", "--", "gufo", "serve", "llm",
+                "--model", "fixture.gguf"]
+        with patch.object(sys, "argv", args), patch.object(functional, "server") as start, \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            functional.main()
+        self.assertEqual(error.exception.code, 2)
+        start.assert_not_called()
 
     def test_runner_inconclusive_is_nonzero_and_correctness_still_fails(self):
         with tempfile.TemporaryDirectory() as directory:
