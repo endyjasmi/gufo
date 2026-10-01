@@ -211,6 +211,7 @@ jobs:
 
       - name: Close the build-failure issue after a good run
         if: ${{ success() }}
+        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -225,6 +226,7 @@ jobs:
 
       - name: Open an issue when the build breaks
         if: ${{ failure() }}
+        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
