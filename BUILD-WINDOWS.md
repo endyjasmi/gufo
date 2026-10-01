@@ -2,6 +2,8 @@
 
 This is the native Windows port of Gufo for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151). It is **not** an upstream-supported configuration — upstream targets Linux — so the build expects a specific toolchain layout. Follow the steps in order.
 
+**If you only want a ready-made binary:** no need to build anything. Grab `gufo-*-windows-gfx1151.zip` from this fork's [Releases page](https://github.com/endyjasmi/gufo/releases), unzip it, and run `gufo.exe` from the extracted folder (an AMD driver with ROCm support is required). The rest of this guide is for building from source.
+
 ## 1. Prerequisites
 
 - **Hardware/driver:** AMD Strix Halo (gfx1151) with a recent AMD driver (current Adrenalin/PRO drivers work).
