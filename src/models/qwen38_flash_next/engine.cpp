@@ -688,7 +688,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
-  const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
+  const bool gpu_greedy = sampler.config().temperature == 0.0F &&
+                          !sampler.config().penalties_enabled();
   const bool gpu_verification = gpu_greedy;
   bool chained = false;
   if (!defer_head && gpu_greedy && !sampled) {
@@ -752,8 +753,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->width = width;
   pending->base = base;
   pending->speculative = true;
-  pending->gpu_greedy = true;
-  pending->gpu_verification = true;
+  pending->sampled = sampled;
+  pending->gpu_greedy = gpu_greedy;
+  pending->gpu_verification = gpu_verification;
   pending->greedy_pinned = true;
   return true;
 }
@@ -795,12 +797,26 @@ bool Session::FinishDecode(const DecodeRequest& request,
   }
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
+  bool cpu_rows = false;
   while (keep < k) {
-    if (gpu_greedy) {
+    if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
       if (!std::isfinite(prediction.value)) {
         AssignError(error_msg, "logit distribution contains no finite values");
         return false;
+      }
+      if (!sampler.CanSelectArgmax(prediction.index)) {
+        // Most native tool tokens already obey the grammar. On the first
+        // forbidden argmax, download the remaining rows once and use exact
+        // masked selection. Avoid one synchronization per rejected candidate.
+        // SelectBatchLogits has already installed this session's row offset.
+        verify_logits_.resize(exec.max_speculative() * vocab);
+        auto rows = std::span(verify_logits_)
+                        .subspan((keep - 1) * vocab, (k - keep + 1) * vocab);
+        if (!exec.ReadVerificationRows(keep - 1, rows, error_msg))
+          return false;
+        cpu_rows = true;
+        continue;
       }
       if (is_stop(prediction.index)) {
         result->stop = true;
@@ -849,10 +865,11 @@ bool Session::FinishDecode(const DecodeRequest& request,
       return false;
     }
   } else if (!exec.Rollback(*session_, keep, error_msg,
-                            gpu_verification ? logits_.data() : nullptr)) {
+                            gpu_verification && !cpu_rows ? logits_.data()
+                                                          : nullptr)) {
     return false;
   }
-  if (!gpu_verification) {
+  if (!gpu_verification || cpu_rows) {
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());
   }
@@ -870,7 +887,23 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
   if (pending.greedy_pinned && !result->stop) {
-    sampler.DeferSample(static_cast<sampling::TokenId>(greedy[keep - 1].index));
+    if (!cpu_rows && !sampler.CanSelectArgmax(greedy[keep - 1].index)) {
+      // The frontier argmax violates the grammar: download its row once and
+      // let the next cycle's masked sampling pick the anchor instead of
+      // deferring a forbidden token.
+      verify_logits_.resize(exec.max_speculative() * vocab);
+      if (!exec.ReadVerificationRows(
+              keep - 1,
+              std::span(verify_logits_).subspan((keep - 1) * vocab, vocab),
+              error_msg)) {
+        return false;
+      }
+      cpu_rows = true;
+    }
+    if (!cpu_rows) {
+      sampler.DeferSample(
+          static_cast<sampling::TokenId>(greedy[keep - 1].index));
+    }
   } else if (correction) {
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
