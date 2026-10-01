@@ -1,23 +1,32 @@
 name: Windows release
 
 on:
+  # Continuous verification: build the port against the newest nightly SDK
+  # every day so toolchain breakage is caught within a day, not discovered
+  # when somebody next needs a build. Scheduled runs check out the Windows
+  # port branch explicitly (schedule otherwise uses the default branch).
+  schedule:
+    - cron: "23 21 * * *"
   workflow_dispatch:
     inputs:
       sdk:
-        description: TheRock nightly gfx1151 Windows tarball to build with
+        description: Optional TheRock tarball to pin (default newest nightly)
         required: false
-        default: therock-dist-windows-gfx1151-10.2.0a20261001.tar.gz
+        default: ""
       publish:
         description: Publish the build to a GitHub release
         type: boolean
         required: false
         default: true
   push:
+    branches:
+      - feature/window-native
     tags:
       - "windows-v*"
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: windows-release
@@ -29,12 +38,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 150
     env:
-      SDK_TARBALL: ${{ github.event.inputs.sdk || 'therock-dist-windows-gfx1151-10.2.0a20261001.tar.gz' }}
       SDK_ROOT: C:/TheRock/build
       BUILD_DIR: build\windows-release
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'feature/window-native' || github.ref }}
 
       - name: Verify this is the Windows port branch
         shell: pwsh
@@ -43,7 +53,35 @@ jobs:
             throw "CMakePresets.json has no windows-release preset; this checkout is not the Windows port. Run this workflow on the feature/window-native branch (or a windows-v* tag pointing at it)."
           }
 
+      - name: Resolve TheRock SDK
+        id: sdk
+        env:
+          SDK_OVERRIDE: ${{ github.event.inputs.sdk }}
+        shell: pwsh
+        run: |
+          if ($env:SDK_OVERRIDE) {
+            $tarball = $env:SDK_OVERRIDE
+          } else {
+            # The nightly index only keeps ~6 weeks of tarballs, so resolve
+            # the newest available one at run time instead of pinning.
+            $index = (Invoke-WebRequest -UseBasicParsing 'https://nightly.repo.amd.com/rocm/core/tarball/').Content
+            $match = [regex]::Match($index, 'const files = (\[.*?\]);', 'Singleline')
+            if (-not $match.Success) { throw 'could not parse the nightly tarball index' }
+            $files = $match.Groups[1].Value | ConvertFrom-Json
+            $latest = $files |
+              Where-Object { $_.name -like 'therock-dist-windows-gfx1151-*.tar.gz' -and
+                             $_.name -notlike '*-tests-*' } |
+              Sort-Object mtime -Descending |
+              Select-Object -First 1
+            if (-not $latest) { throw 'no windows gfx1151 tarball in the nightly index' }
+            $tarball = $latest.name
+          }
+          "tarball=$tarball" >> $env:GITHUB_OUTPUT
+          "version=$($tarball -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', '')" >> $env:GITHUB_OUTPUT
+
       - name: Download TheRock HIP SDK
+        env:
+          SDK_TARBALL: ${{ steps.sdk.outputs.tarball }}
         shell: pwsh
         run: |
           $url = "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
@@ -116,6 +154,8 @@ jobs:
 
       - name: Package
         id: package
+        env:
+          SDK_VERSION: ${{ steps.sdk.outputs.version }}
         shell: pwsh
         run: |
           $version = (Get-Content version.txt -Raw).Trim()
@@ -138,12 +178,11 @@ jobs:
           if ($entries | Where-Object { $_ -like '*\*' }) {
             throw "package contains backslash entry names"
           }
-          $sdkVersion = $env:SDK_TARBALL -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', ''
           @"
           Native Windows build of Gufo for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151).
 
           - Gufo $version (commit $env:GITHUB_SHA)
-          - Built with TheRock HIP SDK $sdkVersion
+          - Built with TheRock HIP SDK $env:SDK_VERSION
 
           Unzip the archive and run ``gufo.exe`` from the extracted folder (``gufo-server.exe`` starts the OpenAI-compatible HTTP server). An AMD graphics driver with ROCm support is required; the build targets gfx1151 only. See BUILD-WINDOWS.md in the repository for build-from-source instructions.
           "@ | Out-File -FilePath "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
@@ -159,10 +198,50 @@ jobs:
           retention-days: 30
 
       - name: Publish release
-        if: ${{ github.event_name == 'push' || github.event.inputs.publish == 'true' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish == 'true' }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          # Tag pushes publish a pinned windows-vX.Y.Z release; branch pushes,
+          # scheduled runs and manual runs refresh the rolling 'windows'
+          # release so the newest good build is always at one link.
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'windows' }}
           files: ${{ steps.package.outputs.zip }}
           body_path: ${{ runner.temp }}/release-notes.md
           make_latest: "true"
+
+      - name: Close the build-failure issue after a good run
+        if: ${{ success() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $open = gh issue list --repo $env:GITHUB_REPOSITORY --state open `
+            --search '"Windows release build is failing" in:title' --json number |
+            ConvertFrom-Json
+          foreach ($issue in $open) {
+            gh issue close $issue.number --repo $env:GITHUB_REPOSITORY `
+              --comment "Latest run succeeded: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          }
+
+      - name: Open an issue when the build breaks
+        if: ${{ failure() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $open = gh issue list --repo $env:GITHUB_REPOSITORY --state open `
+            --search '"Windows release build is failing" in:title' --json number |
+            ConvertFrom-Json
+          if ($open.Count -eq 0) {
+            $body = @"
+          The Windows release workflow failed. The rolling ``windows`` release still holds the last good build; users are unaffected until this is fixed.
+
+          - Failed run: $env:RUN_URL
+          - Commit: $env:GITHUB_SHA
+
+          Common causes: a broken or pulled nightly SDK (re-run with the ``sdk`` input pinned to a known-good tarball from https://nightly.repo.amd.com/rocm/core/tarball/), a compile break on the port branch, or a vcpkg dependency change.
+          "@
+            gh issue create --repo $env:GITHUB_REPOSITORY `
+              --title 'Windows release build is failing' --body $body
+          }
