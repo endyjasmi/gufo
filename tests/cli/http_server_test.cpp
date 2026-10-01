@@ -85,6 +85,8 @@ public:
   }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
+  bool supports_images() const override { return image_support.load(); }
+  std::atomic<bool> image_support{false};
   std::uint32_t max_context() const override { return 65536; }
   std::shared_ptr<GenerationRequest> start_complete(
       std::string_view prompt, std::size_t max_tokens,
@@ -742,6 +744,23 @@ void TestCompatibilityRequests() {
                501);
   assert(server.backend->calls == calls);
 
+  for (const auto& [url, expected] :
+       {std::pair{"data:image/gif;base64,AA==", "image/gif"},
+        std::pair{"data:image/png,AA==", "base64"},
+        std::pair{"data:image/png;base64,A===", "base64"}}) {
+    const auto input = parse(
+        R"({"input":[{"role":"user","content":[{"type":"input_image","image_url":)" +
+        gufo::json::Value(url).dump() +
+        R"(},{"type":"input_text","text":"describe"}]}]})");
+    const auto rejected = server.Post("/v1/responses", input.dump());
+    ExpectStatus(rejected, 400);
+    const auto parsed = parse(rejected.substr(rejected.find("\r\n\r\n") + 4));
+    const auto& error = *parsed.find("error");
+    assert(error.member_str("code") == "invalid_request");
+    assert(error.member_str("message").find(expected) != std::string::npos);
+  }
+  assert(server.backend->calls == calls);
+
   const auto structured =
       response_body(server.Post("/v1/responses",
                                 R"({"input":[{"role":"user","content":[
@@ -817,6 +836,32 @@ void TestCompatibilityRequests() {
           "max_tokens":2})"));
   assert(anthropic.member_str("stop_reason") == "end_turn");
   assert(server.backend->LastCall().chat.messages[0].content == "Be concise.");
+}
+
+void TestModelInputModalities() {
+  RunningServer server;
+  // Keep the same model ID: capability follows the loaded backend, not its
+  // name.
+  for (const bool images : {false, true, false}) {
+    server.backend->image_support = images;
+    const auto response = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    const auto listing =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    assert(listing.member_str("object") == "list");
+    const auto& models = listing.find("data")->items();
+    assert(models.size() == 1);
+    const auto& model = models[0];
+    assert(model.member_str("id") == "test");
+    assert(model.member_str("owned_by") == "gufo");
+    assert(model.member_size("context_length") == 65536);
+    const auto* architecture = model.find("architecture");
+    assert(architecture != nullptr);
+    const auto* modalities = architecture->find("input_modalities");
+    assert(modalities != nullptr);
+    assert(modalities->dump() ==
+           (images ? R"(["text","image"])" : R"(["text"])"));
+  }
 }
 
 void TestRawCompletionStreaming() {
@@ -1316,6 +1361,7 @@ int main() {
   TestCompatibilityRequests();
   std::fprintf(stderr, "hst: TestRawCompletionStreaming\n");
   std::fflush(stderr);
+  TestModelInputModalities();
   TestRawCompletionStreaming();
   std::fprintf(stderr, "hst: TestCompatibilityStopSequences\n");
   std::fflush(stderr);

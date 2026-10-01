@@ -1,6 +1,7 @@
 """Fast checks for the functional runner's failure reporting and process ownership."""
 
 import contextlib
+import base64
 import importlib.util
 import io
 import json
@@ -20,11 +21,170 @@ spec.loader.exec_module(functional)
 from metrics import (CaseComplete, Recorder, canonical, compare, join_server_timings,
                      qualify, summarize, validate_tool_events)
 from progress import ProgressTrace
+from tool_reasoning import ARGUMENTS, assert_edit
+from discovery import assert_model_listing
+from image_inputs import assert_color, image_cases, invalid_image_cases
 from server_metrics import (COUNTERS, TYPES, PROMPT, GENERATED, PROCESSING,
                             parse_metrics, assert_accounting, validate_metrics_report)
 
 
 class FunctionalRunnerTest(unittest.TestCase):
+    def test_pi_proxy_discovery_and_missing_content_type(self):
+        import http.client
+        import http.server
+        import threading
+        from pi_agent import Recorder as PiRecorder
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                if "untyped" not in self.path:
+                    self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"object":"list","data":[]}')
+
+        with tempfile.TemporaryDirectory() as directory, \
+                http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream) as upstream:
+            with PiRecorder(f"http://127.0.0.1:{upstream.server_port}",
+                            Path(directory)) as proxy:
+                workers = [threading.Thread(target=s.serve_forever, daemon=True)
+                           for s in (upstream, proxy)]
+                for worker in workers:
+                    worker.start()
+                try:
+                    for suffix, content_type in (
+                            ("", "application/json"),
+                            ("?untyped=1", "application/octet-stream")):
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1", proxy.server_port, timeout=5)
+                        try:
+                            connection.request("GET", "/v1/models" + suffix)
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.getheader("Content-Type"), content_type)
+                            self.assertEqual(json.loads(response.read()),
+                                             {"object": "list", "data": []})
+                        finally:
+                            connection.close()
+                    self.assertEqual(proxy.requests, [])
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+                finally:
+                    for server in (proxy, upstream):
+                        server.shutdown()
+                    for worker in workers:
+                        worker.join(timeout=5)
+
+    def test_image_inputs_require_a_projector_before_starting_a_server(self):
+        argv = ["run.py", "--output", "/unused", "--sampling-preset", "qwen38",
+                "--suite", "image-inputs", "--record-baseline", "--", "gufo", "serve", "llm"]
+        with patch.object(sys, "argv", argv), patch.object(functional, "server") as start, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            functional.main()
+        self.assertEqual(error.exception.code, 2)
+        start.assert_not_called()
+
+    def test_image_inputs_cover_real_formats_and_require_the_correct_color(self):
+        def image(color):
+            return {"image_url": {"url": "data:image/png;base64,AQID"}}
+        cases = dict(image_cases(image))
+        self.assertEqual(len(cases), 7)
+        jpeg = base64.b64decode(cases["jpeg"].split(",", 1)[1], validate=True)
+        self.assertEqual(len(jpeg), 384)
+        self.assertTrue(jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9"))
+        for name in ("webp_lossless", "webp_lossy"):
+            data = base64.b64decode(cases[name].split(",", 1)[1], validate=True)
+            self.assertEqual(data[:4], b"RIFF")
+            self.assertEqual(int.from_bytes(data[4:8], "little"), len(data) - 8)
+            self.assertEqual(data[8:12], b"WEBP")
+        self.assertEqual(len(invalid_image_cases(image)), 5)
+        result = {"text": "red", "reasoning": "", "finish": "stop", "usage": {
+            "prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 0},
+            "gufo": {"prefill_tokens": 100}}}
+        assert_color(result, "red")
+        for change in ({"text": "blue"}, {"text": "not red"}, {"reasoning": "leaked"},
+                       {"finish": "length"}, {"usage": {**result["usage"],
+                        "prompt_tokens_details": {"cached_tokens": 100}}}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_color({**result, **change}, "red")
+
+    def test_tool_reasoning_requires_the_bug_trigger_and_exact_edit(self):
+        result = {"text": "", "reasoning": "Quoted <tool_call> is file data.",
+                  "finish": "tool_calls", "tools": [{"function": {
+                      "name": "edit", "arguments": json.dumps(ARGUMENTS)}}]}
+        assert_edit(result)
+        for change in ({"reasoning": "No quoted tag."}, {"text": "leaked reasoning"},
+                       {"tools": []}, {"finish": "length"},
+                       {"tools": [{"function": {"name": "edit", "arguments": "{}"}}]}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_edit({**result, **change})
+
+    def test_discovery_requires_an_explicit_expectation_before_starting_a_server(self):
+        for suite in ("discovery", "all"):
+            argv = ["run.py", "--output", "/unused", "--sampling-preset", "qwen38",
+                    "--suite", suite, "--record-baseline", "--", "gufo", "serve", "llm"]
+            with self.subTest(suite=suite), patch.object(sys, "argv", argv), \
+                    patch.object(functional, "server") as start, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                functional.main()
+            self.assertEqual(error.exception.code, 2)
+            start.assert_not_called()
+
+    def test_discovery_requires_expected_capabilities_and_model_metadata(self):
+        entry = {"id": "test", "object": "model", "created": 1, "owned_by": "gufo",
+                 "context_length": 8192, "architecture": {"input_modalities": ["text"]}}
+        listing = {"object": "list", "data": [entry]}
+        assert_model_listing(listing, "test", 8192, ["text"])
+        image = {**entry, "architecture": {"input_modalities": ["text", "image"]}}
+        assert_model_listing({**listing, "data": [image]}, "test", 8192, ["text", "image"])
+        for invalid in (
+            {**listing, "data": []}, {**listing, "data": [entry, entry]},
+            {**listing, "data": [{k: v for k, v in entry.items() if k != "architecture"}]},
+            *({**listing, "data": [{**entry, **change}]} for change in (
+                {"id": "wrong"}, {"context_length": 4096}, {"owned_by": "wrong"},
+                {"created": True}, {"architecture": {"input_modalities": ["image"]}},
+                {"architecture": {"input_modalities": ["text", "image"]}})),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises((AssertionError, KeyError)):
+                assert_model_listing(invalid, "test", 8192, ["text"])
+
+    def test_discovery_fingerprints_ignore_only_creation_time(self):
+        def measurement(value, endpoint="/v1/models"):
+            parts = [(1, json.dumps(value).encode())]
+            return summarize(parts, False, True, (endpoint, {}, 200))
+        listing = {"object": "list", "data": [{"id": "test", "created": 1,
+                   "context_length": 8192, "architecture": {"input_modalities": ["text"]}}]}
+        _, first = measurement(listing)
+        entry = listing["data"][0]
+        self.assertEqual(first, measurement({**listing, "data": [{**entry, "created": 2}]})[1])
+        for change in ({"id": "other"}, {"context_length": 4096},
+                       {"architecture": {"input_modalities": ["text", "image"]}}):
+            self.assertNotEqual(first, measurement({**listing, "data": [{**entry, **change}]})[1])
+        self.assertNotEqual(measurement({"status": "ok"}, "/health")[1],
+                            measurement({"status": "broken"}, "/health")[1])
+
+    def test_discovery_timings_do_not_require_generation_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "discovery.requests.json").write_text(json.dumps({"requests": [{
+                "index": 0, "endpoint": "/v1/models", "request_id": "r1",
+                "output_sha256": "models", "metrics": {}}]}))
+            (root / "server.log").write_text(
+                "[http] request=r1 event=completed duration_ms=0.2\n")
+            join_server_timings(root)
+            row = json.loads((root / "discovery.requests.json").read_text())["requests"][0]
+            self.assertEqual(row["metrics"], {"server_duration_ms": .2})
+            (root / "server.log").write_text("")
+            with self.assertRaisesRegex(ValueError, "no completed"):
+                join_server_timings(root)
+            for endpoint in ("/health", "/v1/health", "/ready", "/v1/ready"):
+                (root / "discovery.requests.json").write_text(json.dumps({"requests": [{
+                    "index": 0, "endpoint": endpoint, "request_id": "r1",
+                    "output_sha256": "probe", "wall_ms": 1, "metrics": {}}]}))
+                join_server_timings(root)
+
     def test_prompt_progress_contract_and_output_order(self):
         def event(processed, elapsed=0):
             return {"prompt_progress": {"total": 10, "cache": 2,
@@ -222,7 +382,8 @@ class FunctionalRunnerTest(unittest.TestCase):
             root = Path(directory)
             path = root / "responses.requests.json"
             path.write_text(json.dumps({"version": 1, "requests": [{
-                "index": 0, "request_id": "r7", "metrics": {}, "output_sha256": "output"}]}))
+                "index": 0, "endpoint": "/v1/responses", "request_id": "r7",
+                "metrics": {}, "output_sha256": "output"}]}))
             (root / "server.log").write_text(
                 "[INFO] request=r7 event=completed duration_ms=12 queue_ms=1 ttft_ms=3\n")
             join_server_timings(root)
@@ -586,6 +747,26 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
                 with functional.server(command, Path(directory) / "ready.log", 5) as process:
                     raise RuntimeError("synthetic failure")
             self.assertIsNotNone(process.returncode)
+
+
+class PiWatchdogTest(unittest.TestCase):
+    def test_repeated_command_can_make_progress(self):
+        from pi_agent import repeated_actions
+
+        def history(outputs):
+            result = []
+            for index, output in enumerate(outputs):
+                result += [
+                    {"role": "assistant", "content": [{
+                        "type": "toolCall", "id": str(index), "name": "bash",
+                        "arguments": {"command": "node test.js"}}]},
+                    {"role": "toolResult", "toolCallId": str(index),
+                     "content": [{"type": "text", "text": output}]}]
+            return result
+
+        self.assertEqual(repeated_actions(history(["same error"] * 6)), 6)
+        self.assertEqual(repeated_actions(history([
+            "missing module", "case 1 fails", "case 2 fails", "ok"])), 1)
 
 
 if __name__ == "__main__":

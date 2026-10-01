@@ -522,6 +522,8 @@ request limits, cancellation, cache accounting and completion state.
 `text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, and the shared
 sampling controls. Message content supports
 `input_text` and `input_image` with an `image_url` (HTTPS or a data URL).
+Image uploads accept PNG, JPEG and WebP. Base64 data URLs also accept
+`image/jpg`, mixed-case media types/`base64`, and parameters such as `name=`.
 Clients supply the complete conversation, including prior Gufo `output` items
 when retaining reasoning. Replay `function_call` items with their `call_id`,
 then supply `function_call_output` items using the same ID. Function tools use
@@ -608,11 +610,12 @@ ordinary continuation.
   which frame a rendered call; dotted and namespaced names such as
   `github.create_issue` are accepted. OpenAI itself documents a narrower set
   for this field, so a name outside `[A-Za-z0-9_-]` is portable to gufo but not
-  to every OpenAI-compatible service. The same name rule applies to an
-  assistant `tool_calls` entry that replays a call. Unsupported tool types,
-  malformed entries, unrenderable declared names and non-object parameters
-  return 400 `invalid_tools` before generation; because messages parse first,
-  an unrenderable name in a replayed call returns 400 `invalid_messages`.
+  to every OpenAI-compatible service. Historical names in assistant
+  `tool_calls` and Responses `function_call` items are preserved verbatim,
+  including Unicode and names absent from the current tools. This does not
+  authorize new calls to them. History still requires a non-empty string name and
+  JSON-object arguments; embedded NUL names are unsupported. Malformed history
+  and invalid declarations return 400 before generation.
 - shared top-k, min-p, repeat, frequency and presence sampling controls
 
 Streaming objects use `chat.completion.chunk` and end with the compatibility
@@ -653,13 +656,22 @@ omitted controls keep their model/CLI defaults.
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
 call starts, decoding constrains its name and argument format. Non-strict tools
-keep optional arguments optional. Untyped arguments retain native best-effort
-semantics; schemas that cannot use native tags fall back to JSON.
-`tool_choice: "required"` constrains decoding to a declared call,
-so the requirement is forced rather than checked afterwards. Where the backend
-cannot constrain sampling, an unmet `required` choice still returns
+keep optional arguments optional. Open nested objects retain native syntax and
+declared requirements/types, including nested fields; unsupported schema
+keywords remain guidance. Unsupported property-admitting rules, including
+conditional branches, leave those objects open without discarding declared
+requirements. Qwen wildcard fields and ambiguous string/null unions use JSON
+to preserve types. Constrained JSON keys follow schema order, with additional
+keys last. Impossible non-strict schemas fall back to JSON-object arguments;
+impossible strict schemas are rejected before generation.
+`tool_choice: "required"` and named choices constrain decoding to a declared
+call. Extended schemas retain compact JSON on this path, avoiding extra
+native framing tokens; ordinary native calls keep their existing format. Where
+the backend cannot constrain sampling, an unmet `required` choice still returns
 `tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
 Stops and token limits terminate normally without emitting incomplete calls.
+With no tools or `tool_choice:"none"`, tool markers are ordinary text and do
+not interrupt reasoning or delay streaming.
 
 Stop sequences match accepted output bytes, including reasoning and tool
 markup, before streaming or response parsing. Partial prefixes are buffered;
@@ -690,6 +702,13 @@ The official SDK supports typed parsing and streaming through
 Constraints apply before target sampling in AR, DFlash2, MTP and DSpark, including
 streaming, images and concurrent requests. Reasoning stays separate from JSON
 and counts toward the output budget. Changing the schema changes the cache prefix.
+
+For constrained tool or JSON output, only `</think>` ends the initial reasoning
+phase. Literal tool markers such as `<tool_call>` quoted during reasoning remain
+reasoning data; they do not start a call or move reasoning into visible content.
+This boundary is identical for buffered responses and SSE deltas in Chat
+Completions and Responses. Tool parsing starts after the reasoning delimiter,
+and markers inside tool argument strings remain argument data.
 
 Parse the returned content: leading whitespace is valid JSON, and stops or token
 limits can leave it incomplete. `finish_reason: "stop"` includes matched stop
@@ -733,9 +752,12 @@ Verify with `tests/functional/openai_sdk.py --suite tools`,
 
 `GET /v1/models` lists the configured text model and ready audio/video
 services. Entries provide `id`, `object`, `created` and `owned_by`; the text
-entry also provides `context_length`, while audio/video entries describe their
-capability. Send the returned model ID in requests. Text requests naming another
-model return 404.
+entry also provides `context_length` and `architecture.input_modalities`: `["text"]`
+for text-only serving or `["text", "image"]` when a vision encoder is loaded.
+Image support reflects the loaded projector, not the model name; launching a
+vision-capable model without its projector advertises text only. Audio/video
+entries describe their capability. Send the returned model ID in requests.
+Text requests naming another model return 404.
 
 ## Errors
 

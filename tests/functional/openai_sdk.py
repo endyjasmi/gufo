@@ -24,6 +24,12 @@ import openai
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 from openai.types import Completion, CompletionChoice
 from metrics import CaseComplete, Recorder
+from tool_reasoning import check_tool_reasoning, response_result
+from discovery import check_discovery
+from image_inputs import check_image_inputs
+from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
+                        check_untyped_agent_tools, check_mixed_tool_schemas,
+                        check_tool_schema_edges)
 
 
 class CompletionStreamChoice(CompletionChoice):
@@ -950,7 +956,7 @@ def check_long_context(client, model, checks, context, vision=False):
     assert repeated.output_text == response.output_text, repeated
     checks["long_responses_sampled_replay"] = repeated.to_dict()
 
-    messages += [{"role": "assistant", "content": first["text"]},
+    messages = [*messages, {"role": "assistant", "content": first["text"]},
                  {"role": "user", "content": "Give the same keyword again as JSON."},
                  {"role": "assistant", "content": response.output_text},
                  {"role": "user", "content": "Explain how to calculate 123 times 456."}]
@@ -1997,9 +2003,6 @@ def check_events(events, reasoning):
 
 
 def check_responses(client, model, checks, options, async_local_only, expect_reasoning):
-    models = client.models.list()
-    assert model in {item.id for item in models.data}, models
-    checks["model_discovery"] = {"models": [item.id for item in models.data]}
     prompt = "What is two plus two? Reply briefly."
     request = dict(model=model, input=prompt, temperature=0, max_output_tokens=256,
                    reasoning={"effort": "low" if expect_reasoning else "none"}, store=False)
@@ -2326,13 +2329,16 @@ def check_server_metrics(client, model, checks, width):
     completed("metrics_after_cancel_cached", lambda: chat_result(client, common))
 
 
-SDK_SUITES = ("responses", "stops", "conversation", "structured", "structured-limits",
-              "tools", "auto-tools", "tool-edges", "sampling-defaults", "sampling-ranges", "batch",
+SDK_SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "structured", "structured-limits",
+              "tool-reasoning",
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
               "long-context", "state-edges", "progress", "metrics")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--expected-input-modalities", choices=("text", "text,image"),
+                        help="Expected loaded inputs for the discovery suite")
     parser.add_argument("--base-url", required=True, help="http://127.0.0.1:PORT/v1")
     parser.add_argument("--model", required=True, help="Gufo served model name")
     parser.add_argument("--expect-reasoning", action="store_true")
@@ -2357,6 +2363,10 @@ def main():
     parser.add_argument("--speculative", choices=("off", "mtp", "dflash2", "dspark"),
                         default="off", help="Server mode; determines sampled replay guarantees")
     args = parser.parse_args()
+    if args.suite in ("discovery", "all") and args.expected_input_modalities is None:
+        parser.error("discovery requires --expected-input-modalities text or text,image")
+    if args.suite == "image-inputs" and not args.vision:
+        parser.error("image-inputs requires --vision and a loaded projector")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
         parser.error("--sampling-preset is required for all/sampling-defaults")
     if not isinstance(args.sampling_overrides, dict):
@@ -2383,6 +2393,7 @@ def main():
               "sampling_preset": args.sampling_preset,
               "sampling_overrides": args.sampling_overrides, "suites": {},
               "through_case": args.through_case, "status": "running"}
+    report["expected_input_modalities"] = args.expected_input_modalities
     recorder = Recorder(args.output.with_suffix(".requests.json") if args.output else None,
                         args.through_case)
     checks = CheckResults(report, args.output, recorder)
@@ -2393,15 +2404,32 @@ def main():
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
+            "discovery": lambda: check_discovery(
+                client, args.model, checks, args.context,
+                args.expected_input_modalities.split(",")),
             "responses": lambda: check_responses(client, args.model, checks, options,
                                                    async_local_only, args.expect_reasoning),
             "stops": lambda: check_stops(client, args.model, checks),
             "conversation": lambda: check_conversations(client, args.model, checks, args.vision),
+            "image-inputs": lambda: check_image_inputs(
+                client, args.model, checks, image_content, chat_result, response_result),
             "structured": lambda: check_structured_outputs(client, args.model, checks, args.vision),
             "structured-limits": lambda: check_structured_limits(client, args.model, checks, args.vision),
             "native-tools": lambda: check_native_tools(client, args.model, checks, args.vision),
             "auto-tools": lambda: check_auto_tools(client, args.model, checks, args.vision),
             "tool-edges": lambda: check_tool_edges(client, args.model, checks),
+            "tool-reasoning": lambda: check_tool_reasoning(client, args.model, checks, chat_result),
+            "tool-agent": lambda: check_tool_agent(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),
+            "tool-history": lambda: check_tool_history(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-untyped": lambda: check_untyped_agent_tools(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-mixed": lambda: check_mixed_tool_schemas(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-schema-edges": lambda: check_tool_schema_edges(
+                client, args.model, checks, chat_result, args.vision, image_content),
             "state-edges": lambda: check_state_edges(
                 client, args.model, checks, args.speculative, args.vision),
             "sampling-defaults": lambda: check_sampling_defaults(
@@ -2417,7 +2445,8 @@ def main():
                 args.allow_missing_progress),
             "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency),
         }
-        selected = (list(suites) if args.suite == "all" else
+        selected = ([name for name in suites if name != "image-inputs" or args.vision]
+                    if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])
         for name in selected:
             started = time.monotonic()

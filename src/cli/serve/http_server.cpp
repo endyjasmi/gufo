@@ -495,7 +495,8 @@ bool ReadTextContent(const json::Value* content, std::string* out) {
 
 bool ReadTextMessages(const json::Value* input,
                       std::vector<tokenization::ChatMessage>* messages,
-                      bool responses = false) {
+                      bool responses = false,
+                      std::string* parse_error = nullptr) {
   core::ImageReadBudget image_budget;
   if (input == nullptr || !input->is_array() || input->empty())
     return false;
@@ -504,8 +505,11 @@ bool ReadTextMessages(const json::Value* input,
                       item.member_str("type") == "function_call_output")) {
       tokenization::ChatMessage message;
       std::string error;
-      if (!ParseOpenAiResponseMessage(item, &message, image_budget, &error))
+      if (!ParseOpenAiResponseMessage(item, &message, image_budget, &error)) {
+        if (parse_error && !error.empty())
+          *parse_error = std::move(error);
         return false;
+      }
       if (message.role == tokenization::ChatRole::kAssistant &&
           !messages->empty() &&
           messages->back().role == tokenization::ChatRole::kAssistant) {
@@ -548,8 +552,11 @@ bool ReadTextMessages(const json::Value* input,
     message.role = RoleFrom(role);
     if (responses) {
       std::string error;
-      if (!ParseOpenAiResponseMessage(item, &message, image_budget, &error))
+      if (!ParseOpenAiResponseMessage(item, &message, image_budget, &error)) {
+        if (parse_error && !error.empty())
+          *parse_error = std::move(error);
         return false;
+      }
     } else if (!ReadTextContent(item.find("content"), &message.content))
       return false;
     if (responses && message.role == tokenization::ChatRole::kAssistant &&
@@ -687,6 +694,13 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     if (backend->max_context() > 0)
       model["context_length"] =
           static_cast<std::size_t>(backend->max_context());
+    json::Value input_modalities = json::Value::array();
+    input_modalities.push_back("text");
+    if (backend->supports_images())
+      input_modalities.push_back("image");
+    json::Value architecture = json::Value::object();
+    architecture["input_modalities"] = std::move(input_modalities);
+    model["architecture"] = std::move(architecture);
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
@@ -985,12 +999,13 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
         {tokenization::ChatRole::kSystem, instructions->str(), "", ""});
   }
   const auto* input = body.find("input");
+  std::string input_error =
+      "'input' must contain text, message items with text/images, reasoning "
+      "items, function calls or function outputs";
   if (input != nullptr && input->is_string() && !input->str().empty()) {
     messages.push_back({tokenization::ChatRole::kUser, input->str(), "", ""});
-  } else if (!ReadTextMessages(input, &messages, true)) {
-    return InvalidCompatibilityRequest(
-        "'input' must contain text, message items with text/images, reasoning "
-        "items, function calls or function outputs");
+  } else if (!ReadTextMessages(input, &messages, true, &input_error)) {
+    return InvalidCompatibilityRequest(input_error);
   }
 
   chat.messages = std::move(messages);
