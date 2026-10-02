@@ -1389,6 +1389,23 @@ void TestSnapshotCacheCapacityIsReportedAtStartup() {
   }
 }
 
+void TestRetainedSnapshotCapacityOverride() {
+  auto stats = std::make_shared<FakeStats>();
+  {
+    // Without an override the runner's claimed budget governs the cache.
+    TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+    Expect(pool.snapshot_capacity_bytes() == 256,
+           "pool keeps the runner's claimed snapshot budget");
+  }
+  {
+    // The override replaces the claimed budget wherever it is observed.
+    TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1,
+                        std::nullopt, std::size_t{1024});
+    Expect(pool.snapshot_capacity_bytes() == 1024,
+           "override replaces the runner's claimed snapshot budget");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1431,6 +1448,7 @@ int main() {
       "evicting a retained prefix for entry capacity is reported");
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
+  TestRetainedSnapshotCapacityOverride();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestMeasuredStateIsReconciledWithClaim();

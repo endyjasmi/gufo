@@ -226,6 +226,27 @@ bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
   return !config.directory.empty();
 }
 
+std::optional<std::size_t> RetainedSnapshotOverrideBytes(
+    const TextDiskCacheConfig& config) noexcept {
+  if (config.retained_snapshot_capacity_bytes == 0) {
+    return std::nullopt;
+  }
+  return config.retained_snapshot_capacity_bytes;
+}
+
+/// With an explicit RAM budget, the disk store's automatic staging — which
+/// otherwise samples free RAM — derives from that budget instead.
+std::size_t DerivedDiskStagingBytes(
+    const TextDiskCacheConfig& config) noexcept {
+  if (config.staging_capacity_bytes != 0 ||
+      config.retained_snapshot_capacity_bytes == 0) {
+    return config.staging_capacity_bytes;
+  }
+  return std::min({config.capacity_bytes,
+                   TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes,
+                   config.retained_snapshot_capacity_bytes / 4});
+}
+
 bool IsSha256Hex(std::string_view value) noexcept {
   return value.size() == 64 && std::ranges::all_of(value, [](char character) {
            return (character >= '0' && character <= '9') ||
@@ -3979,13 +4000,14 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .staging_capacity_bytes = DerivedDiskStagingBytes(disk_cache_config),
       };
     }
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        RetainedSnapshotOverrideBytes(disk_cache_config));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4066,11 +4088,12 @@ bool InferenceBackend::load(
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .staging_capacity_bytes = DerivedDiskStagingBytes(disk_cache_config),
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        RetainedSnapshotOverrideBytes(disk_cache_config));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4150,11 +4173,12 @@ bool InferenceBackend::load(
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .staging_capacity_bytes = DerivedDiskStagingBytes(disk_cache_config),
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        RetainedSnapshotOverrideBytes(disk_cache_config));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4241,11 +4265,12 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .staging_capacity_bytes = DerivedDiskStagingBytes(disk_cache_config),
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        RetainedSnapshotOverrideBytes(disk_cache_config));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

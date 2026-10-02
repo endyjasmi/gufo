@@ -424,7 +424,9 @@ public:
 
   TextRunnerPool(
       std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt);
+      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt,
+      std::optional<std::size_t> retained_snapshot_capacity_bytes =
+          std::nullopt);
   ~TextRunnerPool();
 
   TextRunnerPool(const TextRunnerPool&) = delete;
@@ -434,6 +436,8 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// Effective RAM budget of the retained continuation snapshot cache.
+  [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(

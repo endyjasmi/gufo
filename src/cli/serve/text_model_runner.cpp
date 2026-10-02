@@ -31,6 +31,7 @@ struct ValidatedRunner {
   std::shared_ptr<TextModelRunner> runner;
   TextRunnerDescriptor descriptor;
   TextRunnerResourceClaim resources;
+  std::optional<std::size_t> retained_snapshot_capacity_bytes;
   std::vector<TextExecutionPlan> plans;
 };
 
@@ -49,8 +50,9 @@ std::optional<std::size_t> PerStateReservationBytes(
          *resources.temporary_scratch_bytes;
 }
 
-ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
-                               std::size_t state_count) {
+ValidatedRunner ValidateRunner(
+    std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
+    std::optional<std::size_t> retained_snapshot_capacity_bytes) {
   if (runner == nullptr) {
     throw std::invalid_argument("text model runner must not be null");
   }
@@ -89,6 +91,10 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
   }
 
   auto resources = runner->ResourceClaim();
+  if (retained_snapshot_capacity_bytes.has_value()) {
+    resources.retained_snapshot_capacity_bytes =
+        retained_snapshot_capacity_bytes;
+  }
   const auto per_state_reservation = PerStateReservationBytes(resources);
   if (resources.state_capacity_bytes.has_value() &&
       per_state_reservation.has_value()) {
@@ -138,6 +144,7 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
       .runner = std::move(runner),
       .descriptor = std::move(descriptor),
       .resources = resources,
+      .retained_snapshot_capacity_bytes = retained_snapshot_capacity_bytes,
       .plans = std::move(plans),
   };
 }
@@ -325,7 +332,11 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
           },
       .capacity_bytes =
           [validated] {
-            const auto resources = validated->runner->ResourceClaim();
+            auto resources = validated->runner->ResourceClaim();
+            if (validated->retained_snapshot_capacity_bytes.has_value()) {
+              resources.retained_snapshot_capacity_bytes =
+                  validated->retained_snapshot_capacity_bytes;
+            }
             return resources.retained_snapshot_capacity_bytes.value_or(0);
           },
       .on_event = EmitSnapshotEvent,
@@ -419,8 +430,10 @@ void TextModelRunner::RestorePersistentSnapshot(
 
 struct TextRunnerPool::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count,
-       std::optional<TextRunnerDiskCacheOptions> disk_cache_options)
-      : validated(ValidateRunner(std::move(model_runner), state_count)),
+       std::optional<TextRunnerDiskCacheOptions> disk_cache_options,
+       std::optional<std::size_t> retained_snapshot_capacity_bytes)
+      : validated(ValidateRunner(std::move(model_runner), state_count,
+                                 retained_snapshot_capacity_bytes)),
         cache(
             state_count,
             [this] {
@@ -1173,9 +1186,11 @@ void TextRunnerPool::Request::Invalidate() noexcept {
 
 TextRunnerPool::TextRunnerPool(
     std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-    std::optional<TextRunnerDiskCacheOptions> disk_cache)
+    std::optional<TextRunnerDiskCacheOptions> disk_cache,
+    std::optional<std::size_t> retained_snapshot_capacity_bytes)
     : impl_(std::make_unique<Impl>(std::move(runner), state_count,
-                                   std::move(disk_cache))) {}
+                                   std::move(disk_cache),
+                                   retained_snapshot_capacity_bytes)) {}
 
 TextRunnerPool::~TextRunnerPool() = default;
 
@@ -1185,6 +1200,10 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->cache.capacity();
+}
+
+std::size_t TextRunnerPool::snapshot_capacity_bytes() const noexcept {
+  return impl_->cache.snapshot_capacity_bytes();
 }
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
