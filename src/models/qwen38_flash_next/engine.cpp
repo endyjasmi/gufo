@@ -1139,7 +1139,16 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     }
     if (heads.empty())
       break;
-    if (!exec.MtpHeads(heads, error_msg))
+    // An all-greedy round with at least two more proposal rounds keeps each
+    // session's top-512 so those rounds rank gathered Q4_0 rows instead of
+    // the full vocabulary head. Sampled sessions keep the exact full head
+    // for p/q verification.
+    const bool seed_shortlist =
+        batch_drafts.has_value() && *batch_drafts >= 2 &&
+        std::ranges::all_of(heads, [](const auto& item) {
+          return item.output.candidates == nullptr;
+        });
+    if (!exec.MtpHeads(heads, error_msg, seed_shortlist))
       return false;
     for (std::size_t i = 0; i < requests.size(); ++i) {
       auto& p = pending[i];

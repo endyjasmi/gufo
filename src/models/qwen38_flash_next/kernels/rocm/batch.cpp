@@ -2,6 +2,7 @@
 #include <array>
 #include <stdexcept>
 
+#include "qfn_ggml_stubs.h"
 #include "qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -9,9 +10,6 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
-
-constexpr std::uint32_t kBatchSessions = 8;
-constexpr std::uint32_t kDecodeRows = 8;
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {
@@ -202,6 +200,14 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     rows += n;
     final_rows[i] = rows - 1;
   }
+  // A catch-up starts a cycle: any shortlist a previous cycle seeded ranks a
+  // distribution this cycle has not computed yet.
+  for (const auto& item : items) {
+    if (item.hidden_row >= 0) {
+      batch_shortlist_count_ = 0;
+      break;
+    }
+  }
   if (rows > options_.max_batch)
     return Fail(error, "MTP body batch exceeds executor capacity");
   if (!AnyActive(items))
@@ -384,8 +390,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   return true;
 }
 
-bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
-                        std::string* error) const {
+bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
+                        bool seed_shortlist) const {
   selected_logits_ = nullptr;
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions ||
       items.size() > options_.max_batch) {
@@ -407,6 +413,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     }
   }
   const auto& output = model_->output();
+  const auto& draft_output = model_->output_draft();
   const auto& head = model_->mtp().nextn_head;
   if (!AnyActive(items))
     return true;
@@ -439,11 +446,41 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   }
   const auto n = static_cast<std::uint32_t>(items.size());
   const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
+  // Greedy proposals only rank candidates the target verifies exactly, so an
+  // all-greedy round can score the exact Q4_0 copy of the head — the full
+  // rows when nothing is seeded, or each session's gathered top-512 from the
+  // round that seeded this cycle. Sampled sessions need the full Q8 head for
+  // exact p/q verification, so any candidate request keeps the dense path.
+  const bool shortlist_ok = s_.mtp_short_row_bytes != 0 &&
+                            !draft_output.empty() &&
+                            n <= options_.max_logit_rows;
+  bool all_greedy = true;
+  for (const auto& item : items)
+    all_greedy = all_greedy && item.output.candidates == nullptr;
+  std::array<std::uint32_t, kBatchSessions> slots{};
+  bool use_shortlist =
+      shortlist_ok && all_greedy && batch_shortlist_count_ != 0;
+  if (use_shortlist) {
+    for (std::size_t i = 0; i < n && use_shortlist; ++i) {
+      use_shortlist = false;
+      for (std::uint32_t j = 0; j < batch_shortlist_count_; ++j) {
+        if (batch_shortlist_slots_[j] == items[i].session) {
+          slots[i] = j;
+          use_shortlist = true;
+          break;
+        }
+      }
+    }
+  }
+  // A cycle's first all-greedy round seeds; later rounds of the same cycle
+  // consume. The caller only asks when another round will follow.
+  const bool seed = seed_shortlist && shortlist_ok && all_greedy &&
+                    !use_shortlist && batch_shortlist_count_ == 0;
   const Scratch base = s_;
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
-    for (std::uint32_t i = 0; i < n; ++i) {
+    for (std::size_t i = 0; i < n; ++i) {
       RmsNormRows(items[i].session->mtp_.h, head.norm.f32(),
                   base.xn + std::size_t{i} * config().HcDim(), 1,
                   config().HcDim(), config().hc_count, config().rms_eps,
@@ -454,14 +491,65 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       return false;
     if (!AnyActive(items))
       return true;
-    if (!DenseBatch(output, base.mixed, batch_logits_, n, error))
+    if (use_shortlist) {
+      // One Q4_0 GEMV over every session's gathered rows: token t reads the
+      // expert (shortlist slice) its session was seeded into.
+      for (std::size_t i = 0; i < n; ++i)
+        batch_short_ids_host_[i] = static_cast<std::int32_t>(slots[i]);
+      if (!Check(hipMemcpyAsync(s_.mtp_batch_ids, batch_short_ids_host_,
+                                n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                                stream_),
+                 error)) {
+        return false;
+      }
+      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, s_.mtp_short_w, base.mixed,
+                          s_.mtp_batch_ids, batch_logits_, kMtpDraftShortlist,
+                          output.cols, n, batch_shortlist_count_, 1, stream_,
+                          nullptr, nullptr) != 0) {
+        return Fail(error, "batched shortlist head GEMV failed");
+      }
+    } else if (all_greedy && shortlist_ok) {
+      // The exact Q4_0 copy of the head halves the dense round's read; its
+      // logits only rank proposals.
+      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, base.mixed,
+                          s_.mtp_zero_ids, batch_logits_, output.rows,
+                          output.cols, n, 1, 1, stream_, nullptr,
+                          nullptr) != 0) {
+        return Fail(error, "batched Q4_0 head GEMV failed");
+      }
+    } else if (!DenseBatch(output, base.mixed, batch_logits_, n, error)) {
       return false;
+    }
+    if (seed) {
+      // Keep each session's exact top-512 of this round's distribution and
+      // the matching gathered head rows. Selection and gather are pure
+      // device operations, so the shortlist is ready for the next round.
+      const auto workspace =
+          MtpDraftShortlistWorkspaceSize(config().vocab_size);
+      const auto vocab = config().vocab_size;
+      for (std::size_t i = 0; i < n; ++i) {
+        const float* row = batch_logits_ + std::size_t{i} * output.rows;
+        auto* ids = s_.mtp_short_ids + std::size_t{i} * workspace;
+        MtpDraftShortlist(
+            row, ids, s_.mtp_short_scratch + std::size_t{i} * workspace,
+            s_.mtp_short_scores + std::size_t{i} * kMtpDraftShortlist, vocab,
+            stream_);
+        GatherDraftHeadRows(
+            draft_output.data, ids,
+            static_cast<std::uint8_t*>(s_.mtp_short_w) +
+                std::size_t{i} * kMtpDraftShortlist * s_.mtp_short_row_bytes,
+            s_.mtp_short_row_bytes, kMtpDraftShortlist, stream_);
+        batch_shortlist_slots_[i] = items[i].session;
+      }
+      batch_shortlist_count_ = static_cast<std::uint32_t>(n);
+    }
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
         continue;
       if (items[i].output.candidates == nullptr) {
-        Argmax(batch_logits_ + std::size_t(i) * output.rows, s_.mtp_argmax,
-               s_.mtp_token, 1, output.rows, stream_);
+        const auto rows = use_shortlist ? kMtpDraftShortlist : output.rows;
+        Argmax(batch_logits_ + std::size_t{i} * rows, s_.mtp_argmax,
+               s_.mtp_token, 1, rows, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
                                   s_.mtp_token, sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
@@ -469,7 +557,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           return false;
         continue;
       }
-      MtpTopCandidates(batch_logits_ + std::size_t(i) * output.rows, s_.mtp_ids,
+      MtpTopCandidates(batch_logits_ + std::size_t{i} * output.rows, s_.mtp_ids,
                        s_.mtp_scratch_ids, s_.mtp_scores, output.rows, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +

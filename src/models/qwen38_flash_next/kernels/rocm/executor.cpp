@@ -277,6 +277,7 @@ Executor::~Executor() {
         static_cast<void*>(mtp_candidates_host_),
         static_cast<void*>(mtp_chain_host_),
         static_cast<void*>(mtp_predictions_host_),
+        static_cast<void*>(batch_short_ids_host_),
         static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
       (void)hipHostFree(p);
@@ -506,13 +507,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
             ? short_row_bytes
             : 0U;
     if (s.mtp_short_row_bytes != 0) {
+      // One shortlist per session slot: the pinned chain uses slot 0; batched
+      // all-greedy head rounds seed and gather one slice per session.
       const auto short_ids = MtpDraftShortlistWorkspaceSize(c.vocab_size);
-      s.mtp_short_ids = Alloc<std::uint32_t>(a, short_ids, error_msg);
-      s.mtp_short_scratch = Alloc<std::uint32_t>(a, short_ids, error_msg);
-      s.mtp_short_scores = Alloc<float>(a, kMtpDraftShortlist, error_msg);
-      s.mtp_short_w = Alloc<std::uint8_t>(
-          a, std::size_t{kMtpDraftShortlist} * s.mtp_short_row_bytes,
-          error_msg);
+      s.mtp_short_ids = Alloc<std::uint32_t>(
+          a, std::size_t{kBatchSessions} * short_ids, error_msg);
+      s.mtp_short_scratch = Alloc<std::uint32_t>(
+          a, std::size_t{kBatchSessions} * short_ids, error_msg);
+      s.mtp_short_scores = Alloc<float>(
+          a, std::size_t{kBatchSessions} * kMtpDraftShortlist, error_msg);
+      s.mtp_short_w =
+          Alloc<std::uint8_t>(a,
+                              std::size_t{kBatchSessions} * kMtpDraftShortlist *
+                                  s.mtp_short_row_bytes,
+                              error_msg);
+      s.mtp_batch_ids = Alloc<std::int32_t>(a, kBatchSessions, error_msg);
     }
     if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
@@ -526,7 +535,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         !Check(hipHostMalloc(
                    &e->mtp_predictions_host_,
                    e->options_.max_speculative * sizeof(ArgmaxCandidate)),
-               "pinned greedy predictions", error_msg)) {
+               "pinned greedy predictions", error_msg) ||
+        !Check(hipHostMalloc(&e->batch_short_ids_host_,
+                             kBatchSessions * sizeof(std::int32_t)),
+               "pinned batch shortlist ids", error_msg)) {
       return nullptr;
     }
     std::construct_at(e->mtp_candidates_host_);

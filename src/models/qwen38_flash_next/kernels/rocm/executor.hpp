@@ -26,6 +26,12 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// Independent sessions one batched submission may pack (also the batched
+/// draft-head shortlist slot count), and the token rows one batched GEMV
+/// covers.
+inline constexpr std::uint32_t kBatchSessions = 8;
+inline constexpr std::uint32_t kDecodeRows = 8;
+
 class Executor;
 struct ArgmaxCandidate;
 struct SnapshotHeader;
@@ -232,8 +238,12 @@ public:
   [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
                                      std::string* error_msg) const;
   /// Projects each session's carried draft hidden state with shared weights.
+  /// With `seed_shortlist` the round keeps per-session exact top-512 lists of
+  /// its full head pass, so later all-greedy rounds of the same cycle rank
+  /// proposals over the gathered Q4_0 rows instead of the full vocabulary.
   [[nodiscard]] bool MtpHeads(std::span<const MtpHeadItem> items,
-                              std::string* error_msg) const;
+                              std::string* error_msg,
+                              bool seed_shortlist = false) const;
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::int32_t hidden_row, MtpOutput output,
@@ -542,6 +552,8 @@ private:
     /// Encoded row size of the Q4_0 draft head, or 0 when the loaded model
     /// cannot use the shortlist route (no Q4_0 head, ragged row bytes).
     std::uint32_t mtp_short_row_bytes{0};
+    /// Per-token expert slot of a batched shortlist head round.
+    std::int32_t* mtp_batch_ids;
   };
   mutable Scratch s_{};
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
@@ -562,6 +574,11 @@ private:
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
   mutable MtpCandidateLogits* batch_candidates_host_{nullptr};
+  /// Batched draft-head shortlist: the sessions each seeded slot belongs to
+  /// (count 0 = none), and pinned staging for the per-round expert ids.
+  mutable std::array<Session*, kBatchSessions> batch_shortlist_slots_{};
+  mutable std::uint32_t batch_shortlist_count_{0};
+  std::int32_t* batch_short_ids_host_{nullptr};
   // Mapped descriptors, one slice per layer: GPU reads cannot race the host
   // preparing the next layer. ForwardBatch drains before reusing this table.
   mutable GdnBatchItem* batch_gdn_host_{nullptr};

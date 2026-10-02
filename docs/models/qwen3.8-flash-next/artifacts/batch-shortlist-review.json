@@ -1,0 +1,38 @@
+{
+  "experiment": "batched greedy MTP heads over a per-session draft-head shortlist",
+  "change": "An all-greedy MtpHeads round scores proposals through the exact Q4_0 copy of the head: the cycle's first round over the full rows (it seeds each session's exact top-512 plus the gathered Q4_0 rows), later rounds of the same cycle over the gathered 512-row slices (one routed Q4_0 GEMV, token t reading its session's slice). Sampled sessions keep the full Q8 head for exact p/q verification; any candidate request keeps the dense path. A cycle's catch-up invalidates the seed so every cycle re-seeds from its own distribution.",
+  "machine": "AMD Radeon 8060S (gfx1151, 20 CUs), Windows port",
+  "models": {
+    "target": "unsloth Qwen3.8-Flash-Next UD-Q4_K_XL @ 38bb39ee",
+    "mtp": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+  },
+  "instrument": "qwen38_flash_next_gpu_probe --cost-audit 0 --depth 0 (median complete cycle of three warmed samples per width; catch-up/proposal/target phases timed separately; the proposal phase contains the head rounds this change modifies)",
+  "protocol": "Two interleaved baseline/candidate rounds; baseline = feature/window-native 756eaec built unmodified, candidate = this change. Widths 1-2 and C=1 act as controls (fewer than two head rounds: the shortlist never engages; round-1 rows are dense-path controls).",
+  "median_total_cycle_ms": {
+    "C2": { "w2": [58.58, 57.60], "w3": [71.29, 66.27], "w4": [86.77, 74.04], "w5": [100.77, 83.38], "w6": [112.25, 90.24], "w7": [124.89, 97.06], "w8": [133.25, 100.91] },
+    "C4": { "w2": [79.78, 78.12], "w4": [120.57, 111.42], "w8": [208.86, 169.79] },
+    "C8": { "w2": [117.35, 116.15], "w4": [194.20, 183.26], "w8": [353.04, 308.52] }
+  },
+  "delta_percent_total": {
+    "C2": { "w2": -1.7, "w3": -7.0, "w4": -14.7, "w5": -17.3, "w6": -19.6, "w7": -22.3, "w8": -24.3 },
+    "C4": { "w4": -7.6, "w8": -18.7 },
+    "C8": { "w4": -5.6, "w8": -12.6 }
+  },
+  "proposal_phase_ms": {
+    "C2_w8": [30.02, 30.46, 9.97, 9.90],
+    "C4_w8": [33.40, 33.29, 12.71, 12.70],
+    "C8_w8": [37.41, 38.34, 18.93, 18.75],
+    "note": "[baseline r1, baseline r2, candidate r1, candidate r2] - the changed phase drops 50-67%; round-1 rows also drop because the all-greedy dense round now reads the 311 MB Q4_0 head copy instead of the 683 MB Q8_0 head."
+  },
+  "quality": {
+    "c1_pinned_chain": "greedy outputs and token SHA traces byte-identical to baseline on three prompts (96 tokens each)",
+    "matched_shapes": "session_test batched-vs-serial frontier logits, tokens, RNG and acceptance exact at matched widths up to the pre-existing sampled-draw failure (fails identically on baseline); mixed_batch_exact passes",
+    "c2_free_running": "committed greedy text at C>=2 can flip near-ties when the batch-cycle alignment changes: the UNMODIFIED baseline produces different text for two identical requests staggered 2 s inside one run, so cross-build text differences at C>=2 are engine behavior, not this change",
+    "sampled_path": "unchanged: any candidate request keeps the exact full Q8 head",
+    "pre_existing": "--mtp-audit's exact Q8-head candidate comparison predates the Q4_0 draft head and fails identically on baseline; session prefill-chunk check fails identically on baseline"
+  },
+  "notes": [
+    "The batch policy learns costs at runtime, so serving widths adapt to the cheaper rounds automatically (no cost-table retune needed).",
+    "C2 target_ms also improved ~12% at w8 in both rounds; the audit phases share clock/L2 state, so treat the proposal delta as the mechanism and the total as the headline."
+  ]
+}

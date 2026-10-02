@@ -567,7 +567,10 @@ void AuditMtpCosts(q::rocm::Executor& exec,
             std::vector<q::rocm::Executor::MtpHeadItem> heads;
             for (unsigned i = 0; i < concurrency; ++i)
               heads.push_back({sessions[i].get(), {.token = &next[i]}});
-            Require(exec.MtpHeads(heads, &error), error);
+            // The production batch loop seeds the shortlist when at least
+            // two head rounds follow the catch-up (drafts >= 2): one round
+            // seeds, later rounds rank the gathered rows.
+            Require(exec.MtpHeads(heads, &error, width > 2), error);
             for (unsigned i = 0; i < concurrency; ++i)
               chains[i].push_back(next[i]);
           }

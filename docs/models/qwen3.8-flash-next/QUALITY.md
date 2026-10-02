@@ -19,6 +19,7 @@ September 27–28.
 | Serving | Cancellation, three-turn continuation, reasoning/tool history, concurrent image/text isolation and disk restart pass |
 | Sparse attention | Independent FP64 operator error ≤2.83e-7 (limit 1e-6). At 32K/128K, 256 fixed-token code/prose rows: mean KL 5.82e-4 and 256/256 top-1 agreement with an FP64-attention diagnostic. [Evidence](artifacts/attention-tiles-review.json). |
 | Shortlisted chained draft head | Chained greedy steps rank proposals over the catch-up top-512 instead of the full 248,320-row head. Greedy outputs and token SHA traces byte-identical on three prompts; canonical pp1778/tg128 acceptance unchanged; sampled top-64 path keeps the exact full head. [Evidence](artifacts/chain-shortlist-review.json). |
+| Batched greedy heads over per-session shortlists | All-greedy batched rounds rank proposals through the exact Q4_0 head copy (full rows seeding per-session top-512 lists, gathered rows after); sampled sessions keep the full Q8 head. C1 outputs byte-identical; batched-vs-serial logits/tokens/RNG/acceptance exact at matched widths; free-running C≥2 text may flip near-ties when batch alignment shifts (the unmodified engine does the same for staggered identical requests). [Evidence](artifacts/batch-shortlist-review.json). |
 
 The attention diagnostic retains the quantized weights and other native
 operators. Regrouping FP32 sums can change long-context text across builds;
