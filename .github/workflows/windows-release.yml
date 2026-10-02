@@ -159,7 +159,10 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content version.txt -Raw).Trim()
-          $name = "gufo-$version-windows-gfx1151"
+          # The short commit in the name makes each push's build distinct on
+          # the release page; the prune step below removes superseded assets.
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          $name = "gufo-$version-windows-gfx1151-$sha"
           $pkg = "$env:RUNNER_TEMP\$name"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           Copy-Item "$env:BUILD_DIR\gufo.exe" $pkg
@@ -183,6 +186,8 @@ jobs:
 
           - Gufo $version (commit $env:GITHUB_SHA)
           - Built with TheRock HIP SDK $env:SDK_VERSION
+
+          The asset name carries the short commit hash so builds are distinguishable; branch pushes refresh this rolling ``windows`` release, while ``windows-v*`` tags publish pinned snapshots.
 
           Unzip the archive and run ``gufo.exe`` from the extracted folder (``gufo-server.exe`` starts the OpenAI-compatible HTTP server). An AMD graphics driver with ROCm support is required; the build targets gfx1151 only. See BUILD-WINDOWS.md in the repository for build-from-source instructions.
           "@ | Out-File -FilePath "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
@@ -208,6 +213,25 @@ jobs:
           files: ${{ steps.package.outputs.zip }}
           body_path: ${{ runner.temp }}/release-notes.md
           make_latest: "true"
+
+      - name: Prune superseded assets from the rolling release
+        if: ${{ github.ref_type != 'tag' && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish == 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.package.outputs.name }}.zip
+        shell: pwsh
+        run: |
+          # Re-uploading overwrites the same-named asset but leaves older
+          # builds behind; drop every other gufo zip so the rolling release
+          # always holds exactly the current one.
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/windows" 2>$null | ConvertFrom-Json
+          if (-not $release) { exit 0 }
+          foreach ($asset in $release.assets) {
+            if ($asset.name -like 'gufo-*.zip' -and $asset.name -ne $env:KEEP) {
+              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)"
+              "pruned $($asset.name)"
+            }
+          }
 
       - name: Close the build-failure issue after a good run
         if: ${{ success() }}
