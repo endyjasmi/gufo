@@ -36,6 +36,9 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
               const q::ModelWeights& weights, const q::MtpWeights& mtp,
               const gufo::tokenization::QwenTokenizer& tokenizer,
               const std::filesystem::path& path);
+void AuditChainCosts(q::rocm::Executor& executor,
+                     const gufo::tokenization::QwenTokenizer& tokenizer,
+                     std::uint32_t depth);
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
@@ -89,6 +92,7 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
+  bool chain_audit = false;
   std::uint32_t cost_concurrency = 0;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
@@ -104,6 +108,8 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
+    } else if (arg == "--chain-audit") {
+      chain_audit = true;
     } else if (arg == "--cost-audit") {
       cost_audit = true;
       const auto value = next();
@@ -176,7 +182,7 @@ int main(int argc, char** argv) {
                  "be combined with other probes; --decode-ids requires it\n");
     return 2;
   }
-  if ((mtp_audit || cost_audit) && mtp_path.empty()) {
+  if ((mtp_audit || cost_audit || chain_audit) && mtp_path.empty()) {
     std::fprintf(stderr, "MTP audits require --mtp-model\n");
     return 2;
   }
@@ -184,7 +190,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (cost_depth && !cost_audit) {
+  if (chain_audit &&
+      (mtp_audit || reference || cost_audit || decode || !dump_path.empty())) {
+    std::fprintf(stderr,
+                 "--chain-audit cannot be combined with other probes\n");
+    return 2;
+  }
+  if (cost_depth && !cost_audit && !chain_audit) {
     std::fprintf(stderr, "--depth requires --cost-audit\n");
     return 2;
   }
@@ -215,8 +227,9 @@ int main(int argc, char** argv) {
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
     ngram = q::NgramTable::Open(
-        reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, &error);
+        reader->GetMappedRegions()[t.shard].file_descriptor,
+        reader->GetMappedRegions()[t.shard].source_path, t.file_offset, t.rows,
+        c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
@@ -244,7 +257,7 @@ int main(int argc, char** argv) {
   q::rocm::Executor::Options options;
   options.max_batch = batch;
   options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
-  if (mtp_audit || cost_audit)
+  if (mtp_audit || cost_audit || chain_audit)
     options.max_speculative = 8;
 
   if (cost_audit) {
@@ -256,6 +269,15 @@ int main(int argc, char** argv) {
   if (!executor) {
     std::fprintf(stderr, "executor failed: %s\n", error.c_str());
     return 1;
+  }
+  if (chain_audit) {
+    try {
+      AuditChainCosts(*executor, *tokenizer, cost_depth.value_or(0));
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "chain audit failed: %s\n", e.what());
+      return 1;
+    }
   }
   if (cost_audit) {
     try {
