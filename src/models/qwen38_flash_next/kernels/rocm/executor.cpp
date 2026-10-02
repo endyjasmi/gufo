@@ -492,6 +492,28 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
+    // Chained greedy steps rank proposals over the catch-up distribution's
+    // shortlist. Gathered rows keep the head's Q4_0 encoding, so a 16-byte
+    // chunked gather needs row bytes that divide evenly; anything else
+    // keeps the full-vocabulary head.
+    const DeviceTensor& draft_head = model.output_draft();
+    const auto short_row_bytes =
+        draft_head.type == GgmlType::kQ4_0 && draft_head.cols % 32 == 0
+            ? static_cast<std::uint32_t>(draft_head.cols / 32 * 18)
+            : 0U;
+    s.mtp_short_row_bytes =
+        short_row_bytes % 16 == 0 && c.vocab_size >= kMtpDraftShortlist
+            ? short_row_bytes
+            : 0U;
+    if (s.mtp_short_row_bytes != 0) {
+      const auto short_ids = MtpDraftShortlistWorkspaceSize(c.vocab_size);
+      s.mtp_short_ids = Alloc<std::uint32_t>(a, short_ids, error_msg);
+      s.mtp_short_scratch = Alloc<std::uint32_t>(a, short_ids, error_msg);
+      s.mtp_short_scores = Alloc<float>(a, kMtpDraftShortlist, error_msg);
+      s.mtp_short_w = Alloc<std::uint8_t>(
+          a, std::size_t{kMtpDraftShortlist} * s.mtp_short_row_bytes,
+          error_msg);
+    }
     if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(
@@ -1776,22 +1798,24 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::int32_t* chain_out,
+                       bool candidates, std::int32_t* chain_out, bool shortlist,
                        std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
   const DeviceTensor& draft_output = model_->output_draft();
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
+  const auto head_rows = shortlist ? kMtpDraftShortlist : output.rows;
   if (!draft_output.empty()) {
     // The Q4_0 draft head rides the routed vector GEMV with one "expert"
     // spanning every row; its logits only rank proposals, which the target
-    // verifies exactly.
-    if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, s_.mixed,
-                        s_.mtp_zero_ids, s_.logits,
-                        static_cast<int>(output.rows),
-                        static_cast<int>(output.cols), 1, 1, 1, stream_,
-                        nullptr, nullptr) != 0) {
+    // verifies exactly. A chained step ranks the gathered shortlist rows,
+    // so a shortlist miss can lower acceptance but never change the output.
+    if (qfn_mmq_moe_vec(
+            GGML_TYPE_Q4_0, shortlist ? s_.mtp_short_w : draft_output.data,
+            s_.mixed, s_.mtp_zero_ids, s_.logits, static_cast<int>(head_rows),
+            static_cast<int>(output.cols), 1, 1, 1, stream_, nullptr,
+            nullptr) != 0) {
       AssignError(error_msg, "Q4_0 draft head GEMV failed");
       return false;
     }
@@ -1805,7 +1829,7 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     // A chained draft step keeps its argmax on the device: the next step
     // embeds it and the verify pass never needs it on the host.
     Argmax(s_.logits, s_.mtp_argmax,
-           chain_out != nullptr ? chain_out : s_.mtp_token, 1, output.rows,
+           chain_out != nullptr ? chain_out : s_.mtp_token, 1, head_rows,
            stream_);
     if (chain_out == nullptr &&
         !Check(
@@ -2829,6 +2853,13 @@ bool Executor::MtpDraftChain(Session& session,
   auto* mtp_position_word = control_words + 2;  ///< Session::Control offset
   auto* mtp_blocks_word = control_words + 4;
   auto* hidden_row_word = reinterpret_cast<std::int32_t*>(control_words + 3);
+  // Chained steps rank their proposal over the catch-up distribution's
+  // shortlist: one gathered Q4_0 matrix of kMtpDraftShortlist rows replaces
+  // the full-vocabulary head GEMV per step. The gathered rows are exact
+  // copies, so the shortlisted logits match the full head bit for bit; the
+  // target verifies every proposal exactly, so a shortlist miss can only
+  // lower acceptance, never change the produced tokens.
+  const bool shortlist = proposals >= 3 && s_.mtp_short_row_bytes != 0;
   const auto body = [&] {
     // chain[0] is the anchor: the last replay row, staged in pinned memory.
     if (!Check(hipMemcpyAsync(s_.mtp_chain, tokens_host_ + m - 1,
@@ -2843,13 +2874,20 @@ bool Executor::MtpDraftChain(Session& session,
                  s_.mtp_chain + 1)) {
       return false;
     }
+    if (shortlist) {
+      MtpDraftShortlist(s_.logits, s_.mtp_short_ids, s_.mtp_short_scratch,
+                        s_.mtp_short_scores, c.vocab_size, stream_);
+      GatherDraftHeadRows(model_->output_draft().data, s_.mtp_short_ids,
+                          s_.mtp_short_w, s_.mtp_short_row_bytes,
+                          kMtpDraftShortlist, stream_);
+    }
     // The catch-up consumed m draft positions; every later step one more.
     MtpAdvanceControl(mtp_position_word, mtp_blocks_word, hidden_row_word, m,
                       c.indexer_top_k, c.compress_ratio, stream_);
     for (std::uint32_t i = 1; i < proposals; ++i) {
       if (!MtpBody(session, 1, pos + m + i - 1, true, false, error_msg, 1,
                    nullptr, nullptr, false, s_.mtp_chain + i,
-                   s_.mtp_chain + i + 1)) {
+                   s_.mtp_chain + i + 1, shortlist)) {
         return false;
       }
       MtpAdvanceControl(mtp_position_word, mtp_blocks_word, hidden_row_word, 1,
@@ -2880,7 +2918,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        std::uint32_t pool_grid, const float* hidden_source,
                        MtpTrace* trace, bool kv_only,
                        const std::int32_t* embed_tokens,
-                       std::int32_t* chain_out) const {
+                       std::int32_t* chain_out, bool shortlist_head) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -3079,7 +3117,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, chain_out, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates, chain_out,
+                 shortlist_head, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

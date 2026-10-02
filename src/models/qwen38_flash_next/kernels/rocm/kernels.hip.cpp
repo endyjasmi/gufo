@@ -6320,4 +6320,44 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                                       stream);
 }
 
+std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab) {
+  const auto tiles = (vocab + kMtpCandidateTile - 1) / kMtpCandidateTile;
+  return (tiles > 2 ? tiles : 2) * kMtpDraftShortlist;
+}
+
+void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
+                       std::uint32_t* scratch_ids, float* scores,
+                       std::uint32_t vocab, hipStream_t stream) {
+  if (scores == nullptr)
+    throw std::invalid_argument("invalid MTP draft shortlist scores");
+  SelectMtpCandidates<kMtpDraftShortlist>(logits, ids, scratch_ids, scores,
+                                          vocab, stream);
+}
+
+__global__ void GatherDraftHeadRowsKernel(const std::uint8_t* weights,
+                                          const std::uint32_t* ids,
+                                          uint4* gathered, std::uint32_t chunks,
+                                          std::uint32_t rows) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * chunks) {
+    return;
+  }
+  const std::uint32_t row = i / chunks;
+  const std::uint32_t chunk = i % chunks;
+  const auto* src = reinterpret_cast<const uint4*>(
+      weights + static_cast<std::size_t>(ids[row]) * chunks * 16);
+  gathered[i] = src[chunk];
+}
+
+void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
+                         void* gathered, std::uint32_t row_bytes,
+                         std::uint32_t rows, hipStream_t stream) {
+  const auto chunks = row_bytes / 16;
+  const std::size_t count = std::size_t{rows} * chunks;
+  hipLaunchKernelGGL(
+      GatherDraftHeadRowsKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream,
+      static_cast<const std::uint8_t*>(weights), ids,
+      static_cast<uint4*>(gathered), static_cast<std::uint32_t>(chunks), rows);
+}
+
 }  // namespace gufo::models::qwen38_flash_next::rocm

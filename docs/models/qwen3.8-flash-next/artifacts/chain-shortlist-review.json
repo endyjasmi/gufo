@@ -1,0 +1,38 @@
+{
+  "experiment": "shortlisted draft head for chained greedy MTP steps",
+  "change": "Each pinned-chain step ranks its proposal over the catch-up distribution's exact top-512 tokens (one gathered Q4_0 matrix, byte-exact row copies) instead of running the full 248320-row Q4_0 head GEMV per step. The target verifies every proposal exactly, so a shortlist miss can only lower acceptance, never change produced tokens.",
+  "machine": "AMD Radeon 8060S (gfx1151, 20 CUs), Windows port",
+  "models": {
+    "target": "unsloth Qwen3.8-Flash-Next UD-Q4_K_XL @ 38bb39ee",
+    "mtp": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+  },
+  "instrument": "qwen38_flash_next_gpu_probe --chain-audit --depth 0 (in-process median complete pinned-chain cycle over 40 cycles after 8 warmup cycles; replicates MtpDraftChain -> kVerifyGreedy Forward -> ReadGreedyPredictions -> Rollback -> MtpRewind at full acceptance)",
+  "protocol": "Two interleaved baseline/candidate rounds; baseline = commit 5e2afcf plus the identical audit instrumentation, candidate = shortlist change. Widths 2 acts as the control (proposals=1, shortlist not engaged).",
+  "rounds": [
+    {
+      "round": 1,
+      "baseline_ms": { "2": 43.1281, "4": 59.8014, "6": 71.4269, "8": 87.4851 },
+      "candidate_ms": { "2": 43.2932, "4": 53.8408, "6": 61.1313, "8": 70.9960 }
+    },
+    {
+      "round": 2,
+      "baseline_ms": { "2": 43.0857, "4": 59.7470, "6": 71.4462, "8": 87.3660 },
+      "candidate_ms": { "2": 42.9710, "4": 53.6568, "6": 61.1713, "8": 70.9790 }
+    }
+  ],
+  "median_cycle_ms": {
+    "baseline": { "2": 43.11, "4": 59.77, "6": 71.44, "8": 87.43 },
+    "candidate": { "2": 43.13, "4": 53.75, "6": 61.15, "8": 70.99 },
+    "delta_percent": { "2": 0.0, "4": -10.1, "6": -14.4, "8": -18.8 }
+  },
+  "quality": {
+    "greedy_outputs": "byte-identical to baseline on three prompts (96 tokens each, -t 0), including TokenTrace sha256",
+    "acceptance": "canonical pp1778/tg128 HTTP rounds: ~72% of proposals accepted on both builds (round noise 60-83% either side)",
+    "sampled_path": "unchanged: the batched MtpHeads candidate path keeps the exact full-vocabulary top-64"
+  },
+  "notes": [
+    "Width-2 cycles are unchanged by design, isolating the measured effect to the shortlisted steps.",
+    "The saving per shortlisted step is ~2.7 ms, larger than the batched cost-audit proposal estimate (~2.6 ms per step including the body): the pinned chain's single-row head GEMV streams the 200 MB Q4_0 head well below the batched bandwidth.",
+    "Host wall-clock HTTP benchmarks on this machine swing ±30% with multi-minute GPU clock/power states; the in-process interleaved audit above is the decisive evidence."
+  ]
+}

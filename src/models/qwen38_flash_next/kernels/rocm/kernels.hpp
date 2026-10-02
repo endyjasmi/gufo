@@ -521,6 +521,28 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
 
+/// Vocabulary rows a chained greedy draft step ranks its proposal over.
+inline constexpr std::uint32_t kMtpDraftShortlist = 512;
+
+/// Shortlist-buffer ID capacity of one selection pass: the first reduction
+/// keeps this many of the vocabulary's top candidates.
+std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab);
+
+/// Exact top-`kMtpDraftShortlist` of one full-vocab logit row, descending
+/// score with lowest-token-ID ties. Both ID buffers have room for
+/// MtpDraftShortlistWorkspaceSize(vocab). Graph-safe.
+void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
+                       std::uint32_t* scratch_ids, float* scores,
+                       std::uint32_t vocab, hipStream_t stream);
+
+/// Copies the shortlisted rows of the Q4_0 draft head into one compact
+/// row-major matrix of `rows` rows (`row_bytes` encoded bytes each) so the
+/// chained steps' head GEMV reads only the shortlist. `row_bytes` must be a
+/// multiple of 16. Graph-safe.
+void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
+                         void* gathered, std::uint32_t row_bytes,
+                         std::uint32_t rows, hipStream_t stream);
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_

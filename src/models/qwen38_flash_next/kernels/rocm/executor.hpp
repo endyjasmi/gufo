@@ -414,8 +414,10 @@ private:
                 std::uint32_t rows, std::string* error) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
   /// A non-null `chain_out` keeps the argmax on the device (chained drafts).
+  /// With `shortlist` the greedy argmax ranks only the gathered draft-head
+  /// rows of the catch-up distribution's shortlist (chained steps only).
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool candidates, std::int32_t* chain_out,
+               bool candidates, std::int32_t* chain_out, bool shortlist,
                std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
@@ -430,7 +432,8 @@ private:
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
                const std::int32_t* embed_tokens = nullptr,
-               std::int32_t* chain_out = nullptr) const;
+               std::int32_t* chain_out = nullptr,
+               bool shortlist_head = false) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -529,6 +532,16 @@ private:
     std::uint32_t* mtp_ids;
     std::uint32_t* mtp_scratch_ids;
     float* mtp_scores;
+    /// Chained greedy steps rank their proposal over the catch-up
+    /// distribution's shortlist: selector ping-pong buffers, their scores,
+    /// and the gathered Q4_0 draft-head rows.
+    std::uint32_t* mtp_short_ids;
+    std::uint32_t* mtp_short_scratch;
+    float* mtp_short_scores;
+    void* mtp_short_w;
+    /// Encoded row size of the Q4_0 draft head, or 0 when the loaded model
+    /// cannot use the shortlist route (no Q4_0 head, ragged row bytes).
+    std::uint32_t mtp_short_row_bytes{0};
   };
   mutable Scratch s_{};
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
