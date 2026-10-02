@@ -660,9 +660,27 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  // Pure greedy single-session cycles pick their width from the same runtime
+  // cost controller the batch path uses (one row): live cycle timings replace
+  // the static cost table, so cheaper cycles widen speculation. Seeded
+  // requests replay their exact widths (and tokens) across restores, sampled
+  // requests keep the acceptance-history policy and its fixed cost table for
+  // seeded replay, and penalty-greedy requests verify through the
+  // penalty-aware path whose costs the controller does not measure.
+  std::optional<std::uint32_t> learned;
+  if (MtpEnabled() && cap > 1 && !batch_drafts && sampler.config().seed < 0 &&
+      !sampler.config().uses_random_sampling() &&
+      !sampler.config().penalties_enabled()) {
+    const MtpBatchController::Row row{
+        &draft_length_, static_cast<std::uint32_t>(cap - 1)};
+    learned = model_->batch_policy_.Choose(
+        std::span<const MtpBatchController::Row>(&row, 1),
+        static_cast<std::uint32_t>(tokens_.size()));
+  }
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+                 : learned    ? std::min<std::uint32_t>(*learned, cap - 1)
                               : draft_length_.Choose(
                                     static_cast<std::uint32_t>(cap - 1),
                                     static_cast<std::uint32_t>(tokens_.size())))
@@ -926,6 +944,16 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  // Greedy MTP cycle durations feed the width controller exactly like
+  // batched cycles do; seeded, sampled, and penalty-greedy requests never
+  // observe into it, so replayed widths and the penalty-aware path stay
+  // deterministic.
+  const bool timed = MtpEnabled() && sampler.config().seed < 0 &&
+                     !sampler.config().uses_random_sampling() &&
+                     !sampler.config().penalties_enabled();
+  const auto cycle_start = timed ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+  const auto cycle_context = static_cast<std::uint32_t>(tokens_.size());
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg)) {
     return false;
@@ -948,6 +976,16 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   const bool ok = FinishDecode(request, pending, error_msg);
+  if (ok && timed) {
+    model_->batch_policy_.Observe(
+        1, cycle_context,
+        pending.speculative
+            ? static_cast<std::uint32_t>(pending.chain.size() - 1)
+            : 0,
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count());
+  }
   valid_ = ok;
   return ok;
 }

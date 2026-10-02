@@ -1,0 +1,27 @@
+{
+  "experiment": "runtime cost learning for single-user greedy MTP widths",
+  "change": "Pure greedy single-session cycles (unseeded, no random sampling, no penalties - exactly the pinned-chain population) now pick their draft width from the same runtime cost controller the batch path uses, consulted for one row: live cycle durations measured across DecodeStep replace the static cost table, so the cheaper shortlisted cycles widen speculation. Seeded requests keep the static table (their widths and tokens must replay exactly across restores - the rollback-reuse replay contract), sampled requests keep the acceptance-history policy, and penalty-greedy requests (penalty-aware verify path) are excluded from both choosing and observing.",
+  "machine": "AMD Radeon 8060S (gfx1151, 20 CUs), Windows port",
+  "models": {
+    "target": "unsloth Qwen3.8-Flash-Next UD-Q4_K_XL @ 38bb39ee",
+    "mtp": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+  },
+  "instrument": "gufo-serving-bench.py HTTP, canonical pp1778 prompt, temperature 0 (unseeded), penalties zeroed, C1, 2 warmup rounds; passes 1-2 at tg256 x5 reps, passes 3-4 at tg512 x3 reps",
+  "protocol": "Four interleaved baseline/candidate passes; baseline = 756eaec build (identical C1 behavior to b09899a), candidate = this change.",
+  "decode_tok_s_median": {
+    "baseline": [28.77, 24.67, 30.21, 26.84],
+    "candidate": [27.00, 29.91, 32.16, 32.76],
+    "median_of_medians": [27.8, 31.0],
+    "note": "passes 1-2 ran tg256 (policy not yet converged within the request); passes 3-4 ran tg512 where the controller converges mid-request and shows +6.5% and +22%."
+  },
+  "quality": {
+    "seeded_greedy_replay": "unchanged: seeded requests keep the static table; session_test rollback-reuse replay passes again after the seed gate (it failed with timing-driven widths before the gate)",
+    "sampled": "unchanged: acceptance-history policy and fixed cost table",
+    "tests": "mtp_sampling, snapshot, batch-only (to the pre-existing sampled-draw failure, identical on baseline), sampling-only (to its pre-existing interleaving failure, identical on baseline)",
+    "text": "free-running unseeded greedy text can flip near-ties as widths shift (the engine's documented batch-shape sensitivity); committed tokens remain the target's greedy sequence"
+  },
+  "notes": [
+    "The controller converges within a few dozen cycles; short requests partially run on bootstrap widths from the static table.",
+    "Cumulative acceptance drops slightly (deeper chains have lower tail acceptance) while tok/s rises; the controller maximizes expected tokens per measured millisecond."
+  ]
+}
