@@ -3,8 +3,9 @@ name: Windows release
 on:
   # Continuous verification: build the port against the newest nightly SDK
   # every day so toolchain breakage is caught within a day, not discovered
-  # when somebody next needs a build. Scheduled runs check out the Windows
-  # port branch explicitly (schedule otherwise uses the default branch).
+  # when somebody next needs a build. Scheduled runs are canary builds only:
+  # they publish nothing. They check out the Windows port branch explicitly
+  # (schedule otherwise uses the default branch).
   schedule:
     - cron: "23 21 * * *"
   workflow_dispatch:
@@ -14,7 +15,7 @@ on:
         required: false
         default: ""
       publish:
-        description: Publish the build to a GitHub release
+        description: Publish the build to the checked-out commit's own release
         type: boolean
         required: false
         default: true
@@ -184,15 +185,11 @@ jobs:
           # distinct release that is never replaced by a later one.
           $sha = $env:GITHUB_SHA.Substring(0, 7)
           $name = "gufo-$version-windows-gfx1151-$sha"
-          # Branch pushes publish one release per commit; tag pushes publish
-          # pinned snapshots; scheduled and manual runs refresh the rolling
-          # 'windows' release with a build against the newest nightly SDK.
-          $mode = if ($env:GITHUB_REF_TYPE -eq 'tag') { 'tag' }
-                  elseif ($env:GITHUB_EVENT_NAME -eq 'push') { 'push' }
-                  else { 'rolling' }
-          $tag = if ($mode -eq 'tag') { $env:GITHUB_REF_NAME }
-                 elseif ($mode -eq 'push') { "windows-v$version-$sha" }
-                 else { 'windows' }
+          # Every build publishes its own release: branch pushes and manual
+          # runs tag windows-v<version>-<sha>, tag pushes use their own tag.
+          # Scheduled runs stop before publishing.
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME }
+                 else { "windows-v$version-$sha" }
           $pkg = "$env:RUNNER_TEMP\$name"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           Copy-Item "$env:BUILD_DIR\gufo.exe" $pkg
@@ -217,13 +214,12 @@ jobs:
           - Gufo $version (commit $env:GITHUB_SHA)
           - Built with TheRock HIP SDK $env:SDK_VERSION
 
-          The asset name carries the short commit hash so builds are distinguishable. Branch pushes publish one release per commit (tagged ``windows-v<version>-<sha>``) and earlier releases are kept; ``windows-v*`` tags publish pinned snapshots; scheduled and manual runs refresh the rolling ``windows`` release with a build against the newest nightly SDK.
+          The asset name carries the short commit hash so builds are distinguishable. Branch pushes and manual runs publish one release per commit (tagged ``windows-v<version>-<sha>``) and earlier releases are kept; ``windows-v*`` tags publish pinned snapshots.
 
           Unzip the archive and run ``gufo.exe`` from the extracted folder (``gufo-server.exe`` starts the OpenAI-compatible HTTP server). An AMD graphics driver with ROCm support is required; the build targets gfx1151 only. See BUILD-WINDOWS.md in the repository for build-from-source instructions.
           "@ | Out-File -FilePath "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
           "version=$version" >> $env:GITHUB_OUTPUT
           "name=$name" >> $env:GITHUB_OUTPUT
-          "mode=$mode" >> $env:GITHUB_OUTPUT
           "release_tag=$tag" >> $env:GITHUB_OUTPUT
           "zip=$pkg.zip" >> $env:GITHUB_OUTPUT
 
@@ -235,38 +231,17 @@ jobs:
           retention-days: 30
 
       - name: Publish release
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish == 'true' }}
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          # Branch pushes publish a release per commit (windows-v<version>-<sha>)
-          # and keep earlier ones; tag pushes publish pinned windows-vX.Y.Z
-          # snapshots; scheduled and manual runs refresh the rolling 'windows'
-          # release. The rolling refresh does not claim the 'Latest' badge, so
-          # the newest per-push release stays the latest one.
+          # Branch pushes and manual runs publish a release per commit
+          # (windows-v<version>-<sha>) and keep earlier ones; tag pushes
+          # publish pinned windows-vX.Y.Z snapshots. Scheduled runs are
+          # canary builds against the newest nightly SDK and publish nothing.
           tag_name: ${{ steps.package.outputs.release_tag }}
           files: ${{ steps.package.outputs.zip }}
           body_path: ${{ runner.temp }}/release-notes.md
-          make_latest: ${{ steps.package.outputs.mode == 'rolling' && 'false' || 'true' }}
-
-      - name: Prune superseded assets from the rolling release
-        if: ${{ steps.package.outputs.mode == 'rolling' && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish == 'true') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          KEEP: ${{ steps.package.outputs.name }}.zip
-        shell: pwsh
-        run: |
-          # Re-uploading overwrites the same-named asset but leaves older
-          # scheduled builds behind; drop every other gufo zip so the rolling
-          # release always holds exactly the newest nightly-SDK build. Releases
-          # published by branch pushes and tags are never touched here.
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/windows" 2>$null | ConvertFrom-Json
-          if (-not $release) { exit 0 }
-          foreach ($asset in $release.assets) {
-            if ($asset.name -like 'gufo-*.zip' -and $asset.name -ne $env:KEEP) {
-              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)"
-              "pruned $($asset.name)"
-            }
-          }
+          make_latest: "true"
 
       - name: Close the build-failure issue after a good run
         if: ${{ success() }}
