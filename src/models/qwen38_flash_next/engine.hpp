@@ -45,6 +45,10 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Store the attention K/V caches as Q8_0 blocks (32 F32→int8 codes plus
+  /// one F16 scale) instead of F16 halves: roughly half the per-token bytes,
+  /// lossy. Snapshots of the two formats are not interchangeable.
+  bool kv_cache_q8_0 = false;
 };
 
 class Session;
@@ -79,6 +83,9 @@ public:
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
+  }
+  [[nodiscard]] bool KvCacheQ8_0() const noexcept {
+    return options_.kv_cache_q8_0;
   }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
@@ -195,8 +202,8 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 16;
-  /// Bytes a snapshot of the current context occupies.
+  /// 17: KV cache sections may be planar Q8_0 (kv_dtype header field).
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 17;  /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
   /// state, draft-block state, last logits) into host memory. The

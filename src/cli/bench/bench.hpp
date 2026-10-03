@@ -28,6 +28,8 @@ struct BenchOptions {
   std::string dspark_model_path;
   std::uint32_t draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
+  /// Flash-Next: store attention K/V caches as Q8_0 blocks (lossy).
+  bool kv_cache_q8_0{false};
   sampling::SamplingConfig sampling{.seed = 0};
   bool verbose{false};
 };

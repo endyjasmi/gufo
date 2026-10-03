@@ -10,6 +10,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_layout.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
@@ -165,16 +166,18 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
+/// Writes Q/gates in F32 and K/V caches in F16 (or Q8_0 with `kv_dtype`),
+/// preserving separate rounding.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
-                      float* gate, __half* keys, __half* values,
+                      float* gate, void* keys, void* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope = nullptr);
+                      const qwen::vision::DeviceRope* rope = nullptr,
+                      KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -343,17 +346,19 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream);
 
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
-/// and writes the F16 caches. Returns false for heads wider than 256.
+/// and writes the caches (F16 values, or Q8_0 blocks with `kv_dtype`).
+/// Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, __half* k_cache, __half* v_cache,
+                      float* gate, void* k_cache, void* v_cache,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false);
+                      bool prefill = false,
+                      KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -364,11 +369,12 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
           const qwen::vision::DeviceRope* rope = nullptr);
 
-/// Stores f32 rows into the f16 cache at positions start_pos + t:
-/// cache[(start_pos + t)][row_dim].
-void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
+/// Stores f32 rows into the cache at positions start_pos + t:
+/// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0
+/// blocks per `kv_dtype`.
+void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
-             hipStream_t stream);
+             hipStream_t stream, KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -404,12 +410,12 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
 /// across `splits` blocks per row and merged in a second launch.
-void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+void Attention(const float* q, const void* k_cache, const void* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream);
+               hipStream_t stream, KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
@@ -418,13 +424,14 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
 bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
+                         const void* k_cache, const void* v_cache,
                          const std::uint32_t* mask, std::uint32_t mask_words,
                          float* out, std::uint32_t n_tokens,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only = false,
+                         KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

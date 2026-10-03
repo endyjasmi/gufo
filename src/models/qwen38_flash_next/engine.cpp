@@ -149,6 +149,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
+  exec.kv_cache_dtype = options.kv_cache_q8_0 ? KvCacheDtype::kQ8_0
+                                              : KvCacheDtype::kF16;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
