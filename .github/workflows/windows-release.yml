@@ -37,8 +37,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  decide:
+    name: Decide whether to build
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Check which paths a branch push touched
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          # Branch pushes that only touch CI/docs paths cannot change the
+          # binary, so they skip the build entirely: a fork does not need a
+          # 45-minute runner burn and a 358 MB release per README tweak.
+          # Anything unclear fails open and builds. Tag pushes, scheduled
+          # canaries and manual runs always build.
+          set -euo pipefail
+          build=true
+          if [ "${{ github.event_name }}" = push ] && [ "${{ github.ref_type }}" = branch ] \
+             && [ -n "$BEFORE" ] && ! grep -qE '^0+$' <<< "$BEFORE"; then
+            files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$AFTER" \
+                      --jq '.files[].filename' 2>/dev/null || true)
+            count=$(printf '%s\n' "$files" | wc -l)
+            # The compare endpoint caps its file list at 300; a truncated
+            # list may be hiding a real change, so build.
+            if [ -n "$files" ] && [ "$count" -lt 300 ] \
+               && ! printf '%s\n' "$files" | grep -qvE '^(\.github/|docs/)|\.md$'; then
+              build=false
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
   windows-release:
     name: Build and package Windows release
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 150
     env:
