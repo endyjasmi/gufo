@@ -81,8 +81,10 @@ private:
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
-    __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
-    __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+    /// F16 halves or planar Q8_0 bytes by the executor's kv_cache_dtype;
+    /// rows are [max_context][KvRowBytes(kv_heads*d, dtype)].
+    unsigned char* k_cache{nullptr};
+    unsigned char* v_cache{nullptr};
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
   };
@@ -96,8 +98,8 @@ private:
     std::uint32_t mtp_blocks;    ///< complete predictor indexer blocks
   };
   struct MtpState {
-    __half* k_cache{nullptr};
-    __half* v_cache{nullptr};
+    unsigned char* k_cache{nullptr};
+    unsigned char* v_cache{nullptr};
     float* index_k{nullptr};
     __half* block_k{nullptr};
     std::uint32_t blocks{0};
@@ -149,6 +151,10 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// KV cache element format for every session of this executor. Q8_0
+    /// stores 32-element blocks (F32→int8 codes, trailing F16 scales) and
+    /// roughly halves the per-token bytes; attention dequantizes on load.
+    KvCacheDtype kv_cache_dtype{KvCacheDtype::kF16};
   };
 
   ~Executor();

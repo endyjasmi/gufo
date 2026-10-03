@@ -162,6 +162,11 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddFlag(
+      "", "--kv-cache-q8-0",
+      "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
+      "bytes, lossy)",
+      "Speculative", &opt.kv_cache_q8_0);
   parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -683,7 +688,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
       {.max_context = kDefaultContext,
        .mtp_model_path = mtp_model_path,
        .max_draft_tokens = opt.draft_tokens,
-       .vision_model_path = opt.vision_model_path},
+       .vision_model_path = opt.vision_model_path,
+       .kv_cache_q8_0 = opt.kv_cache_q8_0},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)

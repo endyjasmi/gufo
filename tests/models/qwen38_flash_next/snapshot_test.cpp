@@ -71,10 +71,14 @@ double Millis(std::chrono::steady_clock::time_point start) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 5 || std::string_view(argv[1]) != "--model" ||
-      std::string_view(argv[3]) != "--mtp-model") {
+  bool kv_q8 = false;
+  if (argc == 6 && std::string_view(argv[5]) == "--kv-q8") {
+    kv_q8 = true;
+  } else if (argc != 5 || std::string_view(argv[1]) != "--model" ||
+             std::string_view(argv[3]) != "--mtp-model") {
     std::cerr
-        << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf\n";
+        << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
+           "[--kv-q8]\n";
     return 77;
   }
   try {
@@ -83,7 +87,8 @@ int main(int argc, char** argv) {
     auto model = qfn::Model::Load(argv[2],
                                   {.max_context = kContext,
                                    .mtp_model_path = argv[4],
-                                   .max_draft_tokens = 7},
+                                   .max_draft_tokens = 7,
+                                   .kv_cache_q8_0 = kv_q8},
                                   &error);
     Require(model != nullptr, error);
     const auto pattern = model->Tokenize(

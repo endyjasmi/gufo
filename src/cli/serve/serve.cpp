@@ -580,6 +580,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    bool kv_cache_q8_0 = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -679,6 +680,11 @@ void PrintServeHelp(std::string_view program_name,
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
         "Cache", &cache_ram_bytes);
+    parser.AddFlag(
+        "", "--kv-cache-q8-0",
+        "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
+        "bytes, lossy)",
+        "Cache", &kv_cache_q8_0);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
@@ -1112,6 +1118,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    bool kv_cache_q8_0 = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1207,6 +1214,11 @@ int RunServe(std::span<const char* const> args) {
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
         "Cache", &cache_ram_bytes);
+    llm_parser.AddFlag(
+        "", "--kv-cache-q8-0",
+        "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
+        "bytes, lossy)",
+        "Cache", &kv_cache_q8_0);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
@@ -1354,7 +1366,8 @@ int RunServe(std::span<const char* const> args) {
                        },
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                           .capacity_bytes = cache_ram_bytes},
+                       kv_cache_q8_0)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

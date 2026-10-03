@@ -205,6 +205,11 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddFlag(
+      "", "--kv-cache-q8-0",
+      "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
+      "bytes, lossy)",
+      "Speculative", &opt.kv_cache_q8_0);
   parser.AddCustomOption(
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
@@ -936,6 +941,7 @@ int RunQwen38FlashNextBenchmark(
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+          .kv_cache_q8_0 = options.kv_cache_q8_0,
       },
       &error);
   if (model == nullptr) {

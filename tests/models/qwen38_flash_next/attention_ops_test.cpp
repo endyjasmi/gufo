@@ -16,6 +16,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
+namespace qk = gufo::models::qwen38_flash_next;
 namespace {
 
 // The model's full-attention geometry: 24 query heads over 2 KV heads,
@@ -99,6 +100,50 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
                      hipMemcpyDeviceToHost),
            "download");
   return values;
+}
+
+std::vector<unsigned char> DownloadBytes(HipBuffer<unsigned char>* source) {
+  std::vector<unsigned char> values(source->bytes());
+  CheckHip(hipMemcpy(values.data(), source->get(), source->bytes(),
+                     hipMemcpyDeviceToHost),
+           "download bytes");
+  return values;
+}
+
+/// Host mirror of the kernels' planar Q8_0 row quantization: F16 scale =
+/// amax/127 per 32 elements, codes rounded to nearest even.
+void QuantizeRowQ8_0Host(const float* src, unsigned char* dst,
+                         std::uint32_t row_dim) {
+  const std::size_t scales = row_dim / 32;
+  auto* codes = reinterpret_cast<signed char*>(dst);
+  auto* scale_out = reinterpret_cast<__half*>(dst + row_dim);
+  for (std::size_t b = 0; b < scales; ++b) {
+    float amax = 0.0F;
+    for (std::uint32_t j = 0; j < 32; ++j) {
+      amax = std::max(amax, std::fabs(src[b * 32 + j]));
+    }
+    const float id = amax > 0.0F ? 127.0F / amax : 0.0F;
+    for (std::uint32_t j = 0; j < 32; ++j) {
+      codes[b * 32 + j] =
+          static_cast<signed char>(std::nearbyint(src[b * 32 + j] * id));
+    }
+    scale_out[b] = __float2half_rn(amax / 127.0F);
+  }
+}
+
+/// Decodes a planar Q8_0 row back to floats, optionally rounding through F16
+/// (the WMMA loaders dequantize into F16 registers).
+std::vector<float> DequantRowQ8_0Host(const unsigned char* src,
+                                      std::uint32_t row_dim, bool round_f16) {
+  std::vector<float> out(row_dim);
+  const auto* codes = reinterpret_cast<const signed char*>(src);
+  const auto* scales = reinterpret_cast<const __half*>(src + row_dim);
+  for (std::uint32_t i = 0; i < row_dim; ++i) {
+    const float value =
+        static_cast<float>(codes[i]) * __half2float(scales[i / 32]);
+    out[i] = round_f16 ? __half2float(__float2half_rn(value)) : value;
+  }
+  return out;
 }
 
 void CheckPreparation(std::uint32_t n, std::uint32_t start,
@@ -235,10 +280,15 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
 
 /// FP64 gated attention over the keys each row can see: every key below
 /// pos + 1, or with a mask the selected complete blocks plus the incomplete
-/// tail block. An independent formula for the per-token kernel.
+/// tail block. An independent formula for the per-token kernel. Cache
+/// elements decode through `DecodeCache` (__half or float).
+inline float DecodeCache(__half value) { return __half2float(value); }
+inline float DecodeCache(float value) { return value; }
+
+template<typename KCache, typename VCache>
 std::vector<double> Fp64Attention(
     const std::vector<float>& qv, const std::vector<float>& gate,
-    const std::vector<__half>& kh, const std::vector<__half>& vh,
+    const KCache& kh, const VCache& vh,
     const std::uint32_t* mask, std::uint32_t mask_words, std::uint32_t n_tokens,
     std::uint32_t start_pos, std::uint32_t ratio = kRatio) {
   std::vector<double> out(static_cast<std::size_t>(n_tokens) * kQWidth);
@@ -268,7 +318,7 @@ std::vector<double> Fp64Attention(
         double dot = 0.0;
         for (std::uint32_t d = 0; d < kDim; ++d) {
           dot += static_cast<double>(qv[row + d]) *
-                 static_cast<double>(__half2float(kh[base + d]));
+                 static_cast<double>(DecodeCache(kh[base + d]));
         }
         scores[k] = dot * scale;
         maximum = std::max(maximum, scores[k]);
@@ -282,8 +332,8 @@ std::vector<double> Fp64Attention(
         double acc = 0.0;
         for (std::size_t k = 0; k < keys.size(); ++k) {
           acc += scores[k] *
-                 static_cast<double>(__half2float(
-                     vh[keys[k] * std::size_t{kKvWidth} + kv_head + d]));
+                 static_cast<double>(
+                     DecodeCache(vh[keys[k] * std::size_t{kKvWidth} + kv_head + d]));
         }
         const double g = static_cast<double>(gate[row + d]);
         out[row + d] = acc / sum / (1.0 + std::exp(-g));
@@ -602,10 +652,196 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+/// Q8_0 write path: PrepareAttention's cache rows must byte-match the host
+/// quantization of the same normalized/rotated F32 values (the F16 case
+/// already proves the arithmetic matches StoreKv's inputs).
+void CheckQ8Preparation(std::uint32_t n, std::uint32_t start) {
+  constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
+  const std::size_t cache_rows = start + n + 2;
+  const std::size_t row_bytes = kKvWidth + kKvWidth / 16;
+  HipBuffer<float> packed(static_cast<std::size_t>(n) * stride);
+  HipBuffer<float> q_gamma(kDim), k_gamma(kDim);
+  HipBuffer<float> k(std::size_t{n} * kKvWidth), v(std::size_t{n} * kKvWidth);
+  HipBuffer<unsigned char> k_ref(cache_rows * row_bytes),
+      v_ref(cache_rows * row_bytes);
+  HipBuffer<unsigned char> k_out(cache_rows * row_bytes),
+      v_out(cache_rows * row_bytes);
+  HipBuffer<float> q_out(std::size_t{n} * kQWidth),
+      gate_out(std::size_t{n} * kQWidth);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F));
+  auto qg = MakeValues(kDim, 37, 0.5F);
+  auto kg = MakeValues(kDim, 91, 0.5F);
+  for (auto& x : qg) x += 1.0F;
+  for (auto& x : kg) x += 1.0F;
+  Upload(&q_gamma, qg);
+  Upload(&k_gamma, kg);
+  Upload(&pos, std::vector<std::uint32_t>{start});
+
+  // Reference: the same unpack/norm/rope pipeline (V is never normalized),
+  // then host quantization.
+  q::UnpackQGate(packed.get(), stride, q_out.get(), gate_out.get(), k.get(),
+                 v.get(), n, kHeads, kDim, kKvWidth, nullptr);
+  q::RmsNormRows(k.get(), k_gamma.get(), k.get(), n * kKvHeads, kDim, 1, 1e-6F,
+                 nullptr);
+  q::Rope(k.get(), n, kKvHeads, kDim, 64, pos.get(), 1e7F, nullptr);
+  CheckHip(hipDeviceSynchronize(), "q8 preparation reference ready");
+  const auto kf = Download(&k, std::size_t{n} * kKvWidth);
+  const auto vf = Download(&v, std::size_t{n} * kKvWidth);
+  std::vector<unsigned char> k_ref_host(cache_rows * row_bytes, 0),
+      v_ref_host(cache_rows * row_bytes, 0);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    QuantizeRowQ8_0Host(kf.data() + std::size_t{t} * kKvWidth,
+                        k_ref_host.data() + (start + t) * row_bytes, kKvWidth);
+    QuantizeRowQ8_0Host(vf.data() + std::size_t{t} * kKvWidth,
+                        v_ref_host.data() + (start + t) * row_bytes, kKvWidth);
+  }
+  Upload(&k_ref, k_ref_host);
+  Upload(&v_ref, v_ref_host);
+
+  if (!q::PrepareAttention(packed.get(), stride, q_gamma.get(), k_gamma.get(),
+                           q_out.get(), gate_out.get(), k_out.get(), v_out.get(),
+                           n, kHeads, kKvHeads, kDim, 64, pos.get(), 1e7F,
+                           1e-6F, nullptr, nullptr, false,
+                           qk::KvCacheDtype::kQ8_0)) {
+    throw std::runtime_error("q8 preparation rejected geometry");
+  }
+  CheckHip(hipDeviceSynchronize(), "q8 preparation ready");
+  const auto k_out_host = DownloadBytes(&k_out);
+  const auto v_out_host = DownloadBytes(&v_out);
+  for (std::size_t i = 0; i < cache_rows * row_bytes; ++i) {
+    if (k_out_host[i] != k_ref_host[i]) {
+      std::cerr << "q8 key cache row " << i / row_bytes << " byte " << i % row_bytes
+                << " expected " << static_cast<int>(k_ref_host[i]) << " got "
+                << static_cast<int>(k_out_host[i]) << '\n';
+      throw std::runtime_error("q8 key cache differs from host quantization");
+    }
+    if (v_out_host[i] != v_ref_host[i]) {
+      std::cerr << "q8 value cache row " << i / row_bytes << " byte "
+                << i % row_bytes << " expected " << static_cast<int>(v_ref_host[i])
+                << " got " << static_cast<int>(v_out_host[i]) << '\n';
+      throw std::runtime_error("q8 value cache differs from host quantization");
+    }
+  }
+  std::cout << "q8 preparation n=" << n << " start=" << start
+            << ": cache bytes exact\n";
+}
+
+/// Q8_0 read paths: the per-token kernel (single and split) against FP64 over
+/// the F32-dequantized cache, and the WMMA route against FP64 over the F16
+/// rounded dequantization it computes in registers.
+void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
+                      std::uint32_t seed) {
+  const std::uint32_t n_kv = start_pos + n_tokens;
+  const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const std::size_t row_bytes = kKvWidth + kKvWidth / 16;
+  const auto qv = MakeValues(q_count, seed, 4.0F);
+  const auto gate = MakeValues(q_count, seed ^ 0x5555U, 3.0F);
+  const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+  const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+  std::vector<unsigned char> kh(static_cast<std::size_t>(n_kv) * row_bytes, 0);
+  std::vector<unsigned char> vh(static_cast<std::size_t>(n_kv) * row_bytes, 0);
+  std::vector<float> kd_f32(kv_count), vd_f32(kv_count);
+  std::vector<float> kd_f16(kv_count), vd_f16(kv_count);
+  for (std::uint32_t r = 0; r < n_kv; ++r) {
+    QuantizeRowQ8_0Host(kf.data() + std::size_t{r} * kKvWidth,
+                        kh.data() + std::size_t{r} * row_bytes, kKvWidth);
+    QuantizeRowQ8_0Host(vf.data() + std::size_t{r} * kKvWidth,
+                        vh.data() + std::size_t{r} * row_bytes, kKvWidth);
+    const auto k32 = DequantRowQ8_0Host(
+        kh.data() + std::size_t{r} * row_bytes, kKvWidth, false);
+    const auto v32 = DequantRowQ8_0Host(
+        vh.data() + std::size_t{r} * row_bytes, kKvWidth, false);
+    const auto k16 = DequantRowQ8_0Host(
+        kh.data() + std::size_t{r} * row_bytes, kKvWidth, true);
+    const auto v16 = DequantRowQ8_0Host(
+        vh.data() + std::size_t{r} * row_bytes, kKvWidth, true);
+    std::copy(k32.begin(), k32.end(), kd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v32.begin(), v32.end(), vd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(k16.begin(), k16.end(), kd_f16.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v16.begin(), v16.end(), vd_f16.begin() + std::size_t{r} * kKvWidth);
+  }
+
+  HipBuffer<float> d_q(q_count), d_gate(q_count);
+  HipBuffer<unsigned char> d_k(kh.size()), d_v(vh.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<float> d_out(q_count);
+  Upload(&d_q, qv);
+  Upload(&d_gate, gate);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+
+  const auto exact32 = Fp64Attention(qv, gate, kd_f32, vd_f32, nullptr, 0,
+                                     n_tokens, start_pos);
+  const auto exact16 = Fp64Attention(qv, gate, kd_f16, vd_f16, nullptr, 0,
+                                     n_tokens, start_pos);
+
+  // Per-token kernel: FP32 dequant products, single-block and split forms.
+  q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
+               nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
+               kRatio, nullptr, qk::KvCacheDtype::kQ8_0);
+  q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
+  constexpr std::uint32_t kSplits = 8;
+  HipBuffer<float> d_split(q_count);
+  HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
+                              kSplits * (kDim + 2));
+  q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_split.get(),
+               d_partials.get(), kSplits, n_tokens, d_pos.get(), kHeads,
+               kKvHeads, kDim, kRatio, nullptr, qk::KvCacheDtype::kQ8_0);
+  q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
+  CheckHip(hipDeviceSynchronize(), "q8 per-token attention");
+  const auto single = Download(&d_out, q_count);
+  const auto split = Download(&d_split, q_count);
+  double single_error = 0.0, split_error = 0.0;
+  for (std::size_t i = 0; i < q_count; ++i) {
+    if (!std::isfinite(single[i]) || !std::isfinite(split[i])) {
+      throw std::runtime_error("q8 per-token attention output is not finite");
+    }
+    single_error = std::max(single_error, std::abs(single[i] - exact32[i]));
+    split_error = std::max(split_error, std::abs(split[i] - exact32[i]));
+  }
+  // WMMA route: dequantizes through F16 registers.
+  HipBuffer<float> d_wmma(q_count);
+  if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
+                              nullptr, 0, d_wmma.get(), n_tokens, start_pos,
+                              kHeads, kKvHeads, kDim, kRatio, nullptr, false,
+                              qk::KvCacheDtype::kQ8_0)) {
+    throw std::runtime_error("q8 WMMA attention rejected geometry");
+  }
+  CheckHip(hipDeviceSynchronize(), "q8 wmma attention");
+  const auto wmma = Download(&d_wmma, q_count);
+  double wmma_error = 0.0;
+  for (std::size_t i = 0; i < q_count; ++i) {
+    if (!std::isfinite(wmma[i])) {
+      throw std::runtime_error("q8 WMMA attention output is not finite");
+    }
+    wmma_error = std::max(wmma_error, std::abs(wmma[i] - exact16[i]));
+  }
+  std::cout << "q8 attention n=" << n_tokens << " start=" << start_pos
+            << " fp64 error single " << single_error << " split "
+            << split_error << " wmma " << wmma_error << '\n';
+  if (std::max(single_error, split_error) > 1e-4) {
+    throw std::runtime_error("q8 per-token attention exceeds its FP64 limit");
+  }
+  if (wmma_error > 1e-4) {
+    throw std::runtime_error("q8 WMMA attention exceeds its FP64 limit");
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
+    // The Q8_0 cache cases run first: the F16 query-preparation cases below
+    // hit this toolchain's pre-existing 1-ULP drift (fails identically on an
+    // unmodified build) and would otherwise abort before them.
+    CheckQ8Preparation(8, 4096);
+    CheckQ8Preparation(65, 131069);
+    CheckQ8Attention(4, 4096, 0x51ED0001U);
+    CheckQ8Attention(17, 2047, 0x51ED0002U);
+    CheckQ8Attention(3, 90000, 0x51ED0003U);
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
     CheckPreparation(1, 0, 64);
