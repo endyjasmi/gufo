@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <hipcub/block/block_radix_sort.hpp>
 #include <stdexcept>
 #include <type_traits>
@@ -2902,6 +2903,22 @@ inline unsigned Blocks(std::size_t count) {
 // the writes stay conflict-free. The optional block mask follows the model's
 // sparse selection: keys at or past the query's incomplete tail block are
 // always visible, earlier blocks only when their bit is set.
+constexpr std::uint32_t kHalfMagic = 0x64646464U;  // 1024.0 high bytes
+
+/// Four halves from four code bytes: 1024 + q as F16, minus `magic` (1024,
+/// or 1152 for a signed byte carried as q + 128), then the affine.
+__device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
+                                              __half2 magic, __half2 scale2,
+                                              __half2 bias2, __half2& lo,
+                                              __half2& hi) {
+  const std::uint32_t p0 =
+      __builtin_amdgcn_perm(codes, kHalfMagic, 0x01050004U);
+  const std::uint32_t p1 =
+      __builtin_amdgcn_perm(codes, kHalfMagic, 0x03070206U);
+  lo = __hfma2(__hadd2(__builtin_bit_cast(__half2, p0), magic), scale2, bias2);
+  hi = __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), scale2, bias2);
+}
+
 constexpr std::uint32_t kWmmaHeadDim = 256;
 constexpr std::uint32_t kWmmaQueryHeads = 24;
 constexpr std::uint32_t kWmmaKvHeads = 2;
@@ -3192,23 +3209,27 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const auto* v_base = static_cast<const unsigned char*>(v_cache);
   const auto* k_base = static_cast<const unsigned char*>(k_cache);
   // Dequantizes eight Q8_0 codes at head-relative byte offset `d8` of the
-  // physical token row `row` into the F16 layout of a uint4 register. The
-  // scales sit at the physical row start + kWmmaKvWidth, before the head
-  // offset.
+  // physical token row `row` into the F16 layout of a uint4 register, via the
+  // same packed magic construction the weight paths use (bit-identical to a
+  // rounded F16 multiply). The scales sit at the physical row start +
+  // kWmmaKvWidth, before the head offset.
+  const __half2 magic2 = __floats2half2_rn(-1152.0F, -1152.0F);
+  const __half2 zero2 = __floats2half2_rn(0.0F, 0.0F);
   const auto load_q8_16 = [&](const unsigned char* row, std::uint32_t d8) {
     const uint2 packed =
         *reinterpret_cast<const uint2*>(row + kv_head * kHeadDim + d8);
-    const float block_d = __half2float(*reinterpret_cast<const __half*>(
+    const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
         row + kWmmaKvWidth +
-        (kv_head * (kHeadDim / 32) + (d8 >> 5)) * 2));
-    const auto* codes = reinterpret_cast<const signed char*>(&packed);
-    __half values[8];
-#pragma unroll
-    for (std::uint32_t j = 0; j < 8; ++j)
-      values[j] = static_cast<_Float16>(static_cast<float>(codes[j]) *
-                                        block_d);
+        (kv_head * (kHeadDim / 32) + (d8 >> 5)) * 2);
+    const __half2 scale2 =
+        __half2half2(__builtin_bit_cast(__half, scale_bits));
     uint4 out;
-    __builtin_memcpy(&out, values, 16);
+    CodesToHalves(packed.x ^ 0x80808080U, magic2, scale2, zero2,
+                  *reinterpret_cast<__half2*>(&out),
+                  *(reinterpret_cast<__half2*>(&out) + 1));
+    CodesToHalves(packed.y ^ 0x80808080U, magic2, scale2, zero2,
+                  *(reinterpret_cast<__half2*>(&out) + 2),
+                  *(reinterpret_cast<__half2*>(&out) + 3));
     return out;
   };
 
@@ -3950,7 +3971,6 @@ __device__ __forceinline__ std::uint32_t HeaderByte(const uint4& h,
 // compact rows [pad_bounds[e] + j*BN, +BN) and scatters them to
 // out[rows_out[c]][row] (F32, or F16 with the SwiGLU applied when `out_half`
 // is given: the up projection then writes the down projection's input).
-constexpr std::uint32_t kHalfMagic = 0x64646464U;  // 1024.0 high bytes
 
 /// block_q5_K: the Q4_K header, 32 high-bit bytes (bit s of byte j is the
 /// fifth bit of element j of K block s), then the Q4_K nibble layout.
@@ -4061,20 +4081,6 @@ __device__ __forceinline__ std::uint32_t SpreadHighBits(std::uint32_t bits) {
   // 0x00204081 = 1 + 2^7 + 2^14 + 2^21: bit b of `bits` lands at 8b, every
   // cross term falls off the 0x01010101 mask.
   return (__umul24(bits, 0x00204081U) & 0x01010101U) << 4U;
-}
-
-/// Four halves from four code bytes: 1024 + q as F16, minus `magic` (1024,
-/// or 1152 for a signed byte carried as q + 128), then the affine.
-__device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
-                                              __half2 magic, __half2 scale2,
-                                              __half2 bias2, __half2& lo,
-                                              __half2& hi) {
-  const std::uint32_t p0 =
-      __builtin_amdgcn_perm(codes, kHalfMagic, 0x01050004U);
-  const std::uint32_t p1 =
-      __builtin_amdgcn_perm(codes, kHalfMagic, 0x03070206U);
-  lo = __hfma2(__hadd2(__builtin_bit_cast(__half2, p0), magic), scale2, bias2);
-  hi = __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), scale2, bias2);
 }
 
 // Per-byte modular helpers (the CUDA __v* intrinsics are not in this TU's
@@ -5552,21 +5558,6 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             v[0] = lo;
             v[1] = hi;
           }
-          // Q8_0: each wave's 32 lanes hold one whole 32-element block per
-          // `c`, so the block |max| is a warp reduction. Keys quantize after
-          // RoPE replaced v[0]/v[1].
-          float q8_scale[8] = {};
-          float q8_id[8] = {};
-          if constexpr (kKvQ8) {
-            if (!query && !gate) {
-#pragma unroll
-              for (unsigned c = 0; c < 8; ++c) {
-                const float amax = WaveMax(fabsf(v[c]));
-                q8_scale[c] = amax / 127.0F;
-                q8_id[c] = amax > 0.0F ? 127.0F / amax : 0.0F;
-              }
-            }
-          }
 #pragma unroll
           for (unsigned c = 0; c < 8; ++c) {
             const unsigned col = c * 32 + lane_id;
@@ -5574,38 +5565,30 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               attention.query[tok * width + head * dim + col] = v[c];
             else if (gate)
               attention.gate[tok * width + head * dim + col] = v[c];
-            else if (key) {
-              if constexpr (kKvQ8) {
-                const std::size_t row_base =
-                    static_cast<std::size_t>(*attention.position + tok) *
-                    (kvwidth + kvwidth / 16);
-                auto* codes = static_cast<unsigned char*>(attention.keys) +
-                              row_base + head * dim;
-                codes[col] = static_cast<signed char>(
-                    __float2int_rn(v[c] * q8_id[c]));
-                if (lane_id == 0)
-                  *reinterpret_cast<__half*>(
-                      static_cast<unsigned char*>(attention.keys) + row_base +
-                      kvwidth + (head * 8 + c) * 2) =
-                      __float2half_rn(q8_scale[c]);
-              } else {
-                static_cast<__half*>(attention.keys)[std::size_t(
-                    *attention.position + tok) * kvwidth + head * dim + col] =
-                    __float2half_rn(v[c]);
-              }
-            } else if constexpr (kKvQ8) {
+            else if constexpr (kKvQ8) {
+              // Each wave's 32 lanes hold one whole 32-element block per `c`,
+              // so the block |max| is a warp reduction computed in the same
+              // iteration that stores the block (keys after RoPE replaced
+              // v[0]/v[1]).
+              void* const cache = key ? attention.keys : attention.values;
+              const float amax = WaveMax(fabsf(v[c]));
+              const float id = amax > 0.0F ? 127.0F / amax : 0.0F;
               const std::size_t row_base =
                   static_cast<std::size_t>(*attention.position + tok) *
                   (kvwidth + kvwidth / 16);
-              auto* codes = static_cast<unsigned char*>(attention.values) +
-                            row_base + head * dim;
-              codes[col] = static_cast<signed char>(
-                  __float2int_rn(v[c] * q8_id[c]));
+              auto* codes = static_cast<unsigned char*>(cache) + row_base +
+                            head * dim;
+              codes[col] =
+                  static_cast<signed char>(__float2int_rn(v[c] * id));
               if (lane_id == 0)
-                *reinterpret_cast<__half*>(
-                    static_cast<unsigned char*>(attention.values) + row_base +
-                    kvwidth + (head * 8 + c) * 2) =
-                    __float2half_rn(q8_scale[c]);
+                *reinterpret_cast<__half*>(static_cast<unsigned char*>(cache) +
+                                           row_base + kvwidth +
+                                           (head * 8 + c) * 2) =
+                    __float2half_rn(amax / 127.0F);
+            } else if (key) {
+              static_cast<__half*>(attention.keys)[std::size_t(
+                  *attention.position + tok) * kvwidth + head * dim + col] =
+                  __float2half_rn(v[c]);
             } else {
               static_cast<__half*>(attention.values)[std::size_t(
                   *attention.position + tok) * kvwidth + head * dim + col] =
