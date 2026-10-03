@@ -19,6 +19,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -34,6 +35,7 @@
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -946,7 +948,61 @@ const QwenTextRunnerState& RequireQwenState(const TextRunnerState& state) {
   return *qwen;
 }
 
-class QwenTextRunner final : public TextModelRunner {
+// Owns a four-byte device buffer and a private stream from load, so probing
+// a lost context needs no allocation. HIP context loss is sticky: after a GPU
+// reset even this memset fails with a hard error. Only such an error marks the
+// device lost; a memset still pending at the deadline may be queued behind
+// long kernels on the shared hardware queues, so it counts as usable.
+class HipTextModelRunner : public TextModelRunner {
+public:
+  HipTextModelRunner() {
+    HIP_CHECK(hipStreamCreateWithFlags(&probe_stream_, hipStreamNonBlocking));
+    if (const auto error = hipMalloc(&probe_buffer_, sizeof(std::uint32_t));
+        error != hipSuccess) {
+      hip::LogCleanupError(hipStreamDestroy(probe_stream_));
+      throw std::runtime_error(std::string("device probe allocation: ") +
+                               hipGetErrorString(error));
+    }
+  }
+  ~HipTextModelRunner() override {
+    hip::LogCleanupError(hipFree(probe_buffer_));
+    hip::LogCleanupError(hipStreamDestroy(probe_stream_));
+  }
+  HipTextModelRunner(const HipTextModelRunner&) = delete;
+  HipTextModelRunner& operator=(const HipTextModelRunner&) = delete;
+  HipTextModelRunner(HipTextModelRunner&&) = delete;
+  HipTextModelRunner& operator=(HipTextModelRunner&&) = delete;
+
+  [[nodiscard]] bool DeviceUsable() const override {
+    constexpr auto kTimeout = std::chrono::seconds(5);
+    // Clear the error the failed work unit left on this thread.
+    (void)hipGetLastError();
+    if (hipMemsetAsync(probe_buffer_, 0, sizeof(std::uint32_t),
+                       probe_stream_) != hipSuccess ||
+        hipGetLastError() != hipSuccess)
+      return false;
+    const auto deadline = Clock::now() + kTimeout;
+    for (;;) {
+      const auto status = hipStreamQuery(probe_stream_);
+      if (status == hipSuccess)
+        return true;
+      if (status != hipErrorNotReady)
+        return false;
+      if (Clock::now() >= deadline) {
+        Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
+                                      std::to_string(kTimeout.count()));
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+private:
+  hipStream_t probe_stream_{};
+  void* probe_buffer_{};
+};
+
+class QwenTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
@@ -1020,14 +1076,18 @@ public:
     // they are carved from the same RAM as every host allocation, and HIP's
     // free figure does not see host pressure. Cap them by the host budget too.
     std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
-    if (capacity.has_value())
+    std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
+    if (capacity.has_value()) {
       snapshot_capacity = std::min(snapshot_capacity, *capacity);
+      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
+    }
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
         .retained_snapshot_capacity_bytes = snapshot_capacity,
+        .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
     };
   }
@@ -1700,7 +1760,7 @@ const DeepSeekTextRunnerState& RequireDeepSeekState(
   return *deepseek;
 }
 
-class DeepSeekTextRunner final : public TextModelRunner {
+class DeepSeekTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kDeepSeek;
@@ -1764,6 +1824,7 @@ public:
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2467,7 +2528,7 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
   return *qfn;
 }
 
-class QwenFlashNextTextRunner final : public TextModelRunner {
+class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
@@ -2534,6 +2595,7 @@ public:
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -4317,6 +4379,15 @@ bool InferenceBackend::ready() const {
 #endif
 }
 
+bool InferenceBackend::device_lost() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->scheduler->device_lost();
+#else
+  return false;
+#endif
+}
+
 bool InferenceBackend::supports_images() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -4332,6 +4403,17 @@ std::uint32_t InferenceBackend::max_context() const {
   return state != nullptr ? state->max_context : 0;
 #else
   return 0;
+#endif
+}
+
+std::vector<InferenceBackend::SessionState> InferenceBackend::session_states()
+    const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->scheduler->SessionStates()
+                          : std::vector<SessionState>{};
+#else
+  return {};
 #endif
 }
 
