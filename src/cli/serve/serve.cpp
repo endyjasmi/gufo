@@ -579,11 +579,11 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::size_t cache_ram_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
-    std::size_t cache_ram_bytes = 0;
     bool log_progress = false;
 
     gufo::cli::ArgParser parser(
@@ -675,6 +675,10 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    parser.AddOption(
+        "", "--cache-ram-bytes", "N",
+        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
+        "Cache", &cache_ram_bytes);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
@@ -686,11 +690,6 @@ void PrintServeHelp(std::string_view program_name,
                      "RAM limit for queued snapshots and each disk read "
                      "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
                      "Cache", &cache_disk_staging_bytes);
-    parser.AddOption("", "--cache-ram-bytes", "N",
-                     "RAM budget for retained continuation snapshots, about "
-                     "26 KiB per context token per session (default: 0 = "
-                     "auto, half of available RAM)",
-                     "Cache", &cache_ram_bytes);
     parser.AddFlag("", "--log-progress",
                    "Log live prefill and decode progress (needs "
                    "--log-level=info or debug)",
@@ -1112,11 +1111,11 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::size_t cache_ram_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
-    std::size_t cache_ram_bytes = 0;
     bool log_progress = false;
 
     gufo::cli::ArgParser llm_parser(
@@ -1204,6 +1203,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddOption(
+        "", "--cache-ram-bytes", "N",
+        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
+        "Cache", &cache_ram_bytes);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
@@ -1216,11 +1219,6 @@ int RunServe(std::span<const char* const> args) {
         "RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
-    llm_parser.AddOption("", "--cache-ram-bytes", "N",
-                         "RAM budget for retained continuation snapshots, "
-                         "about 26 KiB per context token per session "
-                         "(default: 0 = auto, half of available RAM)",
-                         "Cache", &cache_ram_bytes);
     llm_parser.AddFlag("", "--log-progress",
                        "Log live prefill and decode progress (needs "
                        "--log-level=info or debug)",
@@ -1354,7 +1352,9 @@ int RunServe(std::span<const char* const> args) {
                            .retained_snapshot_capacity_bytes = cache_ram_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path)) {
+                       vision_model_path,
+                       server::TextRunnerRamCacheOptions{
+                           .capacity_bytes = cache_ram_bytes})) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

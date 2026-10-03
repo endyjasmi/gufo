@@ -64,7 +64,10 @@ draft limit for this suite. Audio and image/video generation have separate tests
 | `progress` | Opt-in progress on all text endpoints; output/sampling equality, limits, stops, images, batching and cancel/resume |
 | `long-context` | Longer multi-turn recall, endpoint switching, sampled JSON and cancellation |
 | `metrics` | Live Prometheus counters, uncached work, endpoint totals, queueing and cancellation |
-| `cache` | Interrupted text/thinking/tool/image histories, ordinary and legacy tool names, RAM and disk restart |
+| `cache` | Interrupted text/thinking/tool/image histories, ordinary and legacy tool names, RAM and disk restart; disk checkpoint spacing for a growing conversation and a branch restored after restart |
+| `cache-edits` | Reuse earlier work after editing the latest message, shortening an older tool result, or editing an earlier user message and dropping later turns; compare with uncached responses |
+| `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, and compare with uncached responses |
+| `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 
 For `discovery` (also included in `all`), pass `--expected-input-modalities text` or `text,image` before
 the server command. Projectors can load automatically beside the weights, so
@@ -75,7 +78,8 @@ small fixed images and is included in `all` only when `--mmproj` is supplied.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
-uses its own 8 GiB disk budget and 1 GiB staging area inside the output directory.
+uses its own 8 GiB disk budget and 1 GiB staging area inside the output directory;
+the runner removes that disk cache when the run ends, keeping reports and logs.
 For timing controls on revisions predating progress, use `--allow-missing-progress`
 with `--record-baseline`. Candidate qualification always requires progress events.
 Model runs stay outside hosted CI; CI checks the runner and measurement logic.
@@ -91,6 +95,21 @@ retains Pi sessions, HTTP/SSE and per-request timings. It executes generated
 commands in disposable fixtures using isolated Pi configuration. Use `--passes 1`
 for a focused check; the default five passes matches the reported debug workload.
 `--conversation --context-file FILE` additionally tests retained long history.
+
+Cache checks use real assistant replies and run cold controls after the warm
+history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
+latest-message edits, shortened tool results and rewinds. `cache-growth` checks
+omitted, preserved and explicitly discarded reasoning, plus thinking off.
+`cache-rotation` visits four conversations and eight small side requests; use
+`--sessions 1` to verify retention is independent of execution slots. It also
+checks the startup RAM cap; byte/record pressure is covered by CPU tests.
+
+Unchanged retries must reproduce the complete output with zero prefill. After a
+restart, disk restores may re-prefill less than one 2048-token disk step;
+greedy and zero-prefill restores must still reproduce their output. Edited
+histories must retain a useful earlier prefix and match their cold answer;
+free-form reasoning may vary with prefill chunk shapes. Use the recorded
+requests and phase timings to investigate failures, not a full model sweep.
 
 Every request checks its applicable response format, expected output and timings.
 Missing measurements fail. `comparison.json` reports per-request prefill, decode,

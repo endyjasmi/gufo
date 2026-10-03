@@ -24,6 +24,9 @@ from progress import ProgressTrace
 from tool_reasoning import ARGUMENTS, assert_edit
 from discovery import assert_model_listing
 from image_inputs import assert_color, image_cases, invalid_image_cases
+from cache_disk_spacing import check_disk_spacing
+from cache_growth import check_cache_growth
+from cache_rotation import check_cache_rotation, check_snapshot_budget, host_available_bytes
 from server_metrics import (COUNTERS, TYPES, PROMPT, GENERATED, PROCESSING,
                             parse_metrics, assert_accounting, validate_metrics_report)
 
@@ -184,6 +187,162 @@ class FunctionalRunnerTest(unittest.TestCase):
                     "index": 0, "endpoint": endpoint, "request_id": "r1",
                     "output_sha256": "probe", "wall_ms": 1, "metrics": {}}]}))
                 join_server_timings(root)
+
+    def test_cache_rotation_checks_host_headroom_and_requested_limits(self):
+        gib = 1024**3
+        def log(capacity, sessions=1, entries=128):
+            return (f"event=snapshot_cache_configured sessions={sessions} "
+                    f"snapshot_entries={entries} capacity_bytes={capacity}\n")
+        self.assertEqual(host_available_bytes("MemTotal: 9 kB\nMemAvailable: 4096 kB\n"),
+                         4096 * 1024)
+        for invalid in ("", "MemAvailable: 0 kB\n", "MemAvailable: invalid kB\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                host_available_bytes(invalid)
+        for available, requested, capacity in (
+            (44 * gib, 0, 22 * gib), (128 * gib, 0, 32 * gib),
+            (44 * gib, 20 * gib, 20 * gib), (44 * gib, 64 * gib, 22 * gib),
+            (128 * gib, 48 * gib, 48 * gib),
+        ):
+            result = check_snapshot_budget(log(capacity), available, requested, 1)
+            self.assertEqual(result["capacity_bytes"], capacity)
+        for output, available, requested in (
+            (log(32 * gib), 44 * gib, 0),  # A fixed cap can exceed host headroom.
+            (log(64 * gib), 44 * gib, 64 * gib),  # Overrides cannot bypass it.
+            (log(48 * gib), 128 * gib, 0), (log(21 * gib), 44 * gib, 20 * gib),
+            (log(0), 44 * gib, 0), (log(20 * gib, sessions=4), 44 * gib, 0),
+            (log(20 * gib, entries=8), 44 * gib, 0), ("", 44 * gib, 0),
+            (log(20 * gib) * 2, 44 * gib, 0),
+        ):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                check_snapshot_budget(output, available, requested, 1)
+
+    def test_disk_spacing_checks_drained_logs(self):
+        def event(tokens, reason="saved"):
+            action = "stored" if reason == "saved" else "skipped"
+            return (f"[cache] event=disk_cache action={action} reason={reason} "
+                    f"file_bytes=1 payload_bytes=1 tokens={tokens} retained_bytes=1\n")
+        totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
+        report = {"turns": [{"measured": {"total": total}} for total in totals]}
+        skips = "".join(event(total, "min_step") for total in totals[1:5] + totals[6:])
+        grown = event(310) + event(2396) + skips + event(5956)
+        restored = event(3012)
+        summary = check_disk_spacing(grown, restored, report)
+        self.assertEqual(summary["stored_tokens"], [2396, 5956])
+        self.assertEqual(summary["shared_boundary_tokens"], [3012])
+        for label, grown_log, restored_log in (
+            ("every turn written", grown + event(2700), restored),
+            ("long turn missing", event(2396) + skips, restored),
+            ("first turn missing", skips + event(5956), restored),
+            ("no skips", event(2396) + event(5956), restored),
+            ("shared boundary skipped", grown, event(3012, "min_step")),
+        ):
+            with self.subTest(label), self.assertRaises(ValueError):
+                check_disk_spacing(grown_log, restored_log, report)
+
+    def run_cache_rotation(self, lost=False, contaminated=False):
+        requests, checks, previous = [], {}, {}
+
+        def chat_result(client, body):
+            requests.append(json.loads(json.dumps(body)))
+            label = body["messages"][0]["content"].splitlines()[0]
+            side = "_side_" in label
+            total = (64 if side else 12000 if label.endswith("main") else 3000) \
+                + (len(body["messages"]) - 2) * 100
+            cold = body.get("extra_body", {}).get("cache_prompt") is False
+            cached = 0 if cold or lost else max(0, previous.get(label, 0) - 5)
+            previous[label] = total
+            code = "ALPHA" if side else "BETA" if label.endswith("main") \
+                else label.rsplit("_", 1)[-1]
+            if contaminated and cached:
+                code = "WRONG"
+            return {"text": code, "reasoning": "", "tools": [], "finish": "stop",
+                    "usage": {"prompt_tokens": total, "cached_tokens": cached,
+                              "completion_tokens": 2,
+                              "gufo": {"prefill_tokens": total - cached}}}
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            check_cache_rotation(None, "fixture", checks, chat_result)
+        return requests, checks
+
+    def test_cache_rotation_delays_controls_and_replays_actual_answers(self):
+        requests, checks = self.run_cache_rotation()
+        self.assertEqual(len(checks), 27)
+        self.assertEqual([body["messages"][0]["content"].splitlines()[0]
+                          for body in requests[:4]],
+                         ["cache_rotation_" + code for code in ("RED", "GREEN", "BLUE", "GOLD")])
+        self.assertTrue(all(body.get("extra_body", {}).get("cache_prompt") is False
+                            for body in requests[-5:]))
+        for warm, cold in zip([requests[21], *requests[8:12]], requests[-5:]):
+            self.assertEqual(warm["messages"], cold["messages"])
+        for body in requests[4:12]:
+            code = body["messages"][0]["content"].splitlines()[0].rsplit("_", 1)[-1]
+            self.assertTrue(all(message["content"] == code for message in body["messages"]
+                                if message["role"] == "assistant"))
+
+    def test_cache_rotation_rejects_lost_history(self):
+        with self.assertRaisesRegex(AssertionError, "lost its checkpoint"):
+            self.run_cache_rotation(lost=True)
+
+    def test_cache_rotation_rejects_cross_conversation_answers(self):
+        with self.assertRaises(AssertionError):
+            self.run_cache_rotation(contaminated=True)
+
+    def run_cache_growth(self, pinned=False, missing_reasoning=False):
+        requests, checks, previous = [], {}, {}
+
+        def chat_result(client, body):
+            # Model-independent checks of request ordering and failure reporting.
+            requests.append(json.loads(json.dumps(body)))
+            label = body["messages"][0]["content"].splitlines()[0]
+            total = 3000 + (len(body["messages"]) - 2) * 100
+            last = previous.get(label, 0)
+            if body["extra_body"].get("cache_prompt") is False:
+                cached = 0
+            elif total == last:
+                cached = total
+            else:
+                cached = 2995 if pinned and "drop_reasoning" in label else last - 5
+            previous[label] = total
+            return {"text": "BETA", "reasoning": "The code word is BETA."
+                    if body["reasoning_effort"] == "low" and not missing_reasoning else "",
+                    "tools": [], "finish": "stop", "usage": {
+                        "prompt_tokens": total, "cached_tokens": cached,
+                        "completion_tokens": 8,
+                        "gufo": {"prefill_tokens": total - cached}}}
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            check_cache_growth(None, "fixture", checks, chat_result)
+        return requests, checks
+
+    def test_cache_growth_uses_real_replay_shapes_and_delays_cold_controls(self):
+        requests, checks = self.run_cache_growth()
+        self.assertEqual(len(checks), 36)
+        for offset, replay in enumerate(("drop_reasoning", "keep_reasoning",
+                                        "discard_reasoning", "thinking_off")):
+            history = requests[offset * 9:(offset + 1) * 9]
+            self.assertEqual([len(body["messages"]) for body in history[:4]], [2, 4, 6, 8])
+            self.assertIs(history[0]["extra_body"]["cache_prompt"], False)
+            self.assertTrue(all("cache_prompt" not in body["extra_body"]
+                                for body in history[1:5]))
+            self.assertTrue(all(body["extra_body"]["cache_prompt"] is False
+                                for body in history[5:]))
+            self.assertEqual(history[4]["messages"], history[3]["messages"])
+            self.assertIs(history[0]["extra_body"]["chat_template_kwargs"]["preserve_thinking"],
+                          replay != "discard_reasoning")
+            for warm, cold in zip(history[:4], history[5:]):
+                self.assertEqual(warm["messages"], cold["messages"])
+            for message in history[3]["messages"]:
+                if message["role"] == "assistant":
+                    self.assertEqual("reasoning_content" in message,
+                                     replay in ("keep_reasoning", "discard_reasoning"))
+
+    def test_cache_growth_rejects_a_frozen_checkpoint(self):
+        with self.assertRaisesRegex(AssertionError, "cache did not advance"):
+            self.run_cache_growth(pinned=True)
+
+    def test_cache_growth_requires_actual_reasoning(self):
+        with self.assertRaises(AssertionError):
+            self.run_cache_growth(missing_reasoning=True)
 
     def test_prompt_progress_contract_and_output_order(self):
         def event(processed, elapsed=0):
@@ -725,6 +884,48 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
                 report = json.loads((root / "report/report.json").read_text())
                 self.assertEqual(report["status"], expected)
                 self.assertEqual(status, 0 if expected == "passed" else 1)
+
+    def test_disk_cache_is_removed_after_restart_checks(self):
+        for exit_code in (0, 7):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                # Stands in for the server filling its runner-owned disk cache.
+                child = f'''
+import json, sys
+from pathlib import Path
+output = Path(sys.argv[sys.argv.index("--output") + 1])
+(output.parent / "disk").mkdir(exist_ok=True)
+(output.parent / "disk" / "entry.kvc").write_bytes(b"x")
+output.write_text(json.dumps([{{"exact": True}}]))
+output.with_suffix(".requests.json").write_text(json.dumps({{"version": 1, "requests": [{{
+    "status": "complete", "wall_ms": 1, "endpoint": "/v1/chat/completions",
+    "request_sha256": "fixture"}}]}}))
+sys.exit({exit_code})
+'''
+                for script in ("continuation.py", "cache_disk_spacing.py"):
+                    (root / script).write_text(child)
+
+                def server(command, log, timeout):
+                    log.touch()
+                    return contextlib.nullcontext()
+
+                args = ["run.py", "--record-baseline", "--output", str(root / "report"),
+                        "--sampling-preset", "qwen38", "--suite", "cache", "--",
+                        sys.executable, "serve", "llm", "--model", "fixture.gguf"]
+                with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
+                     patch.object(functional, "server", side_effect=server), \
+                     patch.object(sys.modules["cache_disk_spacing"], "check_disk_spacing",
+                                  return_value={}), \
+                     patch.object(functional, "provenance", return_value={}), \
+                     patch.object(functional, "join_server_timings"), \
+                     patch.object(functional, "execution_coverage", return_value={}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    functional.main()
+                report = json.loads((root / "report/report.json").read_text())
+                self.assertEqual(report["status"], "failed" if exit_code else "passed", report)
+                self.assertIn("--cache-disk", report["command"])
+                self.assertFalse((root / "report/disk").exists())
+                self.assertTrue((root / "report/text-cancel.json").is_file())
 
     def test_server_is_reaped_on_startup_timeout_and_test_failure(self):
         with tempfile.TemporaryDirectory() as directory:

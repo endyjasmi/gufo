@@ -87,7 +87,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
-            const std::string& vision_model_path = {});
+            const std::string& vision_model_path = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -96,7 +97,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
@@ -105,7 +107,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
@@ -116,15 +119,17 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
   /// Installs a previously loaded Ornith model with request-owned sessions.
   bool load(std::shared_ptr<models::qwen35moe::Model> model, std::string* error,
-            std::uint32_t max_context = 0, std::size_t session_count = 1,
+            std::uint32_t max_context, std::size_t session_count,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.

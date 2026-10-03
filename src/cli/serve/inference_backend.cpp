@@ -405,6 +405,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v3\n"
+           // Older learned boundaries could keep logits from an earlier
+           // prefix. Their payload has no readiness tag to distinguish them.
+           << "checkpoint_frontier=complete-prefix-v1\n"
            << "numerics=qwen-bf16-fp32-prefill-v1\n"
            << "rmsnorm=fused-square-sum-v1\n"
            << "prefill_attention=visible-causal-tail-v1\n"
@@ -1013,12 +1016,18 @@ public:
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
+    // Snapshot buffers are device allocations, but on a unified-memory APU
+    // they are carved from the same RAM as every host allocation, and HIP's
+    // free figure does not see host pressure. Cap them by the host budget too.
+    std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
+    if (capacity.has_value())
+      snapshot_capacity = std::min(snapshot_capacity, *capacity);
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
-        .retained_snapshot_capacity_bytes = capacity,
+        .retained_snapshot_capacity_bytes = snapshot_capacity,
         .requires_device_runtime_lock = true,
     };
   }
@@ -3585,7 +3594,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path) {
+                            const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3662,7 +3672,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     TextSpeculativeConfig resolved_speculative_config = speculative_config;
@@ -3831,7 +3841,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3863,7 +3873,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config));
+              std::move(resolved_disk_cache_config), ram_cache_config);
 #else
   (void)model_path;
   (void)max_context;
@@ -3873,6 +3883,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)ram_cache_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3885,7 +3896,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -4007,7 +4019,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
-        RetainedSnapshotOverrideBytes(disk_cache_config));
+        RetainedSnapshotOverrideBytes(disk_cache_config), ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4026,7 +4038,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -4093,7 +4106,7 @@ bool InferenceBackend::load(
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
-        RetainedSnapshotOverrideBytes(disk_cache_config));
+        RetainedSnapshotOverrideBytes(disk_cache_config), ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4112,7 +4125,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -4178,7 +4192,7 @@ bool InferenceBackend::load(
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
-        RetainedSnapshotOverrideBytes(disk_cache_config));
+        RetainedSnapshotOverrideBytes(disk_cache_config), ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4200,7 +4214,8 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Ornith-1.5-35B model must not be null");
     return false;
@@ -4270,7 +4285,7 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
-        RetainedSnapshotOverrideBytes(disk_cache_config));
+        RetainedSnapshotOverrideBytes(disk_cache_config), ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
