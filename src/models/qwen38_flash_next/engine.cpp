@@ -1147,10 +1147,17 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
+  // Mirror the single-session gate: seeded requests replay their exact widths
+  // across restores, sampled requests keep the acceptance-history policy, and
+  // penalty-greedy requests verify through the penalty-aware path whose costs
+  // the controller does not measure. None may observe into or feed the
+  // live-timing batch controller.
   if (std::ranges::all_of(
           requests, [](const auto& r) { return r.session->MtpEnabled(); }) &&
       std::ranges::none_of(requests, [](const auto& request) {
-        return request.sampler->config().uses_random_sampling();
+        const auto& config = request.sampler->config();
+        return config.seed >= 0 || config.uses_random_sampling() ||
+               config.penalties_enabled();
       })) {
     std::array<MtpBatchController::Row, 8> rows{};
     for (std::size_t i = 0; i < requests.size(); ++i) {
