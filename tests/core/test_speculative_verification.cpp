@@ -730,8 +730,10 @@ void TestSampledSpeculationMatchesTargetDistribution() {
     const TokenId current = verifier.Prime(prompt);
     std::vector<TokenId> sequence = {prompt.front(), current};
     std::uint64_t rng_state = seed;
-    const auto result =
-        verifier.VerifyStep(sequence, 1, current, 99, 2, 1.0F, &rng_state);
+    gufo::sampling::SamplingConfig sampling_config;
+    sampling_config.temperature = 1.0F;
+    const auto result = verifier.VerifyStep(sequence, 1, current, 99, 2,
+                                            sampling_config, &rng_state);
     Expect(!result.emitted_tokens.empty(),
            "sampled speculation emits a target-distributed token");
     second_token_count += result.emitted_tokens.front() == 2 ? 1 : 0;
@@ -909,7 +911,10 @@ void TestMalformedProposalDoesNotAdvanceTarget() {
     std::uint64_t rng = 42;
     bool rejected = false;
     try {
-      (void)verifier.VerifyStep(sequence, 1, current, 99, 3, 1.0F, &rng);
+      gufo::sampling::SamplingConfig sampling_config;
+      sampling_config.temperature = 1.0F;
+      (void)verifier.VerifyStep(sequence, 1, current, 99, 3, sampling_config,
+                                &rng);
     } catch (const std::runtime_error&) {
       rejected = true;
     }
@@ -954,8 +959,10 @@ void TestStopAndBudgetKeepExactFrontier() {
     const auto current = verifier.Prime(prompt);
     std::vector<TokenId> sequence{0, current};
     std::uint64_t rng = 42;
+    gufo::sampling::SamplingConfig sampling_config;
+    sampling_config.temperature = 1.0F;
     const auto result =
-        verifier.VerifyStep(sequence, 1, current, 2, 3, 1.0F, &rng);
+        verifier.VerifyStep(sequence, 1, current, 2, 3, sampling_config, &rng);
     Expect(result.emitted_tokens == std::vector<TokenId>({2}) &&
                result.next_token == 2 && result.hit_eos &&
                target.StateSize() == 2,

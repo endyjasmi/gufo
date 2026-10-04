@@ -335,7 +335,8 @@ public:
                         std::uint32_t cur_pos,
                         tokenization::TokenId current_token,
                         tokenization::TokenId eos_id,
-                        std::uint32_t max_emitted_tokens, float temperature,
+                        std::uint32_t max_emitted_tokens,
+                        const sampling::SamplingConfig& sampling_config,
                         std::uint64_t* rng_state);
   StepResult VerifyStep(std::span<const tokenization::TokenId> current_sequence,
                         std::uint32_t cur_pos,
@@ -374,6 +375,9 @@ private:
   void PrepareProposalVerification(PreparedStep& prepared,
                                    const StepRequest& request,
                                    bool defer_target_only);
+  static void ValidateProposalShape(const DraftProposal& proposal,
+                                    std::size_t max_draft_tokens,
+                                    std::uint32_t position);
   [[nodiscard]] std::optional<StepResult> ProcessVerificationChunk(
       PreparedStep& prepared, VerificationChunkResult verification,
       sampling::SamplerState& sampler);

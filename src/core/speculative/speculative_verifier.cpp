@@ -351,26 +351,23 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id,
     std::uint32_t max_emitted_tokens) {
+  const sampling::SamplingConfig config;
   return VerifyStep(current_sequence, cur_pos, current_token, eos_id,
-                    max_emitted_tokens, 0.0F, nullptr);
+                    max_emitted_tokens, config, nullptr);
 }
 
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id,
-    std::uint32_t max_emitted_tokens, float temperature,
-    std::uint64_t* rng_state) {
-  if (!std::isfinite(temperature) || temperature < 0.0F) {
-    throw std::invalid_argument(
-        "speculative temperature must be finite and nonnegative");
-  }
-  if (temperature > 0.0F && rng_state == nullptr) {
+    std::uint32_t max_emitted_tokens,
+    const sampling::SamplingConfig& sampling_config, std::uint64_t* rng_state) {
+  // The caller's whole configuration applies: dropping filters or penalties
+  // here would sample from a wider distribution than the request asked for.
+  sampling_config.Validate();
+  if (sampling_config.temperature > 0.0F && rng_state == nullptr) {
     throw std::invalid_argument("sampled speculation requires RNG state");
   }
-  sampling::SamplingConfig config;
-  config.temperature = temperature;
-  config.seed = 0;
-  sampling::SamplerState sampler(config, current_sequence);
+  sampling::SamplerState sampler(sampling_config, current_sequence);
   if (rng_state != nullptr) {
     sampler.SetRngState(*rng_state);
   }
@@ -502,6 +499,18 @@ void SpeculativeVerifier::PrepareTargetOnlyStep(PreparedStep& prepared,
   };
 }
 
+void SpeculativeVerifier::ValidateProposalShape(const DraftProposal& proposal,
+                                                std::size_t max_draft_tokens,
+                                                std::uint32_t position) {
+  // Both verification paths run against this contract: a backend that returns
+  // a misplaced or oversized proposal must fail loudly, not verify at wrong
+  // positions.
+  if (proposal.tokens.size() > max_draft_tokens ||
+      proposal.start_pos != position) {
+    throw std::runtime_error("draft backend returned a malformed proposal");
+  }
+}
+
 void SpeculativeVerifier::PrepareProposalVerification(
     PreparedStep& prepared, const StepRequest& request,
     bool defer_target_only) {
@@ -510,11 +519,8 @@ void SpeculativeVerifier::PrepareProposalVerification(
     PrepareTargetOnlyStep(prepared, request, defer_target_only);
     return;
   }
+  ValidateProposalShape(proposal, prepared.max_draft_tokens, request.position);
   const std::size_t num_draft = proposal.tokens.size();
-  if (num_draft > prepared.max_draft_tokens ||
-      proposal.start_pos != request.position) {
-    throw std::runtime_error("draft backend returned a malformed proposal");
-  }
   const bool random_sampling = prepared.random_sampling;
   if (random_sampling && (proposal.candidates_per_token == 0 ||
                           proposal.candidates_per_token >
@@ -984,6 +990,9 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   }
 
   const std::size_t num_draft = proposal.tokens.size();
+  // The sequential path derives positions from cur_pos, so a misplaced or
+  // oversized proposal must be rejected exactly like the batched one.
+  ValidateProposalShape(proposal, max_draft_tokens, cur_pos);
   const bool capture_target_hidden =
       draft_backend_->RequiresTargetHiddenStates();
   std::size_t accepted_count = 0;
