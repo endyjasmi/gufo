@@ -243,7 +243,12 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     overlapped.OffsetHigh = static_cast<DWORD>((begin + got) >> 32);
     overlapped.hEvent = io_event;
     // The handle is asynchronous; submit and wait per segment. Each worker
-    // holds its own event, so concurrent reads stay independent.
+    // holds its own event, so concurrent reads stay independent. The event
+    // must be nonsignaled before submit: the short-read retry reuses the
+    // slot event left signaled by the completed pipelined read, and a stale
+    // signal releases the blocking wait below while this I/O is still
+    // pending (ERROR_IO_INCOMPLETE fails the whole gather).
+    ResetEvent(io_event);
     const bool submitted =
         ReadFile(static_cast<HANDLE>(file_handle_), base + got,
                  static_cast<DWORD>(length - got), nullptr, &overlapped) ||
