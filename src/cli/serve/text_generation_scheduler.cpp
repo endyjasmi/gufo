@@ -1379,7 +1379,13 @@ struct TextGenerationScheduler::Impl {
       item.request->result.physical_execution_width = std::max(
           item.request->result.physical_execution_width, plan.physical_width);
       item.request->result.execution_plan = execution_plan;
-      FinishAdvanced(item.request, item.decode_start);
+      try {
+        FinishAdvanced(item.request, item.decode_start);
+      } catch (...) {
+        // Run is noexcept: completion can throw (backpressure, token decode)
+        // and must fail this request instead of terminating the scheduler.
+        CompleteFailure(item.request, std::current_exception());
+      }
     }
   }
 
@@ -1501,19 +1507,26 @@ struct TextGenerationScheduler::Impl {
         CompleteFailure(item.request, std::current_exception());
         continue;
       }
-      for (const auto& selection : step.selections) {
-        if (!PublishDecodedSelection(item.request, selection)) {
-          published = false;
-          break;
+      try {
+        for (const auto& selection : step.selections) {
+          if (!PublishDecodedSelection(item.request, selection)) {
+            published = false;
+            break;
+          }
+          if (item.request->stop_filter.stopped())
+            break;
         }
-        if (item.request->stop_filter.stopped())
-          break;
+        item.request->result.decode_ms +=
+            std::chrono::duration<double, std::milli>(Clock::now() -
+                                                      item.decode_start)
+                .count();
+        LogDecodeProgress(item.request);
+      } catch (...) {
+        // Run is noexcept: publishing allocates and completion inside
+        // PublishSelection can throw, so fail the request, not the scheduler.
+        CompleteFailure(item.request, std::current_exception());
+        continue;
       }
-      item.request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() -
-                                                    item.decode_start)
-              .count();
-      LogDecodeProgress(item.request);
       if (!published || IsTerminal(item.request)) {
         continue;
       }
@@ -1656,17 +1669,26 @@ struct TextGenerationScheduler::Impl {
 
       const bool due_decoder = HasDueDecoder(decoding);
       const std::size_t resident_count = prefilling.size() + decoding.size();
-      const bool preparing_multi_token_batch =
+      bool preparing_multi_token_batch =
           multi_token_decode && resident_count > 1 && !prefilling.empty() &&
           runner_pool->SelectDecodePlan(resident_count).kind ==
               TextExecutionPlanKind::kBatched;
       if (preparing_multi_token_batch) {
-        for (const auto& pending : prefilling) {
-          pending->runner_request.PrepareBatchExecution();
-        }
-        for (const auto& ready : decoding) {
-          ready->runner_request.PrepareBatchExecution();
-        }
+        // Shaping batch scratch is an optimization. A failed reshape must not
+        // escape this noexcept thread: fall back to the serial paths for this
+        // iteration and let the next one retry the batch.
+        const auto prepare_batch = [&](auto& queue) {
+          for (const auto& request : queue) {
+            try {
+              request->runner_request.PrepareBatchExecution();
+            } catch (...) {
+              return false;
+            }
+          }
+          return true;
+        };
+        preparing_multi_token_batch =
+            prepare_batch(prefilling) && prepare_batch(decoding);
       }
       // Give simultaneous new requests one bounded chunk to form their first
       // batch. Once decoding starts, every due decoder runs before more
