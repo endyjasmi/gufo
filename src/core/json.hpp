@@ -177,13 +177,22 @@ public:
 
   std::string dump() const {
     std::ostringstream o;
-    dump_to(o);
+    dump_to(o, false);
+    return o.str();
+  }
+
+  /// Jinja's `tojson` spelling, as Python's json.dumps(ensure_ascii=False)
+  /// writes it: ", " between items and ": " after keys. Chat templates render
+  /// non-string tool arguments this way, so models generate it.
+  std::string tojson() const {
+    std::ostringstream o;
+    dump_to(o, true);
     return o.str();
   }
 
 private:
   // NOLINTNEXTLINE(misc-no-recursion)
-  void dump_to(std::ostream& os) const {
+  void dump_to(std::ostream& os, bool spaced) const {
     switch (type_) {
       case Type::kNull:
         os << "null";
@@ -211,8 +220,8 @@ private:
         os << '[';
         for (std::size_t i = 0; i < arr_.size(); ++i) {
           if (i)
-            os << ',';
-          arr_[i].dump_to(os);
+            os << (spaced ? ", " : ",");
+          arr_[i].dump_to(os, spaced);
         }
         os << ']';
         break;
@@ -221,9 +230,9 @@ private:
         os << '{';
         for (std::size_t i = 0; i < obj_.size(); ++i) {
           if (i)
-            os << ',';
-          os << '"' << escape(obj_[i].first) << "\":";
-          obj_[i].second.dump_to(os);
+            os << (spaced ? ", " : ",");
+          os << '"' << escape(obj_[i].first) << (spaced ? "\": " : "\":");
+          obj_[i].second.dump_to(os, spaced);
         }
         os << '}';
         break;

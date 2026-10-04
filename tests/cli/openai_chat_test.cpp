@@ -35,24 +35,34 @@ public:
   using Backend = gufo::server::TextGenerationBackend;
 
   ProgressRequest(std::shared_ptr<GenerationRequest> inner,
-                  std::vector<Backend::PromptProgress> progress)
-      : inner_(std::move(inner)), progress_(std::move(progress)) {}
+                  std::vector<Backend::PromptProgress> progress,
+                  std::optional<gufo::sampling::JsonConstraint::ToolFormat>
+                      tool_format = {})
+      : inner_(std::move(inner)),
+        progress_(std::move(progress)),
+        tool_format_(tool_format) {}
 
   Backend::Result Wait(const Backend::TokenCallback& on_token,
-                       const Backend::ProgressCallback& on_progress) override {
+                       const Backend::ProgressCallback& on_progress,
+                       const Backend::StartCallback& on_start) override {
     for (const auto& value : progress_) {
       if (on_progress && !on_progress(value)) {
         inner_->Cancel();
         break;
       }
     }
-    return inner_->Wait(on_token, on_progress);
+    return inner_->Wait(on_token, on_progress, on_start);
   }
   void Cancel() noexcept override { inner_->Cancel(); }
+  std::optional<gufo::sampling::JsonConstraint::ToolFormat> ToolFormat()
+      const override {
+    return tool_format_;
+  }
 
 private:
   std::shared_ptr<GenerationRequest> inner_;
   std::vector<Backend::PromptProgress> progress_;
+  const std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format_;
 };
 
 class FakeBackend final : public gufo::server::TextGenerationBackend {
@@ -153,7 +163,7 @@ public:
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_chat(request, max_tokens, sampling,
                                           is_cancelled, stream_output),
-        progress);
+        progress, tool_format);
   }
 
   [[nodiscard]] std::size_t count_tokens(std::string_view text) const override {
@@ -175,6 +185,7 @@ public:
 
   std::vector<std::string> pieces;
   std::vector<PromptProgress> progress;
+  std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format;
   std::string cache_miss_reason;
   FinishReason finish_reason{FinishReason::kStop};
   std::string stop_sequence;
@@ -711,6 +722,29 @@ void TestToolNameCharacters() {
                message.tool_calls[0].arguments[0].value == "a.txt",
            "Responses preserves the same historical names and arguments");
   }
+}
+
+// Chat templates render typed arguments with Jinja tojson, so the model
+// generates that spelling. Replayed history must render it the same way, or
+// the next turn re-prefills the call it generated.
+void TestHistoricalTypedArgumentsUseTojson() {
+  const auto item = gufo::json::parse(
+      R"({"type":"function_call","call_id":"call_1","name":"edit",
+          "arguments":"{\"path\":\"a.txt\",\"edits\":[{\"oldText\":\"a\",\"newText\":\"b\"}],\"n\":2}"})");
+  gufo::tokenization::ChatMessage message;
+  gufo::core::ImageReadBudget budget;
+  std::string error;
+  Expect(gufo::server::ParseOpenAiResponseMessage(item, &message, budget,
+                                                  &error) &&
+             message.tool_calls.size() == 1 &&
+             message.tool_calls[0].arguments.size() == 3 &&
+             message.tool_calls[0].arguments[0].value == "a.txt" &&
+             message.tool_calls[0].arguments[0].is_string &&
+             message.tool_calls[0].arguments[1].value ==
+                 R"([{"oldText": "a", "newText": "b"}])" &&
+             !message.tool_calls[0].arguments[1].is_string &&
+             message.tool_calls[0].arguments[2].value == "2",
+         "Typed historical arguments render as the template's tojson");
 }
 
 void TestMalformedHistoricalFunctions() {
@@ -2390,6 +2424,11 @@ void TestNativeToolTransports() {
               body["tool_choice"] = constrained ? "required" : "auto";
               body["chat_template_kwargs"]["enable_thinking"] = thinking;
               FakeBackend backend;
+              if (constrained)
+                backend.tool_format =
+                    call.starts_with("<｜DSML｜tool_calls>")
+                        ? gufo::sampling::JsonConstraint::ToolFormat::kDeepSeek
+                        : gufo::sampling::JsonConstraint::ToolFormat::kQwen;
               const auto raw =
                   (thinking ? "Reasoning.</think>" : "") + call + " \n";
               for (char byte : raw)
@@ -2617,6 +2656,225 @@ void TestJsonToolStringOwnership() {
   }
 }
 
+void TestNativeToolDialectSelection() {
+  using gufo::json::Value;
+  using gufo::sampling::JsonConstraint;
+  using Format = JsonConstraint::ToolFormat;
+  const auto native_call = [](Format format, std::string_view path) {
+    if (format == Format::kDeepSeek)
+      return "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n"
+             "<｜DSML｜parameter name=\"path\" string=\"true\">" +
+             std::string(path) +
+             "</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+             "</｜DSML｜tool_calls>";
+    return "<tool_call>\n<function=read>\n<parameter=path>\n" +
+           std::string(path) + "\n</parameter>\n</function>\n</tool_call>";
+  };
+  // The JSON fallback leaves text before <tool_call> unconstrained. A native
+  // DeepSeek call written there remains a call, as before this change.
+  {
+    auto schema = gufo::json::parse(R"({"type":"object",
+    "properties":{"path":{"type":"string","pattern":"^[a-z.]+$"}},
+    "required":["path"],"additionalProperties":false})");
+    Expect(!JsonConstraint::ToolParameters(schema, false, Format::kDeepSeek),
+           "patterned string requires JSON tool fallback");
+    auto body = gufo::json::parse(R"({
+    "model":"test-model","reasoning_effort":"none",
+    "messages":[{"role":"user","content":"Read fixture.xml."}],
+    "tool_choice":"auto","tools":[{"type":"function","function":{
+      "name":"read","strict":false}}]})");
+    auto tool = body["tools"].items()[0];
+    tool["function"]["parameters"] = schema;
+    body["tools"] = Value::array();
+    body["tools"].push_back(std::move(tool));
+    for (const bool stream : {false, true}) {
+      body["stream"] = stream;
+      FakeBackend backend;
+      backend.tool_format = Format::kJson;
+      backend.pieces = {native_call(Format::kDeepSeek, "fixture.xml")};
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "JSON fallback request succeeds");
+      std::string content;
+      std::vector<std::string> arguments;
+      const auto collect = [&](const Value& event) {
+        for (const auto& choice : event.find("choices")->items()) {
+          const auto* message = choice.find(stream ? "delta" : "message");
+          content += message->member_str("content");
+          if (const auto* calls = message->find("tool_calls"))
+            for (const auto& item : calls->items())
+              arguments.push_back(
+                  item.find("function")->member_str("arguments"));
+        }
+      };
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          const auto payload = chunk.substr(chunk.find("data: ") + 6);
+          if (!payload.starts_with("[DONE]"))
+            collect(gufo::json::parse(payload));
+          return true;
+        });
+      } else {
+        collect(gufo::json::parse(response.body));
+      }
+      Expect(arguments == std::vector<std::string>{R"({"path":"fixture.xml"})"},
+             "a native call written under the JSON fallback is returned");
+      Expect(content.find("DSML") == std::string::npos,
+             "the recognized native call is not visible content");
+    }
+  }
+  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+    const auto schema = gufo::json::parse(R"({"type":"object",
+    "properties":{"path":{"type":"string"}},
+    "required":["path"],"additionalProperties":false})");
+    const auto parameters =
+        JsonConstraint::ToolParameters(schema, false, format);
+    Expect(parameters != nullptr, "file tool has a supported wire format");
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"read", parameters}}, false, true, format);
+    const std::string call = native_call(format, "fixture.xml");
+    const auto foreign =
+        format == Format::kDeepSeek ? Format::kQwen : Format::kDeepSeek;
+    const std::string suffix =
+        format == Format::kDeepSeek
+            ? ""
+            : " The XML root remains `<tool_calls></tool_calls>`.";
+    for (const std::string& prefix :
+         {std::string{"The XML root is `<tool_calls></tool_calls>`.\n"},
+          std::string{"The foreign wrapper is `"} +
+              (foreign == Format::kQwen ? "<tool_call>"
+                                        : "<｜DSML｜tool_calls>") +
+              "`.\n",
+          "Example syntax:\n" + native_call(foreign, "example.xml") +
+              "\nNow inspect the fixture.\n"}) {
+      const auto raw = prefix + call + suffix;
+      auto state = grammar->Start();
+      for (const unsigned char byte : raw)
+        state = grammar->Advance(state, byte);
+      Expect(grammar->Complete(state),
+             "foreign visible literals and the actual call satisfy the "
+             "production tool grammar");
+      for (const bool responses : {false, true}) {
+        for (const bool stream : {false, true}) {
+          auto body = gufo::json::parse(R"({
+          "model":"test-model","reasoning_effort":"none",
+          "messages":[{"role":"user","content":"Inspect fixture.xml and its tool_calls root element."}],
+          "tool_choice":"auto","tools":[{"type":"function","function":{
+            "name":"read","strict":false}}]})");
+          auto tool = body["tools"].items()[0];
+          tool["function"]["parameters"] = schema;
+          body["tools"] = Value::array();
+          body["tools"].push_back(std::move(tool));
+          body["stream"] = stream;
+          FakeBackend backend;
+          backend.tool_format = format;
+          for (const char byte : raw)
+            backend.pieces.emplace_back(1, byte);
+          gufo::server::HttpResponse response;
+          if (responses) {
+            gufo::server::ChatRequest chat;
+            chat.reasoning.enabled = false;
+            Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+                   "Responses accepts the file tool");
+            response = gufo::server::CreateOpenAiResponse(
+                Request(body.dump()), backend, chat, 256, {}, stream);
+          } else {
+            response =
+                gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          }
+          Expect(response.status == 200, "native file tool request succeeds");
+          // A later backend configuration must not change an admitted stream's
+          // format. The fake snapshots this metadata on its GenerationRequest.
+          backend.tool_format.reset();
+          std::string content;
+          std::vector<std::string> arguments;
+          const auto collect = [&](const Value& event) {
+            if (responses) {
+              const auto* result = stream ? event.find("response") : &event;
+              if (!result || result->member_str("status") != "completed")
+                return;
+              for (const auto& item : result->find("output")->items()) {
+                if (item.member_str("type") == "function_call")
+                  arguments.push_back(item.member_str("arguments"));
+                else if (item.member_str("type") == "message")
+                  for (const auto& part : item.find("content")->items())
+                    content += part.member_str("text");
+              }
+            } else {
+              for (const auto& choice : event.find("choices")->items()) {
+                const auto* message = choice.find(stream ? "delta" : "message");
+                content += message->member_str("content");
+                if (const auto* calls = message->find("tool_calls"))
+                  for (const auto& item : calls->items())
+                    arguments.push_back(
+                        item.find("function")->member_str("arguments"));
+              }
+            }
+          };
+          if (stream) {
+            response.streaming_body([&](std::string_view chunk) {
+              const auto payload = chunk.substr(chunk.find("data: ") + 6);
+              if (!payload.starts_with("[DONE]"))
+                collect(gufo::json::parse(payload));
+              return true;
+            });
+          } else {
+            collect(gufo::json::parse(response.body));
+          }
+          Expect(arguments ==
+                     std::vector<std::string>{R"({"path":"fixture.xml"})"},
+                 "only the actual selected-dialect call reaches the client");
+          Expect(content == prefix + suffix,
+                 "foreign tool syntax remains literal visible content");
+        }
+      }
+    }
+  }
+  // DeepSeek's template writes "\n\n" before its call block. That separator
+  // is framing, as in llama.cpp's parser; returned as content, the replayed
+  // history would carry it twice and miss the generated continuation.
+  for (const std::string prose : {"", "Reading the fixture."}) {
+    for (const bool stream : {false, true}) {
+      auto body = gufo::json::parse(R"({
+      "model":"test-model","reasoning_effort":"none",
+      "messages":[{"role":"user","content":"Read fixture.xml."}],
+      "tool_choice":"auto","tools":[{"type":"function","function":{
+        "name":"read","parameters":{"type":"object",
+        "properties":{"path":{"type":"string"}},"required":["path"]}}}]})");
+      body["stream"] = stream;
+      FakeBackend backend;
+      backend.tool_format = Format::kDeepSeek;
+      for (const char byte :
+           prose + "\n\n" + native_call(Format::kDeepSeek, "fixture.xml"))
+        backend.pieces.emplace_back(1, byte);
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      std::string content;
+      std::size_t calls = 0;
+      const auto collect = [&](const Value& event) {
+        for (const auto& choice : event.find("choices")->items()) {
+          const auto* message = choice.find(stream ? "delta" : "message");
+          content += message->member_str("content");
+          if (const auto* found = message->find("tool_calls"))
+            calls += found->size();
+        }
+      };
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          const auto payload = chunk.substr(chunk.find("data: ") + 6);
+          if (!payload.starts_with("[DONE]"))
+            collect(gufo::json::parse(payload));
+          return true;
+        });
+      } else {
+        collect(gufo::json::parse(response.body));
+      }
+      Expect(response.status == 200 && calls == 1 && content == prose,
+             "the separator before a DeepSeek call block is not content");
+    }
+  }
+}
+
 void TestNativeReferencedArgumentTypes() {
   using gufo::json::Value;
   const auto arguments = gufo::json::parse(
@@ -2687,6 +2945,53 @@ void TestNativeReferencedArgumentTypes() {
       Expect(encoded == arguments.dump(),
              "native argument types follow property and root references");
     }
+}
+
+void TestNativeUnionToolTypes() {
+  // Non-strict unions stay in Qwen's native syntax (#383). The parser tries
+  // their typed alternatives first, as llama.cpp's qwen3-coder parser does,
+  // while plain strings keep quotes and literal JSON text.
+  auto body = gufo::json::parse(R"({"model":"test-model",
+    "messages":[{"role":"user","content":"call record"}],
+    "tools":[{"type":"function","function":{"name":"record","parameters":{
+      "type":"object","properties":{
+        "content":{"type":"string"},
+        "provider":{"anyOf":[{"type":"string","const":"brave"},
+                             {"type":"string","const":"exa"}]},
+        "args":{"anyOf":[{"type":"string"},
+                         {"type":"object","additionalProperties":true}]},
+        "label":{"anyOf":[{"type":"string"},{"type":"null"}]},
+        "note":{"anyOf":[{"type":"string"},{"type":"null"}]},
+        "limit":{"anyOf":[{"type":"integer"},{"type":"null"}]}},
+      "required":["content"]}}}],
+    "tool_choice":"auto"})");
+  FakeBackend backend;
+  backend.pieces = {
+      "<tool_call>\n<function=record>\n"
+      "<parameter=content>\n#include \"a.h\"\n42\n</parameter>\n"
+      "<parameter=provider>\nexa\n</parameter>\n"
+      "<parameter=args>\n{\"key\": 1}\n</parameter>\n"
+      "<parameter=label>\nnull\n</parameter>\n"
+      "<parameter=note>\nplain text\n</parameter>\n"
+      "<parameter=limit>\n3\n</parameter>\n"
+      "</function>\n</tool_call>"};
+  const auto response =
+      gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+  Expect(response.status == 200, "native union call succeeds");
+  const auto output = gufo::json::parse(response.body);
+  const auto arguments = gufo::json::parse(output.find("choices")
+                                               ->items()[0]
+                                               .find("message")
+                                               ->find("tool_calls")
+                                               ->items()[0]
+                                               .find("function")
+                                               ->member_str("arguments"));
+  Expect(arguments.dump() ==
+             gufo::json::parse(R"({"content":"#include \"a.h\"\n42",
+               "provider":"exa","args":{"key":1},"label":null,
+               "note":"plain text","limit":3})")
+                 .dump(),
+         "native union arguments try typed alternatives before text");
 }
 
 void TestWildcardToolTypes() {
@@ -3043,6 +3348,7 @@ void TestResponsesPromptProgress() {
 }
 
 int main() {
+  TestHistoricalTypedArgumentsUseTojson();
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();
@@ -3056,8 +3362,10 @@ int main() {
   TestResponsesOutput();
   TestNativeToolTransports();
   TestJsonToolStringOwnership();
+  TestNativeToolDialectSelection();
   TestNativeReferencedArgumentTypes();
   TestWildcardToolTypes();
+  TestNativeUnionToolTypes();
   TestToolMetadataAndFraming();
   TestResponsesLiveAndCancellation();
   TestCachePromptOption();
