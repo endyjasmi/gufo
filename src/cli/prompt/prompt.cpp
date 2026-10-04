@@ -1305,13 +1305,19 @@ int RunPrompt(std::span<const char* const> args) {
   const auto start_time = std::chrono::steady_clock::now();
   std::size_t generated_count = 0;
 
-  const auto tokens = generator->Generate(
-      prompt_tokens, gen_opts,
-      [&](tokenization::TokenId, std::string_view piece) -> bool {
-        std::cout << piece << std::flush;
-        ++generated_count;
-        return true;
-      });
+  std::vector<tokenization::TokenId> tokens;
+  try {
+    tokens = generator->Generate(
+        prompt_tokens, gen_opts,
+        [&](tokenization::TokenId, std::string_view piece) -> bool {
+          std::cout << piece << std::flush;
+          ++generated_count;
+          return true;
+        });
+  } catch (const std::exception& exception) {
+    std::cerr << "\nError generating: " << exception.what() << '\n';
+    return 1;
+  }
 
   std::cout << "\n";
 

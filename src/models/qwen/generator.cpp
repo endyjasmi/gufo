@@ -1,6 +1,7 @@
 #include "src/models/qwen/generator.hpp"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +57,16 @@ std::vector<tokenization::TokenId> QwenGenerator::Generate(
   if (prompt_tokens.empty()) {
     return output_tokens;
   }
+  // Prefill writes every prompt position into the KV cache, so a prompt at or
+  // past the structural ceiling cannot run at all. Decode stops at the same
+  // ceiling like any other generation limit.
+  const std::uint32_t max_context = kv_cache_.max_context();
+  if (prompt_tokens.size() >= max_context) {
+    throw std::runtime_error(
+        "prompt of " + std::to_string(prompt_tokens.size()) +
+        " tokens exceeds the CPU reference context limit of " +
+        std::to_string(max_context) + " tokens");
+  }
 
   kv_cache_.Reset();
   ssm_cache_.Reset();
@@ -75,6 +86,9 @@ std::vector<tokenization::TokenId> QwenGenerator::Generate(
   // 3. Auto-regressive decode loop
   while (output_tokens.size() < options.max_new_tokens) {
     if (tokenizer_->IsStopToken(next_token)) {
+      break;
+    }
+    if (cur_pos >= max_context) {
       break;
     }
 

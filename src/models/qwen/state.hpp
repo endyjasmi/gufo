@@ -19,6 +19,10 @@
 
 namespace gufo::models {
 
+/// Structural context ceiling of the CPU reference: the KV cache and the
+/// attention-score scratch arena are sized to this many positions.
+inline constexpr std::uint32_t kQwenReferenceMaxContext = 8192;
+
 /// Non-owning reference to a mapped tensor. Consumers validate the exact
 /// formats supported for each tensor role.
 struct QwenTensorRef {
@@ -181,6 +185,9 @@ public:
     return current_pos_;
   }
   void AdvancePos() noexcept { ++current_pos_; }
+  [[nodiscard]] std::uint32_t max_context() const noexcept {
+    return max_context_;
+  }
 
   [[nodiscard]] std::span<float> GetKeySlice(std::uint32_t layer,
                                              std::uint32_t kv_head,
