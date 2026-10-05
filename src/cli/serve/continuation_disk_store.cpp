@@ -721,8 +721,11 @@ struct ContinuationDiskStore::Impl {
 #if defined(_WIN32)
     // The ownership/symlink/mode hardening is a POSIX permissions model; on
     // Windows validate that the path is a real directory and keep operating
-    // on joined paths instead of a directory descriptor.
-    if (!std::filesystem::is_directory(options.directory, error) || error) {
+    // on joined paths instead of a directory descriptor. symlink_status is
+    // required because the plain status calls follow the link.
+    const auto link_status =
+        std::filesystem::symlink_status(options.directory, error);
+    if (error || !std::filesystem::is_directory(link_status)) {
       throw std::runtime_error(
           "continuation disk directory is not a directory");
     }
