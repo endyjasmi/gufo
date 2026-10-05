@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <sstream>
 #include <stdexcept>
@@ -128,6 +129,11 @@ public:
   gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning;
   }
+  InitialOutputState initial_output_state(
+      const gufo::server::ChatRequest& request) const override {
+    return initial_output_state_override.value_or(
+        TextGenerationBackend::initial_output_state(request));
+  }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
@@ -227,6 +233,7 @@ public:
   std::atomic<bool> lost{false};
   std::string forced_stop_sequence;
   gufo::ReasoningOptions reasoning;
+  std::optional<InitialOutputState> initial_output_state_override;
   bool wait_for_disconnect{false};
   std::atomic<bool> disconnected{false};
   std::binary_semaphore entered{0};
@@ -1029,6 +1036,25 @@ void TestCompatibilityRequests() {
   assert(replayed.messages.size() == 3 &&
          replayed.messages[1].thought == "plan" &&
          replayed.messages[1].content == "answer");
+
+  // An explicit content phase preserves requested literal reasoning tags.
+  // The default automatic phase above still recognizes reasoning blocks.
+  server.backend->initial_output_state_override =
+      FakeBackend::InitialOutputState::kContent;
+  const std::string literal_thinking = "<think>literal example</think>";
+  server.backend->SetOutput(literal_thinking);
+  const auto literal = response_body(
+      server.Post("/v1/messages", R"({"messages":[{"role":"user","content":
+        "Copy this XML exactly: <think>literal example</think>"}],
+        "thinking":{"type":"disabled"}})"));
+  assert(server.backend->LastCall().chat.reasoning.enabled == false);
+  const auto literal_blocks = literal.find("content")->items();
+  assert(literal_blocks.size() == 1 &&
+         literal_blocks[0].member_str("type") == "text" &&
+         literal_blocks[0].member_str("text") == literal_thinking &&
+         "disabled thinking preserves literal tags as one text block");
+  server.backend->initial_output_state_override.reset();
+
   server.backend->SetOutput("answer");
   const auto plain = response_body(server.Post(
       "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}]})"));
@@ -1039,10 +1065,53 @@ void TestCompatibilityRequests() {
            {"type":"thinking","thinking":"plan"}]}]})",
         R"({"messages":[{"role":"user","content":"hi"}],"thinking":true})",
         R"({"messages":[{"role":"user","content":"hi"}],
-            "thinking":{"type":"adaptive"}})",
+            "thinking":{"type":"enabled","budget_tokens":0}})",
         R"({"messages":[{"role":"user","content":"hi"}],
-            "thinking":{"type":"enabled","budget_tokens":0}})"})
+            "thinking":{"type":"adaptive","display":"full"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"effort":"adaptive"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"effort":"minimal"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":"high"})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"format":{"type":"json_schema"}}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "reasoning_effort":"high"})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "chat_template_kwargs":{"enable_thinking":true}})"})
     ExpectStatus(server.Post("/v1/messages", invalid), 400);
+
+  // The reasoning fields Claude Code sends on every request. Adaptive keeps
+  // the server's thinking default and the reasoning is still returned.
+  server.backend->SetOutput("<think>plan</think>answer");
+  for (const bool server_thinking : {false, true}) {
+    server.backend->reasoning.enabled = server_thinking;
+    server.backend->reasoning.effort = gufo::ReasoningEffort::kLow;
+    const auto adaptive = response_body(
+        server.Post("/v1/messages", R"({"max_tokens":256,"stream":false,
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "output_config":{"effort":"xhigh"},
+            "messages":[{"role":"user","content":"hi"}]})"));
+    if (server_thinking)
+      assert(adaptive.find("content")->items()[0].member_str("thinking") ==
+             "plan");
+    const auto reasoning = server.backend->LastCall().chat.reasoning;
+    assert(reasoning.enabled == server_thinking);
+    assert(reasoning.effort == gufo::ReasoningEffort::kXHigh);
+  }
+  server.backend->reasoning = {};
+  const auto updates = response_body(server.Post(
+      "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"enabled","display":"updates"}})"));
+  assert(updates.find("content")->items()[0].member_str("thinking") == "plan");
+  // Effort never enables thinking.
+  response_body(server.Post("/v1/messages",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"disabled"},"output_config":{"effort":"low"}})"));
+  assert(server.backend->LastCall().chat.reasoning.enabled == false);
+  assert(server.backend->LastCall().chat.reasoning.effort ==
+         gufo::ReasoningEffort::kLow);
   server.backend->SetOutput("ok");
 }
 
@@ -1662,7 +1731,9 @@ void TestAdmittedStreamHeaders() {
     ExpectStatus(response, 200);
     const auto ping = response.find(": ping\n\n");
     assert(ping != std::string::npos);
-    assert(ping < response.find("ok"));
+    const auto token = response.find(R"("ok")");
+    assert(token != std::string::npos);
+    assert(ping < token);
     assert(response.ends_with("0\r\n\r\n"));
   }
   // After admission, failures before any token are terminal SSE errors.

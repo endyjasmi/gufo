@@ -5,8 +5,16 @@
 #include <io.h>
 #include <sys/stat.h>
 #include <windows.h>
+
+// Advisory-lock operations matching the POSIX values. Windows has no flock;
+// the directory lock below grants every request because this port never
+// opens a directory descriptor.
+constexpr int LOCK_SH = 1;
+constexpr int LOCK_EX = 2;
+constexpr int LOCK_NB = 4;
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -175,6 +183,44 @@ public:
 
 private:
   std::binary_semaphore& gate_;
+  bool acquired_{false};
+};
+
+class ScopedFileLock {
+public:
+  ScopedFileLock(int descriptor, int operation) noexcept
+      : descriptor_(descriptor) {
+#if defined(_WIN32)
+    // This port never opens a directory descriptor, so there is no lock
+    // object to coordinate across stores: grant every request, which keeps
+    // the pre-flock single-store behavior.
+    (void)operation;
+    acquired_ = true;
+#else
+    int result;
+    do {
+      result = ::flock(descriptor_, operation);
+    } while (result != 0 && errno == EINTR);
+    acquired_ = result == 0;
+#endif
+  }
+
+  ~ScopedFileLock() {
+#if !defined(_WIN32)
+    if (acquired_) {
+      while (::flock(descriptor_, LOCK_UN) != 0 && errno == EINTR) {
+      }
+    }
+#endif
+  }
+
+  explicit operator bool() const noexcept { return acquired_; }
+
+  ScopedFileLock(const ScopedFileLock&) = delete;
+  ScopedFileLock& operator=(const ScopedFileLock&) = delete;
+
+private:
+  int descriptor_;
   bool acquired_{false};
 };
 
@@ -896,7 +942,12 @@ struct ContinuationDiskStore::Impl {
     for (const auto& directory_entry : iterator) {
       const std::string filename = directory_entry.path().filename().string();
       if (filename.starts_with(kTemporaryPrefix)) {
-        RemoveFileOnly(filename);
+        // Publishers hold a shared directory lock from before temporary-file
+        // creation through rename. Defer orphan cleanup while any is active;
+        // readers must not wait for another store's potentially long write.
+        const ScopedFileLock cleanup_lock(directory_fd, LOCK_EX | LOCK_NB);
+        if (cleanup_lock)
+          RemoveFileOnly(filename);
         continue;
       }
       if (!HasSuffix(filename, kFileSuffix)) {
@@ -1128,6 +1179,12 @@ struct ContinuationDiskStore::Impl {
                                   const TextModelRunner& runner,
                                   const TextRunnerSnapshot& snapshot,
                                   std::size_t payload_bytes) {
+    // Save serializes publishers in this instance with write_mutex, and
+    // startup indexing completes before its worker starts. Thus no two lock
+    // owners in this instance can share directory_fd's open file description.
+    const ScopedFileLock publication_lock(directory_fd, LOCK_SH);
+    if (!publication_lock)
+      return false;
     const std::string temporary_filename =
         std::string(kTemporaryPrefix) + UniqueSuffix();
 #if defined(_WIN32)

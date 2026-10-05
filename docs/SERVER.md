@@ -295,6 +295,11 @@ Use `--think off` or `chat_template_kwargs.enable_thinking=false` for direct
 answers. DeepSeek defaults to thinking with `high` effort. Quality comparisons
 must use the same reasoning mode and effort.
 
+Keep `reasoning_effort` (Chat) or `output_config.effort` (Messages) consistent
+across turns while thinking is enabled: Qwen and DeepSeek render the effort
+instruction into the prompt, so changing it changes the prompt prefix and can
+force a full conversation prefill.
+
 `POST /v1/chat/completions` accepts top-level `reasoning_effort` (`none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`) and Pi/llama.cpp-style
 `chat_template_kwargs`:
@@ -579,12 +584,17 @@ The other compatibility routes are deliberately limited:
 All four routes validate the loaded model, positive integer limits and shared
 sampling controls. Messages and `/completion` reject streaming; all reject
 multiple candidates. Responses and Messages honor the server's thinking defaults.
-Messages accepts `thinking.type` (`enabled` or `disabled`); `budget_tokens`
-has no native equivalent and keeps the server's effort. Reasoning is returned
-as a `thinking` block before the `text` block, with an empty `signature`.
-Replay assistant `thinking` blocks unchanged so later turns reuse the cached
-prompt. Messages rejects tools and `output_config`; use Chat Completions for
-tool and reasoning-effort controls. Completions routes accept `stop`;
+Messages accepts `thinking.type` (`enabled`, `adaptive` or `disabled`);
+`adaptive` keeps the server's thinking default, and `budget_tokens` has no
+native equivalent, so the effort stays the server's unless
+`output_config.effort` sets it. Reasoning is returned as a `thinking` block
+before the `text` block, with an empty `signature`, for every accepted
+`thinking.display` (`summarized`, `omitted` or `updates`). Replay assistant
+`thinking` blocks unchanged so later turns reuse the cached prompt.
+`output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the
+reasoning effort used while thinking is on; it never enables thinking. Other
+`output_config` members are rejected. Messages rejects tools; use Chat
+Completions for tools. Completions routes accept `stop`;
 Messages accepts `stop_sequences`. Responses has no stop-sequence field.
 `/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
 and template-aware message counting are not implemented.
@@ -672,7 +682,10 @@ omitted controls keep their model/CLI defaults.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
-call starts, decoding constrains its name and argument format. Non-strict tools
+call starts, decoding constrains its name and argument format. As in llama.cpp,
+a DeepSeek call block ends the output: parallel calls share one block, and no
+text follows it. Other DeepSeek output, including client call markup written in
+place of a native call, is returned as content. Non-strict tools
 keep optional arguments optional. Open nested objects retain native syntax and
 declared requirements/types, including nested fields; unsupported schema
 keywords remain guidance. Unsupported property-admitting rules, including
