@@ -1007,6 +1007,89 @@ bool ToolMarkerPrefix(std::string_view text, ToolMarkerSet markers) {
       markers, [&](auto marker) { return marker.starts_with(text); });
 }
 
+/// Closing tags of the tool-call envelopes the model was taught to write,
+/// plus the foreign envelopes Qwen-family models drift into. A recognized
+/// call is sometimes accompanied by stray closers (before or after the
+/// parsed block, or between calls); they are framing noise, not answer
+/// text: like the DeepSeek separator, replaying them as content corrupts
+/// the next turn's tool framing. Foreign call syntax under a declared other
+/// dialect stays literal, so a closer only counts when its opener is one of
+/// the active markers (or the model is on the Qwen dialect, whose family
+/// emits function/invoke drift).
+constexpr std::array<std::string_view, 4> kStrayToolClosers{
+    "</tool_call>", "</｜DSML｜tool_calls>", "</function>", "</invoke>"};
+
+bool StrayToolCloser(std::string_view closer, ToolMarkerSet markers) {
+  const auto opener = std::string_view(closer.data() + 1, closer.size() - 1);
+  if (std::ranges::any_of(
+          markers, [&](std::string_view marker) { return marker == opener; }))
+    return true;
+  // The Qwen dialect has no invoke/function opener markers; its models
+  // still emit those closers when they drift off the instructed format.
+  return opener != "<tool_call>" &&
+         std::ranges::any_of(markers, [](std::string_view marker) {
+           return marker == "<tool_call>";
+         });
+}
+
+/// Length of the trailing run of whitespace and complete stray envelope
+/// closing tags in `text`. Markers are the active dialect openers.
+std::size_t StrayToolFramingTail(std::string_view text, ToolMarkerSet markers) {
+  std::size_t end = text.size();
+  bool stripped_closer = false;
+  for (;;) {
+    const std::size_t before_whitespace = end;
+    while (end > 0 &&
+           std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+      --end;
+    }
+    bool consumed = end < before_whitespace;
+    for (const auto closer : kStrayToolClosers) {
+      if (end >= closer.size() && StrayToolCloser(closer, markers) &&
+          text.substr(end - closer.size(), closer.size()) == closer) {
+        end -= closer.size();
+        consumed = true;
+        stripped_closer = true;
+        break;
+      }
+    }
+    if (!consumed) {
+      break;
+    }
+  }
+  // Whitespace alone is answer formatting; strip only around stray closers.
+  return stripped_closer ? text.size() - end : 0;
+}
+
+/// Length of the leading run of whitespace and complete stray envelope
+/// closing tags in `text`, as left behind right after a parsed call block.
+std::size_t StrayToolFramingHead(std::string_view text, ToolMarkerSet markers) {
+  std::size_t position = 0;
+  bool stripped_closer = false;
+  for (;;) {
+    const std::size_t before_whitespace = position;
+    while (position < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[position])) != 0) {
+      ++position;
+    }
+    bool consumed = position > before_whitespace;
+    for (const auto closer : kStrayToolClosers) {
+      if (position + closer.size() <= text.size() &&
+          StrayToolCloser(closer, markers) &&
+          text.substr(position, closer.size()) == closer) {
+        position += closer.size();
+        consumed = true;
+        stripped_closer = true;
+        break;
+      }
+    }
+    if (!consumed) {
+      break;
+    }
+  }
+  return stripped_closer ? position : 0;
+}
+
 std::string ArgumentsJson(
     std::span<const tokenization::ChatMessage::ToolArgument> arguments) {
   json::Value object = json::Value::object();
@@ -1504,6 +1587,13 @@ ParsedGeneration ParseGeneration(
     // complete calls, but do not expose an unfinished call as ordinary text.
     if (!parsed.tool_calls.empty() || !enforce_required) {
       parsed.text = text_before_tools;
+      // Stray envelope closers the model emitted before the recognized call
+      // are framing noise, not answer text; clients replay content as history
+      // and a stray closer would corrupt the next turn's tool framing.
+      if (!parsed.tool_calls.empty()) {
+        parsed.text.resize(parsed.text.size() -
+                           StrayToolFramingTail(parsed.text, markers));
+      }
       parsed.hide_tool_markup = true;
     }
   }
@@ -1560,7 +1650,12 @@ ParsedGeneration ParseStructuredGeneration(
     if (tool_only) {
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
-        call.text += content.substr(cursor, begin - cursor);
+        std::string segment(content.substr(cursor, begin - cursor));
+        // Stray envelope closers the model wrote ahead of a recognized call
+        // are framing noise, not answer text; clients replay content as
+        // history and a stray closer would corrupt the next turn's framing.
+        segment.resize(segment.size() - StrayToolFramingTail(segment, markers));
+        call.text += segment;
         cursor = end;
       }
       const auto tail = content.substr(cursor);
@@ -1569,7 +1664,13 @@ ParsedGeneration ParseStructuredGeneration(
           choice == ChatRequest::ToolChoice::kRequired)
         if (const auto held = HeldMarkerPrefix(tail, markers))
           unfinished = tail.size() - held;
-      call.text += tail.substr(0, spans.empty() ? marker : unfinished);
+      const std::size_t visible_end =
+          std::min(tail.size(), spans.empty() ? marker : unfinished);
+      // Stray closers immediately after a parsed call block are framing
+      // noise (a doubled envelope closer); keep them out of the content.
+      std::string_view visible = tail.substr(0, visible_end);
+      visible.remove_prefix(StrayToolFramingHead(visible, markers));
+      call.text += visible;
     }
     call.hide_tool_markup = true;
     if (call.tool_calls.empty() && enforce_required &&
@@ -1826,8 +1927,8 @@ public:
       }
       const std::size_t marker = recognize_tools_
                                      ? EarliestMarker(pending_, markers_)
-                                     : std::string::npos;
-      if (marker != std::string::npos) {
+                                     : std::string_view::npos;
+      if (marker != std::string_view::npos) {
         if (marker > 0 && !emit_piece_(pending_.substr(0, marker), false)) {
           return false;
         }
@@ -1883,17 +1984,30 @@ private:
     if (tool_only_) {
       const auto start = EarliestMarker(pending_, markers_);
       if (start != std::string::npos) {
-        if (start &&
-            !emit_piece_(std::string_view(pending_).substr(0, start), false))
-          return false;
-        emitted_content_bytes_ += start;
+        if (start) {
+          // The marker converts the whole tail into tool framing; drop stray
+          // envelope closers the model wrote ahead of it, matching the final
+          // parse of the same segment.
+          std::string_view prefix = std::string_view(pending_).substr(0, start);
+          const std::size_t emitted =
+              prefix.size() - StrayToolFramingTail(prefix, markers_);
+          if (emitted &&
+              !emit_piece_(std::string_view(pending_).substr(0, emitted),
+                           false))
+            return false;
+          emitted_content_bytes_ += emitted;
+        }
         hidden_ = pending_.substr(start);
         pending_.clear();
         tool_mode_ = true;
         return true;
       }
+      // Hold stray envelope closers back the way partial openers are held:
+      // they either precede a recognized call (swallowed above) or flush
+      // verbatim at Finish when the answer really ends with them.
       const auto held = HeldMarkerPrefix(pending_, markers_);
-      const auto ready = pending_.size() - held;
+      const auto framing = StrayToolFramingTail(pending_, markers_);
+      const auto ready = pending_.size() - std::max(held, framing);
       if (ready &&
           !emit_piece_(std::string_view(pending_).substr(0, ready), false))
         return false;

@@ -1165,6 +1165,100 @@ void TestModelSamplingDefaults() {
          "Explicit public-API configuration preserves its output constraint");
 }
 
+// Stray envelope closers the model writes ahead of a recognized call (a
+// closing tag of the instructed envelope or of a foreign dialect) must not
+// reach content: clients replay content as history and the stray closer would
+// corrupt the next turn's tool framing (issue #1).
+void TestStrayToolFramingIsDropped() {
+  const char* tools = R"(
+    "tools":[{"type":"function","function":{
+      "name":"multiply","description":"Multiply two numbers.",
+      "parameters":{"type":"object","properties":{"x":{"type":"number"}},
+                    "required":["x"]}}}],)";
+  const char* xml_call =
+      "<tool_call>\n<function=multiply>\n<parameter=x>\n6\n</parameter>\n"
+      "</function>\n</tool_call>";
+  const char* json_call =
+      "<tool_call>\n{\"name\": \"multiply\", \"arguments\": {\"x\": 6}}\n"
+      "</tool_call>";
+
+  for (bool stream : {false, true}) {
+    // Own-envelope closer before the recognized XML call.
+    FakeBackend backend;
+    backend.pieces = {"Working on it.\n\n</tool_call>\n", xml_call};
+    auto response = gufo::server::HandleOpenAiChat(
+        Request(std::string(
+            R"({"model":"test-model",)" + std::string(tools) + R"(
+        "messages":[{"role":"user","content":"multiply"}],)" +
+            (stream ? R"("stream":true)" : R"("stream":false)") + "}")),
+        backend);
+    std::string output = response.body;
+    if (stream) {
+      Expect(static_cast<bool>(response.streaming_body),
+             "Stray framing request supports streaming");
+      response.streaming_body([&](std::string_view chunk) {
+        output += chunk;
+        return true;
+      });
+    }
+    if (output.find(R"("content":"Working on it.")") == std::string::npos)
+      std::cerr << "DBG-1: " << output << "\n";
+    Expect(output.find(R"("content":"Working on it.")") != std::string::npos,
+           "Stray own-envelope closer is dropped from content");
+    Expect(output.find(R"("finish_reason":"tool_calls")") != std::string::npos,
+           "Recognized call still reports tool_calls");
+    Expect(output.find(R"(\"x\":6)") != std::string::npos,
+           "Call arguments survive the framing cleanup");
+
+    // Foreign-dialect closer before a JSON-dialect call inside the envelope.
+    FakeBackend foreign;
+    foreign.pieces = {"Sure.\n</invoke>", json_call};
+    response = gufo::server::HandleOpenAiChat(
+        Request(std::string(
+            R"({"model":"test-model",)" + std::string(tools) +
+            R"(
+        "messages":[{"role":"user","content":"multiply"}],)" +
+            (stream ? R"("stream":true)" : R"("stream":false)") + "}")),
+        foreign);
+    output = response.body;
+    if (stream) {
+      response.streaming_body([&](std::string_view chunk) {
+        output += chunk;
+        return true;
+      });
+    }
+    Expect(output.find(R"("content":"Sure.")") != std::string::npos,
+           "Stray foreign closer is dropped from content");
+    Expect(output.find(R"(</invoke>)") == std::string::npos,
+           "Foreign closer markup never reaches the stream");
+    Expect(output.find(R"("finish_reason":"tool_calls")") != std::string::npos,
+           "JSON-dialect call inside the envelope still parses");
+  }
+
+  // Without a parsed call the framing stays literal quoted text.
+  for (bool stream : {false, true}) {
+    FakeBackend backend;
+    backend.pieces = {"Quote: </tool_call> ends the answer"};
+    const auto response = gufo::server::HandleOpenAiChat(
+        Request(std::string(
+            R"({"model":"test-model",)" + std::string(tools) +
+            R"(
+        "messages":[{"role":"user","content":"quote"}],)" +
+            (stream ? R"("stream":true)" : R"("stream":false)") + "}")),
+        backend);
+    std::string output = response.body;
+    if (stream) {
+      response.streaming_body([&](std::string_view chunk) {
+        output += chunk;
+        return true;
+      });
+    }
+    Expect(
+        output.find("Quote: </tool_call> ends the answer") != std::string::npos,
+        "Literal closer in an answer without calls is preserved");
+  }
+}
+
 void TestCompleteToolDefinitionsReachTemplate() {
   FakeBackend backend;
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
@@ -3399,6 +3493,7 @@ int main() {
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();
   TestAggregateImageLimit();
+  TestStrayToolFramingIsDropped();
   std::cout << "All OpenAI chat protocol tests passed\n";
   return 0;
 }
