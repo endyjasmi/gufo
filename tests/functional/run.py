@@ -161,8 +161,11 @@ def server(command, log_path, startup_timeout):
         process = None
         previous_handlers = {}
         try:
+            stop_signals = [signal.SIGTERM]
+            if hasattr(signal, "SIGHUP"):
+                stop_signals.append(signal.SIGHUP)
             previous_handlers = {signum: signal.signal(signum, interrupt)
-                                 for signum in (signal.SIGTERM, signal.SIGHUP)}
+                                 for signum in stop_signals}
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
@@ -184,7 +187,12 @@ def server(command, log_path, startup_timeout):
             yield process
         finally:
             if process is not None and process.poll() is None:
-                process.send_signal(signal.SIGINT)
+                try:
+                    process.send_signal(signal.SIGINT)
+                except ValueError:
+                    # Windows Popen cannot deliver SIGINT; TerminateProcess
+                    # still reaps the server.
+                    process.terminate()
                 try:
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
