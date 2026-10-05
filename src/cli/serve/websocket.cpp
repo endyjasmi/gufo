@@ -5,6 +5,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 
 #include "src/cli/serve/audio_stream.hpp"
@@ -12,11 +13,13 @@
 #include "src/core/utf8.hpp"
 
 #if defined(_WIN32)
-constexpr int kShutdownRead = SD_RECEIVE;
 constexpr int kShutdownBoth = SD_BOTH;
+using PollDescriptor = WSAPOLLFD;
+constexpr short kPollIn = POLLRDNORM;
 #else
-constexpr int kShutdownRead = SHUT_RD;
 constexpr int kShutdownBoth = SHUT_RDWR;
+using PollDescriptor = struct pollfd;
+constexpr short kPollIn = POLLIN;
 #endif
 
 namespace gufo::server {
@@ -101,9 +104,11 @@ WebSocket::WebSocket(int fd, std::string buffered)
 
 WebSocket::~WebSocket() {
   Close();
-  // Cancellation can wake the consumer before the reader finishes its close
-  // reply. Let that writer complete before shutting down the send half.
-  (void)::shutdown(fd_, kShutdownRead);
+  // Every path that marks the socket closed also shuts the socket down
+  // (Close's drain or the send-failure path), which unblocks a reader parked
+  // in recv. An extra read-side shutdown here must not be added: on Windows
+  // SD_RECEIVE with unread data aborts the connection with RST and destroys
+  // the close frame this destructor's Close just queued.
   reader_.join();
   (void)::shutdown(fd_, kShutdownBoth);
 }
@@ -172,7 +177,29 @@ void WebSocket::Close(std::uint16_t code) {
   const std::array<char, 2> payload{static_cast<char>(code >> 8),
                                     static_cast<char>(code & 255)};
   (void)Send(8, std::string_view(payload.data(), payload.size()));
-  (void)::shutdown(fd_, kShutdownRead);
+  // A frame rejected mid-parse leaves its unread remainder queued, and
+  // closing a socket with unread data makes Windows abort with RST, which
+  // discards the just-sent close frame on the peer before it is read. Drain
+  // briefly so the peer sees the close frame followed by a clean FIN.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  char sink[512];
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now())
+            .count();
+    if (remaining <= 0)
+      break;
+    PollDescriptor descriptor{};
+    descriptor.fd = static_cast<decltype(descriptor.fd)>(fd_);
+    descriptor.events = kPollIn;
+    if (net::PollSocket(&descriptor, 1, static_cast<int>(remaining)) <= 0)
+      break;
+    if (::recv(fd_, sink, sizeof(sink), 0) <= 0)
+      break;
+  }
+  (void)::shutdown(fd_, kShutdownBoth);
 }
 
 bool WebSocket::MarkClosed() {
