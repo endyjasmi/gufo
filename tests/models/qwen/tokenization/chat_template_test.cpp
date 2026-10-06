@@ -406,9 +406,19 @@ void TestHuggingFaceRenderedGoldens() {
       {base[0], call, {ChatRole::kUser, "<tool_response>21 C</tool_response>"}},
       options, "tool_loop_preserve");
   for (const auto role : {ChatRole::kSystem, ChatRole::kDeveloper}) {
-    Expect(!QwenChatTemplate::Render(
-               std::vector<ChatMessage>{base[0], {role, "Late instructions"}}),
-           "Late system/developer messages are rejected");
+    const std::vector<ChatMessage> late{{ChatRole::kSystem, "Be concise."},
+                                        history[0],
+                                        history[1],
+                                        {role, "Late instructions"},
+                                        history[2]};
+    const std::vector<ChatMessage> leading{late[0], late[3], late[1], late[2],
+                                           late[4]};
+    const auto rendered = QwenChatTemplate::Render(late, tools, options);
+    Expect(rendered &&
+               rendered == QwenChatTemplate::Render(leading, tools, options) &&
+               rendered->find("Be concise.\nLate instructions<|im_end|>") !=
+                   std::string::npos,
+           "Late system/developer messages join the leading system turn");
   }
   for (const auto role : {ChatRole::kSystem, ChatRole::kDeveloper,
                           ChatRole::kAssistant, ChatRole::kTool}) {
@@ -611,6 +621,53 @@ void TestToolReplayArgumentsAreContent() {
            "Native tool-call tags stay framing while argument spellings stay "
            "text");
   }
+}
+
+void TestNewLiteralTokenDoesNotRetokenizeHistory() {
+  using namespace gufo::tokenization;
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  for (const auto* token :
+       {"<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>", ".\n"})
+    vocab.emplace_back(token);
+  const std::vector<std::string> merges = {". \n"};
+  const std::unordered_map<std::string, TokenId> specials = {
+      {"<|im_start|>", 256},
+      {"<|im_end|>", 257},
+      {"<tool_call>", 258},
+      {"</tool_call>", 259}};
+  std::string error;
+  auto tokenizer =
+      QwenTokenizer::CreateFromVocabulary(vocab, merges, specials, &error);
+  Expect(tokenizer != nullptr, "Tokenizer with boundary merge: " + error);
+  ChatMessage assistant{ChatRole::kAssistant, ""};
+  assistant.tool_calls.push_back(
+      {.id = "read-1",
+       .name = "read",
+       .arguments = {{.name = "path", .value = "file"}}});
+  std::vector<ChatMessage> history{{ChatRole::kUser, "Read the file."},
+                                   assistant,
+                                   {ChatRole::kTool, "Done."}};
+  ChatTemplateOptions options;
+  options.add_generation_prompt = false;
+  options.enable_thinking = false;
+  const auto before =
+      QwenChatTemplate::RenderAndTokenize(*tokenizer, history, options);
+  Expect(before.has_value(), "History tokenizes");
+  Expect(
+      std::find(before->begin(), before->end(), 260) != before->end(),
+      "Fixture merges content punctuation with the following framing newline");
+  history.push_back({ChatRole::kUser, "The literal text <tool_call> is data."});
+  const auto after =
+      QwenChatTemplate::RenderAndTokenize(*tokenizer, history, options);
+  Expect(
+      after && after->size() > before->size() &&
+          std::equal(before->begin(), before->end(), after->begin()),
+      "A new literal control spelling leaves every historical token unchanged");
+  Expect(std::count(before->begin(), before->end(), 258) ==
+             std::count(after->begin(), after->end(), 258),
+         "Literal spelling does not add a structural tool opener");
 }
 
 /// The server prepares every request through models::qwen::vision::Prepare,
@@ -1069,6 +1126,7 @@ int main() {
   TestRenderAndTokenize();
   TestContentSpellingATokenIsNotParsedAsOne();
   TestToolReplayArgumentsAreContent();
+  TestNewLiteralTokenDoesNotRetokenizeHistory();
   TestVisionPreparationReadsContentAsText();
   TestEncodeRenderedReadsImageContentAsText();
   TestChatCorpusConformance();
