@@ -214,12 +214,29 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
+          # Hand CMake the HIP root explicitly and put the SDK's bin on
+          # PATH: CMake 4.4 cannot discover it by itself for some TheRock
+          # layouts (neither the compiler's "Found HIP installation"
+          # self-report nor hipconfig is reachable), which failed the first
+          # 10.0.0 release build at enable_language(HIP).
+          $env:PATH = "$env:SDK_ROOT\bin;$env:PATH"
           $toolchain = "$($env:VCPKG_ROOT -replace '\\', '/')/scripts/buildsystems/vcpkg.cmake"
-          cmake --preset windows-release "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+          cmake --preset windows-release "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
 
       - name: Build
         shell: pwsh
         run: cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Upload configure and build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cmake-logs-${{ github.sha }}
+          path: |
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeError.log
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Stage Tensile kernel libraries
         shell: pwsh
