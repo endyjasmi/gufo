@@ -1,3 +1,58 @@
+**This is the Windows fork of Gufo**: a native Windows port for AMD Strix
+Halo (Ryzen AI Max+ 395 with Radeon 8060S, `gfx1151`), maintained on this
+repository's `feature/window-native` branch. Upstream Gufo targets Linux;
+the original README — models, benchmarks, philosophy and the Linux build —
+follows below the separator.
+
+**Getting started:** download a ready-made build from the
+[Releases page](https://github.com/endyjasmi/gufo/releases), unzip the
+`gufo-<version>-windows-gfx1151-<commit>.zip` asset (for example
+`gufo-0.8.0-windows-gfx1151-1b2da4a.zip`) and run `gufo.exe` from the
+extracted folder — no installation needed. Every update to the port
+publishes its own release, so older builds stay available. A recent AMD
+graphics driver is required.
+
+**Next, download a model.** The `hf` command ships with Hugging Face's
+Python package (`pip install -U huggingface_hub`). This fetches the
+Qwen3.8 Flash-Next UD-Q4_K_XL GGUF (four shards), the shared MTP predictor
+and the vision projector into the default Hugging Face cache
+(`.cache\huggingface\hub` in your user profile); see the
+[model guide](docs/models/qwen3.8-flash-next/README.md) for other quants
+and the full file list:
+
+```pwsh
+hf download unsloth/Qwen3.8-Flash-Next-GGUF `
+  --revision 38bb39ee97821de2c9009abb7e93950eec396e66 `
+  --include "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" "mmproj-BF16.gguf"
+```
+
+Then serve it with MTP speculative decoding at the full 256K context for
+two concurrent sessions. Run PowerShell from your user profile folder so
+the `.cache` paths below resolve; the loader finds the remaining shards
+and the MTP predictor automatically:
+
+```pwsh
+.\Downloads\gufo-0.8.0-windows-gfx1151-1b2da4a\gufo.exe serve llm --model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\38bb39ee97821de2c9009abb7e93950eec396e66\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --speculative mtp `
+  --served-model-name qwen3.8-flash-next `
+  --context 262144 --sessions 2 `
+  --cache-ram-bytes 8589934592 `
+  --cache-disk .\.cache\gufo-qwen4exp `
+  --cache-disk-bytes 21474836480 `
+  --cache-disk-staging-bytes 8589934592 `
+  --temperature 1 --top-p 0.95 --top-k 20 --min-p 0 `
+  --think on --reasoning-effort xhigh --preserve-thinking on `
+  --repeat-penalty 1 --frequency-penalty 0 --presence-penalty 0 `
+  --host 0.0.0.0 --port 11434 --log-progress --kv-cache-q8-0
+```
+
+When the server is up, point OpenAI-compatible clients at
+`http://localhost:11434/v1` (see the [API contract](docs/SERVER.md)).
+
+You can also [build it yourself on Windows](BUILD-WINDOWS.md) with MSVC, the
+TheRock HIP SDK and vcpkg.
+
+<hr/>
+
 # Gufo: the Strix Halo inference engine
 
 <p align="center">
