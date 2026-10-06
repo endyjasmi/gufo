@@ -36,8 +36,17 @@ GUARD_CLOSE = "#endif\n"
 
 
 def patch_clang_version(version_dir: Path) -> bool:
-    header = version_dir / "__clang_cuda_math_forward_declares.h"
     changed = False
+    # Clang resource layouts differ: the headers sit directly under the
+    # version directory in some SDKs and under include/ in others.
+    for base in (version_dir, version_dir / "include"):
+        changed |= patch_headers(base)
+    return changed
+
+
+def patch_headers(header_dir: Path) -> bool:
+    changed = False
+    header = header_dir / "__clang_cuda_math_forward_declares.h"
     if header.exists():
         text = header.read_text(encoding="utf-8")
         if "GUFO_MSVC_CMATH_PATCH" not in text:
@@ -53,7 +62,7 @@ def patch_clang_version(version_dir: Path) -> bool:
                 changed = True
                 print(f"patched declarations: {header}")
 
-    header = version_dir / "__clang_hip_cmath.h"
+    header = header_dir / "__clang_hip_cmath.h"
     if header.exists():
         text = header.read_text(encoding="utf-8")
         if "GUFO_MSVC_CMATH_PATCH" not in text:
@@ -85,7 +94,8 @@ def main() -> int:
         return 1
     changed = False
     for version_dir in sorted(include_root.iterdir()):
-        if (version_dir / "__clang_hip_cmath.h").exists():
+        if (version_dir / "__clang_hip_cmath.h").exists() or \
+           (version_dir / "include/__clang_hip_cmath.h").exists():
             changed |= patch_clang_version(version_dir)
     if not changed:
         print("all HIP math headers already patched")
