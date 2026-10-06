@@ -80,6 +80,13 @@ jobs:
     env:
       SDK_ROOT: C:/TheRock/build
       BUILD_DIR: build\windows-release
+      # The tarball published builds ship from. Nightly 10.2.0a* compiles
+      # binaries that run ~100x slower on gfx1151 (issue #1), and the
+      # nightly index purges tarballs after ~6 weeks, so published builds
+      # use a validated stable SDK mirrored on this repository's
+      # toolchain/therock-* releases. Bump the pin only after validating a
+      # new SDK end to end on device (see BUILD-WINDOWS.md).
+      PINNED_SDK: therock-dist-windows-gfx1151-10.0.0.tar.gz
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,10 +107,12 @@ jobs:
         shell: pwsh
         run: |
           if ($env:SDK_OVERRIDE) {
+            # A manual run explicitly chose a tarball.
             $tarball = $env:SDK_OVERRIDE
-          } else {
-            # The nightly index only keeps ~6 weeks of tarballs, so resolve
-            # the newest available one at run time instead of pinning.
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'schedule') {
+            # Canary builds check compile health against the newest nightly
+            # and publish nothing. The nightly index only keeps ~6 weeks of
+            # tarballs, so resolve the newest available one at run time.
             $index = (Invoke-WebRequest -UseBasicParsing 'https://nightly.repo.amd.com/rocm/core/tarball/').Content
             $match = [regex]::Match($index, 'const files = (\[.*?\]);', 'Singleline')
             if (-not $match.Success) { throw 'could not parse the nightly tarball index' }
@@ -115,6 +124,12 @@ jobs:
               Select-Object -First 1
             if (-not $latest) { throw 'no windows gfx1151 tarball in the nightly index' }
             $tarball = $latest.name
+          } else {
+            # Published builds ship from the validated pin, not the newest
+            # nightly: nightly 10.2.0a20261005 compiled binaries that ran
+            # ~100x slower on gfx1151 (issue #1), and a --version smoke test
+            # cannot catch that.
+            $tarball = $env:PINNED_SDK
           }
           "tarball=$tarball" >> $env:GITHUB_OUTPUT
           "version=$($tarball -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', '')" >> $env:GITHUB_OUTPUT
@@ -124,9 +139,16 @@ jobs:
           SDK_TARBALL: ${{ steps.sdk.outputs.tarball }}
         shell: pwsh
         run: |
-          $url = "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
-          curl.exe --fail --location --retry 3 --output "$env:RUNNER_TEMP\sdk.tar.gz" "$url"
-          if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE for $url" }
+          $out = "$env:RUNNER_TEMP\sdk.tar.gz"
+          $amdUrl = "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+          curl.exe --fail --location --retry 3 --output "$out" "$amdUrl"
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          # The pin may have aged off AMD's ~6-week nightly index; fall back
+          # to this repository's toolchain mirror release.
+          $version = $env:SDK_TARBALL -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', ''
+          $mirrorUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/toolchain/therock-$version/$env:SDK_TARBALL"
+          curl.exe --fail --location --retry 3 --output "$out" "$mirrorUrl"
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE for both $amdUrl and $mirrorUrl" }
 
       - name: Extract TheRock HIP SDK
         shell: pwsh
@@ -233,7 +255,15 @@ jobs:
           Copy-Item "$env:BUILD_DIR\*.dll" $pkg
           Copy-Item "$env:BUILD_DIR\rocblas" $pkg -Recurse
           Copy-Item "$env:BUILD_DIR\hipblaslt" $pkg -Recurse
-          tar --format zip -cf "$pkg.zip" -C $pkg .
+          # Package with .NET's ZipFile writer, not `tar --format zip`:
+          # bsdtar marks every file entry with the streaming data-descriptor
+          # flag (general-purpose bit 3), which Windows Explorer's zip
+          # handler refuses — the shell namespace shows the archive as empty
+          # and Extract All fails on Windows 11. .NET writes seekable
+          # entries without descriptors; `tar -tf` still reads the result.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          if (Test-Path "$pkg.zip") { Remove-Item "$pkg.zip" -Force }
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($pkg, "$pkg.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
           $entries = tar -tf "$pkg.zip"
           foreach ($required in @('gufo.exe', 'gufo-server.exe', 'MIOpen.dll',
                                   'rocblas/library/', 'hipblaslt/library/')) {
@@ -241,8 +271,8 @@ jobs:
               throw "package is missing $required"
             }
           }
-          if ($entries | Where-Object { $_ -like '*\*' }) {
-            throw "package contains backslash entry names"
+          if ($entries | Where-Object { $_ -like '*\*' -or $_ -like './' -or $_ -like './*' }) {
+            throw "package contains backslash or ./-prefixed entry names"
           }
           @"
           Native Windows build of Gufo for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151).

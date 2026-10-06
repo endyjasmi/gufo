@@ -70,6 +70,31 @@ Then run a real model (GGUF from Hugging Face, e.g. an unsloth Q4_K_XL build):
 build\windows-release\gufo.exe bench -p 2048 -n 128 <path\to\model.gguf>
 ```
 
+## 8. Validating a new TheRock SDK before pointing releases at it
+
+The release workflow ships from a pinned SDK (`PINNED_SDK` in
+`.github/workflows/windows-release.yml`), not from the newest nightly, and
+falls back to the mirrored tarball in this repository's
+`toolchain/therock-*` release when AMD purges it from the nightly index.
+
+Never bump that pin on faith: a toolchain change can compile binaries that
+are *functionally correct but run orders of magnitude slower*, which a
+`--version` smoke test cannot catch — nightly `10.2.0a20261005` produced
+binaries that ran ~100x slower on gfx1151 (issue #1). Validate a candidate
+SDK end to end on device before publishing from it:
+
+1. Build locally with the candidate SDK (steps 5-6, pointing the presets at
+   the new SDK root).
+2. Run the bench from step 7 on a known model and compare against a build
+   from the current pin on the same machine, same session. Numbers within
+   ~10% are fine; a large drop means the SDK regressed — do not ship it.
+3. Serve a prompt through `/v1/chat/completions` and check `ttft_ms` and
+   `decode_tps` in the request log line.
+
+The daily canary build still compiles against the newest nightly to catch
+toolchain *breakage* early; it publishes nothing and does not validate
+performance.
+
 To serve:
 
 ```cmd
