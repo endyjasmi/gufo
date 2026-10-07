@@ -6,6 +6,34 @@
 `Qwen3.8-Flash-Next` UD-Q4_K_XL (4 shards, rev `38bb39ee`) + `shared-Q8_0` MTP +
 mmproj-BF16 — same model files as the report.
 
+## Confirmation rerun (same binary, same protocol, new RNG draws)
+
+A full second pass of every arm (results in `results/*-r2*`, logs
+`*-r2.log`, probe r1 outputs preserved as `results/*-r1`):
+
+| Arm | Run 1 | Run 2 | Combined |
+|---|---|---|---|
+| baseline exact signature (finish=stop, content="") | 5/28 | 3/28 | **8/56 (14.3%)** |
+| baseline budget-burn loops (finish=length, content="") | 4/28 | 0/28 | 4/56 |
+| `--speculative off` exact signature | 0/28 | 0/28 | **0/56** |
+| `--speculative off` budget-burn loops | 0/28 | 1/28 | 1/56 |
+| identity denials | 0 | 0 | 0 |
+
+- The contrast replicates: **8/56 exact-signature empty turns with MTP vs
+  0/56 without**. Run-to-run rates vary with the RNG draw (5/28 vs 3/28),
+  bracketing the reporter's 25% on their fixture — consistent with a
+  material-dependent probability, not a fixed count.
+- Honest nuance: the AR-only arm produced 1/28 budget-burn in run 2 — the
+  base model at temp 1.0 with no repetition penalty can loop on its own,
+  rarely. MTP raises the degeneration rate roughly an order of magnitude
+  and is responsible for the exact `finish=stop` signature (AR only ever
+  burned the budget, never stopped early with empty content).
+- The greedy parity probes are **bit-stable across runs**: persona turn 1
+  diverges at char 195 both times (MTP stops 987 vs AR 1200 cap), plain
+  English at char 734 both times. Deterministic engine-level drift, not
+  noise. The width ablation (`--draft-tokens 1/2/7` → same divergence
+  offset) was not repeated; its conclusion does not depend on the draw.
+
 ## Verdict (TL;DR)
 
 **Reproduced, and the root cause is isolated to the speculative (MTP) decode
