@@ -141,7 +141,48 @@ answer" shape.
   The per-row GDN/conv/PLE snapshot restore in `Executor::Rollback`
   (executor.cpp:2890) also audits clean on read-through.
 
-## Fix session (2026-10-07, later): kernel-level localization
+## Fix session (2026-10-07, later): rollback restore isolated
+
+A GPU parity probe (`parity_probe.cpp`, committed) now reproduces the drift
+**at the engine session level, deterministically, without HTTP**: an AR
+session and a speculative session run the same 1,423-token prompt greedy.
+
+Measured chain (all bit-exact unless noted):
+- Prefill frontiers: bit-identical.
+- Width-1 decode: bit-identical over 250 steps.
+- First verify cycle: per-layer row-0 sub-stages (ple/mix/attn/res × 48
+  layers) **bit-identical**; the downloaded frontier differs by max|Δ|=11.85
+  over all 248,320 logits.
+- Per-build disables: snapshot stores+restore, pinned chain, q8t staging
+  cache, per-row n-gram hashing, graphs (trunk/draft/prefix) — the delta
+  stayed bit-identical through every variant.
+- Per-row PLE and per-row LM-head routes (fix candidates, reverted): changed
+  nothing — the batched PLE and head routes are exact.
+- **Decisive restore-isolation test**: right after the first rejected cycle
+  (committed histories verified identical on both sessions), one width-1
+  decode step on each session diverges at the first step (max|Δ|=18.4). The
+  rollback leaves the session state wrong.
+
+**Root cause (isolated): `Executor::Rollback` restores an incomplete or
+corrupted session state after a rejected speculative cycle.** Verified
+correct: GDN state/conv checksums (layers 0–2), PLE history head, n-gram
+window, position/blocks. The missing/corrupted component is elsewhere in the
+session state the verify forward mutates — candidates: the unchecked 33
+linear layers (checksum coverage was sum-of-squares only, which cannot
+distinguish permuted/off-by-one content), attention KV/indexer rows for the
+rejected positions, or a snapshot-slot off-by-one. Sum-of-squares equality
+is a weak check; the next step is full-vector dumps of every restored
+buffer right after Rollback, diffed against the AR session at the same
+commit.
+
+**Consequences:** every rejected speculative cycle poisons the session —
+explaining the ~10× reasoning-degeneration at temp 1.0 (each reject
+degrades context), the empty/loop turns, and why `--speculative off` is
+clean. The immediate user mitigation remains `--speculative off`.
+
+Probe: `parity_probe.cpp` phase 2 now includes the restore-isolation test
+(restore-test lines in its output). Evidence: `probe-*.log` next to this
+file and in the worktree root.
 
 A GPU parity probe (`parity_probe.cpp`, committed) now reproduces the drift
 **at the engine session level, deterministically, without HTTP**: an AR
@@ -192,6 +233,14 @@ in the op tests. Until then `--speculative off` is the only clean mode;
 
 Probe evidence: `results/probe-*` and `probe-exp*.log` next to this file
 (worktree root).
+
+### Intermediate hypothesis (superseded by the restore isolation above)
+
+The per-row PLE/head routes were tested as fix candidates and reverted:
+they did not change the divergence, ruling the batched PLE and head routes
+out as the cause. The kernel-geometry theory below was the working
+hypothesis before the restore isolation was found; kept for provenance of
+the per-op elimination work.
 
 With the MTP block loaded, every generated token's distribution comes from
 trunk forwards that run **with the MTP machinery active** — the trunk frontier

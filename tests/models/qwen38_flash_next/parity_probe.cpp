@@ -108,7 +108,6 @@ std::string_view ArgmaxText(const Model& model, std::int32_t token) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  _putenv("GUFO_ISSUE6_TRACE=1");
   std::printf("probe start\n");
   std::string_view model_path;
   std::string_view mtp_path;
@@ -214,6 +213,7 @@ int main(int argc, char** argv) {
       gufo::sampling::SamplerState mtp_sampler(config, history);
       std::uint64_t prev_drafted = 0;
       std::uint64_t prev_accepted = 0;
+      bool restore_tested = false;
       int diverged = -1;
       int emitted = 0;
       for (int step = 0; step < steps && diverged < 0; ++step) {
@@ -256,9 +256,84 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(cycle_accepted),
                     cycle_drafted > cycle_accepted ? " REJECTED" : "",
                     frontier.max_abs, frontier.signs);
+        // Restore-isolation test: right after the first rejected cycle the
+        // committed histories are still identical; width-1 steps on both
+        // sessions must produce bit-identical frontiers if the rollback
+        // restored everything.
+        if (cycle_drafted > cycle_accepted && !restore_tested) {
+          restore_tested = true;
+          const std::vector<gufo::sampling::TokenId> history_a(
+              ar2->Tokens().begin(), ar2->Tokens().end());
+          const std::vector<gufo::sampling::TokenId> history_b(
+              mtp2->Tokens().begin(), mtp2->Tokens().end());
+          if (history_a == history_b) {
+            gufo::sampling::SamplerState sa(config, history_a);
+            gufo::sampling::SamplerState sb(config, history_b);
+            for (int rstep = 0; rstep < 8; ++rstep) {
+              Session::DecodeResult ra;
+              Session::DecodeResult rb;
+              if (!ar2->DecodeStep(1, sa, &ra, &error) ||
+                  !mtp2->DecodeStep(1, sb, &rb, &error)) {
+                std::fprintf(stderr, "restore-test decode failed: %s\n",
+                             error.c_str());
+                break;
+              }
+              const auto rdiff = Compare(ar2->Logits(), mtp2->Logits());
+              const bool same = rdiff.max_abs == 0.0 && rdiff.signs == 0;
+              std::printf("  restore-test step %d: %s max|d|=%.6g differing=%zu\n",
+                          rstep, same ? "IDENTICAL" : "DIVERGES",
+                          rdiff.max_abs, rdiff.signs);
+              if (!same)
+                break;
+              if (ra.stop || rb.stop)
+                break;
+            }
+          } else {
+            std::printf("  restore-test: committed histories differ\n");
+          }
+        }
         emitted += static_cast<int>(rb.tokens.size());
         if (ra.stop || rb.stop)
           break;
+      }
+      // Restore-isolation test: after the first rejected cycle (state rolled
+      // back), run BOTH sessions in width-1 mode on their now-identical
+      // committed histories. Bit-exact frontiers prove the rollback
+      // restored everything; any divergence names the restore as incomplete.
+      {
+        const std::vector<gufo::sampling::TokenId> history_a(ar2->Tokens().begin(),
+                                                             ar2->Tokens().end());
+        const std::vector<gufo::sampling::TokenId> history_b(
+            mtp2->Tokens().begin(), mtp2->Tokens().end());
+        if (history_a == history_b) {
+          gufo::sampling::SamplerState sa(config, history_a);
+          gufo::sampling::SamplerState sb(config, history_b);
+          int restored_ok = 0;
+          for (int step = 0; step < 8; ++step) {
+            Session::DecodeResult ra;
+            Session::DecodeResult rb;
+            if (!ar2->DecodeStep(1, sa, &ra, &error) ||
+                !mtp2->DecodeStep(1, sb, &rb, &error)) {
+              std::fprintf(stderr, "restore-test decode failed: %s\n",
+                           error.c_str());
+              break;
+            }
+            const auto diff = Compare(ar2->Logits(), mtp2->Logits());
+            const bool same = diff.max_abs == 0.0 && diff.signs == 0;
+            std::printf("  restore-test step %d: %s max|d|=%.6g differing=%zu\n",
+                        step, same ? "IDENTICAL" : "DIVERGES", diff.max_abs,
+                        diff.signs);
+            if (!same)
+              break;
+            ++restored_ok;
+            if (ra.stop || rb.stop)
+              break;
+          }
+          if (restored_ok == 8)
+            std::printf("  restore-test: width-1 frontiers IDENTICAL over 8 steps\n");
+        } else {
+          std::printf("  restore-test: committed histories differ; skipped\n");
+        }
       }
       if (diverged >= 0) {
         // Coherence check: continue the MTP session with width-1 steps and
