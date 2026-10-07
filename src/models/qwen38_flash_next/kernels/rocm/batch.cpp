@@ -1023,6 +1023,27 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
+    // Decode-sized batches run the head one row at a time with the exact
+    // single-token calls the isolated verify path uses: the batched head
+    // mixer and vocabulary projection reduce differently at multiple rows
+    // than single-token decode, which would make concatenated decode
+    // batches disagree with isolated execution and desync speculative
+    // verification from autoregressive decoding. Wider (prefill replay)
+    // batches keep the batched route.
+    if (rows <= 8) {
+      for (std::uint32_t row = 0; row < rows; ++row) {
+        if (!HcMix(model_->hc_head(),
+                   base.res + static_cast<std::size_t>(row) * c.HcDim(),
+                   false, s_.mixed, nullptr, 1, error) ||
+            !Dense(model_->output(), s_.mixed,
+                   batch_logits_ +
+                       static_cast<std::size_t>(row) * c.vocab_size,
+                   1, error)) {
+          return false;
+        }
+      }
+      return true;
+    }
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
            DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);

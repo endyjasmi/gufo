@@ -26,7 +26,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from fixture import VARIANTS  # noqa: E402
 
-BUILD_DIR = Path(r"D:\gufo\build\windows-release")
+import os
+BUILD_DIR = Path(os.environ.get("GUFO_BUILD_DIR",
+                            r"D:\gufouild\windows-release"))
 GUFO = BUILD_DIR / "gufo.exe"
 HF = Path.home() / ".cache" / "huggingface" / "hub"
 SNAP = HF / "models--unsloth--Qwen3.8-Flash-Next-GGUF" / "snapshots" / (

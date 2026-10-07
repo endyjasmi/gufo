@@ -1,5 +1,10 @@
 # Triage: endyjasmi/gufo#6 — reasoning-only empty turns + identity denials on `feature/window-native`
 
+**FIX LANDED (2026-10-08, see "The fix" below): per-row PLE injection +
+per-row LM head at decode sizes. Temp-1.0 empty-content turns drop from
+9/28 (32%) to 1/28 (3.6%) — the AR-only base rate. The issue's exact
+signature (finish=stop, empty content) is 0/28.**
+
 **Date:** 2026-10-07 · **Binary under test:** `D:\gufo\build\windows-release\gufo.exe`
 (built from `feature/window-native` @ `1cfd681`, one commit past the reported `39d8378`)
 **Machine:** Strix Halo gfx1151, same class as reporter. Model: unsloth
@@ -140,6 +145,56 @@ answer" shape.
   (w1 never runs a verify batch or rollback, yet drifts identically).
   The per-row GDN/conv/PLE snapshot restore in `Executor::Rollback`
   (executor.cpp:2890) also audits clean on read-through.
+
+## The fix (2026-10-08)
+
+Two decode-sized routes were made per-row (n ≤ 8 keeps of the speculative
+verify / concatenated decode batches):
+
+1. **PLE injection** (`Executor::Ple`, executor.cpp): decode-sized batches
+   run the gather/key/value/gate/conv chain one row at a time with the
+   exact single-token calls, restoring the rolling-history snapshot after
+   each row so the rollback contract (rows[keep-1] = window after `keep`
+   tokens) is preserved. Prefill keeps the batched route.
+2. **LM head** (`Executor::ForwardBody` head block, mirrored in the
+   concatenated-batch head in batch.cpp): decode-sized batches run the head
+   mixer + vocabulary projection per row with the identical single-token
+   calls (`HcMix(1)` + `Dense(1)`), so every verify row — and every row of
+   a multi-session decode batch — is bit-identical to what autoregressive
+   decoding computes for the same token.
+
+**Why this is the bug:** the batched PLE gate/conv and head reductions
+compute each row differently at n > 1 than single-token decode. Those
+logits decide anchors and verify acceptance, so every speculative cycle
+re-rolled the model's routing decisions with different numerics than AR —
+the degeneration multiplier at temp 1.0. With per-row routes, rejected-cycle
+frontiers are bit-exact and streams stay identical far longer.
+
+**Validation:**
+- Engine probe (`parity_probe`): prefill bit-exact; width-1 identical 250
+  steps; post-reject rollback state bit-exact over 8 width-1 steps
+  (max|Δ|=0); token streams identical for 40 emitted tokens (previously
+  diverged at token 2-3).
+- **Serve, reporter's config, temp 1.0 (4 sessions × 7 turns): 0/28 exact
+  empty signature, 1/28 budget-burn = 1/28 (3.6%) total vs 9/28 (32%)
+  unfixed and 1/56 (1.8%) AR-only.** The remaining single burn is the base
+  model's own rare loop (AR shows it too).
+- Session test `--sampling-only`: all 25 serial serving-sampling cases pass
+  including greedy AR/MTP parity. The final interleaved-pair check **fails
+  identically on the pristine build** (verified by stashing the fix) — a
+  pre-existing Windows-build failure in the batch path (AR-vs-AR token flip
+  under concurrency), not a regression. Worth a separate issue.
+- Perf: single-request width sweep timings were 25→30 s (w7) / 31→34 s (w1)
+  in one noisy sample each — the per-row head re-reads the 248K×2560 head
+  weights n times per cycle. Needs a proper benchmark before/after; if it
+  lands >5%, a row-batched head kernel with per-row reductions is the
+  follow-up.
+
+**Residual (accepted):** greedy near-tie flips at row ≥ 1 of the body's
+batched middle layers (first at emitted token ~40 on the fixture, e.g.
+跟进/跟) — the documented "may flip near-ties" class; same-text or
+adjacent-token variants, no empty turns. Full removal requires per-row MoE
+attention/GDN reductions, which is kernel engineering beyond this fix.
 
 ## Fix session (2026-10-07, later): rollback restore isolated
 

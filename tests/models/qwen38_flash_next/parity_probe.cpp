@@ -108,7 +108,6 @@ std::string_view ArgmaxText(const Model& model, std::int32_t token) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  _putenv("GUFO_ISSUE6_TRACE=1");
   std::printf("probe start\n");
   std::string_view model_path;
   std::string_view mtp_path;
@@ -231,25 +230,38 @@ int main(int argc, char** argv) {
             diverged = step;
           break;
         }
-        if (ra.tokens.front() != rb.tokens.front()) {
-          diverged = step;
-          const auto diff = Compare(ar2->Logits(), mtp2->Logits());
-          std::printf("phase 2 (cycle-2): step %d TOKEN DIVERGES %d(%.*s) vs %d(%.*s); frontier max|d|=%.6g differing=%zu/%zu\n",
-                      step, ra.tokens.front(),
-                      static_cast<int>(
-                          ArgmaxText(*model, ra.tokens.front()).size()),
-                      ArgmaxText(*model, ra.tokens.front()).data(),
-                      rb.tokens.front(),
-                      static_cast<int>(
-                          ArgmaxText(*model, rb.tokens.front()).size()),
-                      ArgmaxText(*model, rb.tokens.front()).data(),
-                      diff.max_abs, diff.signs, ar2->Logits().size());
+        // Compare committed STREAMS, not per-step emissions: a speculative
+        // cycle commits a variable number of tokens while AR commits one,
+        // so per-step fronts legitimately differ once a draft is accepted.
+        const auto& ar_stream = ar2->Tokens();
+        const auto& mtp_stream = mtp2->Tokens();
+        const auto common =
+            std::min(ar_stream.size(), mtp_stream.size()) - prompt.size();
+        for (std::size_t i = 0; i < common; ++i) {
+          const auto ai = prompt.size() + i;
+          if (ar_stream[ai] != mtp_stream[ai]) {
+            diverged = step;
+            std::printf("phase 2 (cycle-2): step %d STREAM DIVERGES at emitted token %zu: %d(%.*s) vs %d(%.*s)\n",
+                        step, i, ar_stream[ai],
+                        static_cast<int>(
+                            ArgmaxText(*model, ar_stream[ai]).size()),
+                        ArgmaxText(*model, ar_stream[ai]).data(),
+                        mtp_stream[ai],
+                        static_cast<int>(
+                            ArgmaxText(*model, mtp_stream[ai]).size()),
+                        ArgmaxText(*model, mtp_stream[ai]).data());
+            break;
+          }
         }
         const auto stats = mtp2->Statistics();
         const auto cycle_drafted = stats.drafted - prev_drafted;
         const auto cycle_accepted = stats.accepted - prev_accepted;
         prev_drafted = stats.drafted;
         prev_accepted = stats.accepted;
+        // NOTE: for greedy pinned cycles Session::Logits() stays at the
+        // pre-cycle frontier by design (the next anchor rides in the
+        // sampler's deferred sample), so this frontier delta is expected
+        // and not evidence of state corruption.
         const auto frontier = Compare(ar2->Logits(), mtp2->Logits());
         std::printf("  phase2 step %d: emitted=%zu cycle_drafted=%llu cycle_accepted=%llu%s frontier max|d|=%.6g differing=%zu\n",
                     step, rb.tokens.size(),
@@ -258,9 +270,12 @@ int main(int argc, char** argv) {
                     cycle_drafted > cycle_accepted ? " REJECTED" : "",
                     frontier.max_abs, frontier.signs);
         // Restore-isolation test: right after the first rejected cycle the
-        // committed histories are still identical; width-1 steps on both
-        // sessions must produce bit-identical frontiers if the rollback
-        // restored everything.
+        // committed histories are still identical. One width-1 step through
+        // the SAME persistent samplers (the production contract: a rejected
+        // pinned cycle defers the next anchor via DeferSample) must then
+        // produce bit-identical frontiers if the rollback restored
+        // everything. Fresh samplers here would be an invalid test: they
+        // cannot see the deferred anchor.
         if (cycle_drafted > cycle_accepted && !restore_tested) {
           restore_tested = true;
           const std::vector<gufo::sampling::TokenId> history_a(
@@ -268,15 +283,19 @@ int main(int argc, char** argv) {
           const std::vector<gufo::sampling::TokenId> history_b(
               mtp2->Tokens().begin(), mtp2->Tokens().end());
           if (history_a == history_b) {
-            gufo::sampling::SamplerState sa(config, history_a);
-            gufo::sampling::SamplerState sb(config, history_b);
             for (int rstep = 0; rstep < 8; ++rstep) {
               Session::DecodeResult ra;
               Session::DecodeResult rb;
-              if (!ar2->DecodeStep(1, sa, &ra, &error) ||
-                  !mtp2->DecodeStep(1, sb, &rb, &error)) {
+              if (!ar2->DecodeStep(1, ar_sampler, &ra, &error) ||
+                  !mtp2->DecodeStep(1, mtp_sampler, &rb, &error)) {
                 std::fprintf(stderr, "restore-test decode failed: %s\n",
                              error.c_str());
+                break;
+              }
+              if (!ra.tokens.empty() && !rb.tokens.empty() &&
+                  ra.tokens.front() != rb.tokens.front()) {
+                std::printf("  restore-test step %d: TOKEN DIVERGES %d vs %d\n",
+                            rstep, ra.tokens.front(), rb.tokens.front());
                 break;
               }
               const auto rdiff = Compare(ar2->Logits(), mtp2->Logits());
@@ -296,45 +315,6 @@ int main(int argc, char** argv) {
         emitted += static_cast<int>(rb.tokens.size());
         if (ra.stop || rb.stop)
           break;
-      }
-      // Restore-isolation test: after the first rejected cycle (state rolled
-      // back), run BOTH sessions in width-1 mode on their now-identical
-      // committed histories. Bit-exact frontiers prove the rollback
-      // restored everything; any divergence names the restore as incomplete.
-      {
-        const std::vector<gufo::sampling::TokenId> history_a(ar2->Tokens().begin(),
-                                                             ar2->Tokens().end());
-        const std::vector<gufo::sampling::TokenId> history_b(
-            mtp2->Tokens().begin(), mtp2->Tokens().end());
-        if (history_a == history_b) {
-          gufo::sampling::SamplerState sa(config, history_a);
-          gufo::sampling::SamplerState sb(config, history_b);
-          int restored_ok = 0;
-          for (int step = 0; step < 8; ++step) {
-            Session::DecodeResult ra;
-            Session::DecodeResult rb;
-            if (!ar2->DecodeStep(1, sa, &ra, &error) ||
-                !mtp2->DecodeStep(1, sb, &rb, &error)) {
-              std::fprintf(stderr, "restore-test decode failed: %s\n",
-                           error.c_str());
-              break;
-            }
-            const auto diff = Compare(ar2->Logits(), mtp2->Logits());
-            const bool same = diff.max_abs == 0.0 && diff.signs == 0;
-            std::printf("  restore-test step %d: %s max|d|=%.6g differing=%zu\n",
-                        step, same ? "IDENTICAL" : "DIVERGES", diff.max_abs,
-                        diff.signs);
-            if (!same)
-              break;
-            ++restored_ok;
-            if (ra.stop || rb.stop)
-              break;
-          }
-          if (restored_ok == 8)
-            std::printf("  restore-test: width-1 frontiers IDENTICAL over 8 steps\n");
-        } else {
-          std::printf("  restore-test: committed histories differ; skipped\n");
-        }
       }
       if (diverged >= 0) {
         // Coherence check: continue the MTP session with width-1 steps and
@@ -391,17 +371,29 @@ int main(int argc, char** argv) {
             diverged = step;
           break;
         }
-        if (ra.tokens.front() != rb.tokens.front()) {
-          diverged = step;
-          std::printf("phase 3 (free): step %d TOKEN DIVERGES %d(%.*s) vs %d(%.*s)\n",
-                      step, ra.tokens.front(),
-                      static_cast<int>(
-                          ArgmaxText(*model, ra.tokens.front()).size()),
-                      ArgmaxText(*model, ra.tokens.front()).data(),
-                      rb.tokens.front(),
-                      static_cast<int>(
-                          ArgmaxText(*model, rb.tokens.front()).size()),
-                      ArgmaxText(*model, rb.tokens.front()).data());
+        // Stream comparison (see phase 2): free-running widths commit a
+        // variable number of tokens per step.
+        {
+          const auto& ar_stream = ar3->Tokens();
+          const auto& mtp_stream = mtp3->Tokens();
+          const auto common =
+              std::min(ar_stream.size(), mtp_stream.size()) - prompt.size();
+          for (std::size_t i = 0; i < common; ++i) {
+            const auto ai = prompt.size() + i;
+            if (ar_stream[ai] != mtp_stream[ai]) {
+              diverged = step;
+              std::printf("phase 3 (free): step %d STREAM DIVERGES at emitted token %zu: %d(%.*s) vs %d(%.*s)\n",
+                          step, i, ar_stream[ai],
+                          static_cast<int>(
+                              ArgmaxText(*model, ar_stream[ai]).size()),
+                          ArgmaxText(*model, ar_stream[ai]).data(),
+                          mtp_stream[ai],
+                          static_cast<int>(
+                              ArgmaxText(*model, mtp_stream[ai]).size()),
+                          ArgmaxText(*model, mtp_stream[ai]).data());
+              break;
+            }
+          }
         }
         emitted += rb.tokens.size();
         if (ra.stop || rb.stop)

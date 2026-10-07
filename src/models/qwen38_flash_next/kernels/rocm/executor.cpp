@@ -1947,6 +1947,53 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                    float* res, bool speculative, std::string* error_msg,
                    bool embeddings_ready, PrefillCheckpoint* checkpoint) const {
   const Config& c = config();
+  // Decode-sized batches run the injection one row at a time: the batched
+  // gate/conv routes reduce differently at n > 1 than single-token decode,
+  // which perturbs every downstream router decision and desyncs speculative
+  // verification from autoregressive decoding. Per-row calls keep the
+  // arithmetic bit-identical; prefill keeps the batched route (AR and MTP
+  // prefill already match chunk for chunk).
+  if (n > 1 && !prefill_phase && checkpoint == nullptr) {
+    const std::size_t emb_count =
+        static_cast<std::size_t>(n) * c.PleEmbeddingDim();
+    if (!embeddings_ready &&
+        (!WaitPle(error_msg) ||
+         !Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
+                               hipMemcpyHostToDevice, stream_),
+                "n-gram upload", error_msg))) {
+      return false;
+    }
+    const std::size_t hist_bytes =
+        static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
+        sizeof(float);
+    for (std::uint32_t row = 0; row < n; ++row) {
+      if (!Check(hipMemcpyAsync(
+                     s_.ple_emb,
+                     host_emb_ + static_cast<std::size_t>(row) *
+                                     c.PleEmbeddingDim(),
+                     c.PleEmbeddingDim() * sizeof(float),
+                     hipMemcpyHostToDevice, stream_),
+                 "n-gram row upload", error_msg)) {
+        return false;
+      }
+      if (!Ple(l, session, 1,
+               res + static_cast<std::size_t>(row) * c.HcDim(), speculative,
+               error_msg, true, checkpoint)) {
+        return false;
+      }
+      // Snapshot the rolling history after each row: rows[keep - 1] must be
+      // the window after `keep` tokens when a rejected draft rolls back.
+      if (speculative && row + 1 < n &&
+          session.ple_snapshots_.rows[0] != nullptr &&
+          !Check(hipMemcpyAsync(session.ple_snapshots_.rows[row],
+                                session.ple_history_, hist_bytes,
+                                hipMemcpyDeviceToDevice, stream_),
+                 "PLE row snapshot", error_msg)) {
+        return false;
+      }
+    }
+    return true;
+  }
   const std::size_t emb_count =
       static_cast<std::size_t>(n) * c.PleEmbeddingDim();
   if (!embeddings_ready &&
@@ -2866,13 +2913,34 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     return false;
   }
   if (n_logits > 0) {
+    const bool decode_head = !prefill_phase;
     PrefillPhase head_phase(false);
     // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
-    if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
-               n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+    // Decode-sized batches run the head one row at a time. The batched head
+    // mixer and vocabulary projection reduce differently at n > 1 than
+    // single-token decode, which shifts logits far enough to flip greedy
+    // tokens and desync speculative verification from autoregressive
+    // decoding. Per-row calls are bit-identical to AR; prefill keeps the
+    // batched route.
+    if (decode_head && n_logits > 1) {
+      for (std::uint32_t row = 0; row < n_logits; ++row) {
+        if (!HcMix(head,
+                   s_.res +
+                       (skip + static_cast<std::size_t>(row)) * c.HcDim(),
+                   false, s_.mixed, nullptr, 1, error_msg) ||
+            !Dense(model_->output(), s_.mixed,
+                   s_.logits +
+                       static_cast<std::size_t>(row) * c.vocab_size,
+                   1, error_msg)) {
+          return false;
+        }
+      }
+    } else if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
+                      n_logits, error_msg) ||
+               !Dense(model_->output(), s_.mixed, s_.logits, n_logits,
+                      error_msg)) {
       return false;
     }
     if (download_logits &&
