@@ -28,13 +28,12 @@ void QwenGpuExecutor::PrefillLayerCheckpoint(std::uint32_t layer) {
   HIP_CHECK(hipEventRecord(prefill_events_[slot], arena_.stream));
   if (layer < 8)
     return;
-  hipError_t status;
-  while ((status = hipEventQuery(prefill_events_[1 - slot])) ==
-         hipErrorNotReady) {
-    CheckPrefillCancellation();
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
-  }
-  HIP_CHECK(status);
+  // One blocking wait parks the host thread in the kernel until the older
+  // group retires. Polling the event with query+sleep storms cost ~5% of
+  // large-chunk prefill on WDDM: each query is a kernel-mode round trip,
+  // and the 200 us sleeps let dispatch run dry between polls.
+  CheckPrefillCancellation();
+  HIP_CHECK(hipEventSynchronize(prefill_events_[1 - slot]));
 }
 
 tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
