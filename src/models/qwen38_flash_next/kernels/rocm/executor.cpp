@@ -3313,7 +3313,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
 std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                                                std::uint32_t position) const {
   const auto& c = config();
-  auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session);
+  auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session,
+                              options_.kv_cache_dtype);
   h.position = position;
   h.blocks = c.compress_ratio > 0 && position > c.indexer_top_k
                  ? position / c.compress_ratio
