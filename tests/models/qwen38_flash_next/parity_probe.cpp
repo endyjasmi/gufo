@@ -108,6 +108,7 @@ std::string_view ArgmaxText(const Model& model, std::int32_t token) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  _putenv("GUFO_ISSUE6_TRACE=1");
   std::printf("probe start\n");
   std::string_view model_path;
   std::string_view mtp_path;
