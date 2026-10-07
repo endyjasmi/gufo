@@ -21,7 +21,8 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-// Keep enough direct reads outstanding while layer 0 runs.
+// Next-chunk prefetch hides large gathers behind the current transformer
+// pass. More readers increased CPU work without improving served prefill.
 constexpr std::size_t kWorkers = 32;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
@@ -466,8 +467,13 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   pending_ = jobs_.size();
   failed_ = false;
   active_ = true;
-  if (pending_ != 0) {
+  // A decode gather has a handful of reads: wake one reader per read, not
+  // the whole pool. Readers keep taking jobs until the queue is empty.
+  if (pending_ >= workers_.size()) {
     wake_.notify_all();
+  } else {
+    for (std::size_t i = 0; i < pending_; ++i)
+      wake_.notify_one();
   }
   return true;
 }

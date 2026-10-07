@@ -22,6 +22,7 @@
 
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/json.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #if defined(_WIN32)
 // Upstream's POSIX environment helper, for the redirected-sink assertions.
@@ -29,6 +30,9 @@ static void setenv(const char* name, const char* value, int) {
   (void)_putenv_s(name, value);
 }
 #endif
+
+using gufo::tokenization::kImEnd;
+using gufo::tokenization::kImStart;
 
 namespace {
 
@@ -1614,6 +1618,53 @@ void TestRamLearnsDivergenceBoundaries() {
   request.Invalidate();
 }
 
+void TestLearnedBoundarySurvivesExactRepublication() {
+  // A request for exactly the learned prefix publishes the same tokens again.
+  // Uncached, it replaces the learned checkpoint, in place or, with a full
+  // budget, after admission reclaims the old copy. Either way the copy must
+  // stay a branch point, or it ranks as redundant once the older branch is
+  // gone and the next new branch retires it.
+  for (const auto [full, reuse] :
+       {std::pair{false, true}, std::pair{false, false}, std::pair{true, true},
+        std::pair{true, false}}) {
+    auto stats = std::make_shared<FakeStats>();
+    // Room for five snapshots, so unrelated prompts force evictions, or for
+    // three, so republication itself must evict.
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "republished-boundary", (full ? 3 : 5) * sizeof(FakeSnapshot),
+        4096);
+    TextRunnerPool pool(runner, 1);
+    const std::vector<TextRunnerToken> shared(1000, 100);
+    const auto run = [&](std::vector<TextRunnerToken> prompt,
+                         bool reuse_prompt = true) {
+      auto request = pool.Acquire(std::move(prompt), {}, {}, {}, reuse_prompt);
+      const auto cached = request.cached_prompt_tokens();
+      while (!request.prefill_complete())
+        (void)request.Prefill(4096);
+      (void)request.Commit();
+      return cached;
+    };
+    const auto branch = [&](TextRunnerToken tail) {
+      auto prompt = shared;
+      prompt.insert(prompt.end(), 600, tail);
+      return prompt;
+    };
+    (void)run(branch(10000));
+    (void)run(branch(20000));  // Learns the branch point after 1000 tokens.
+    if (full)
+      (void)run({9, 9, 9});  // Fills the budget and evicts the older branch.
+    (void)run(shared, reuse);
+    if (!full) {
+      for (const TextRunnerToken token : {9U, 8U, 7U, 6U})
+        (void)run({token, token, token});
+    }
+    Expect(run(branch(30000)) == 1000,
+           "republishing the learned prefix keeps it a branch point");
+    Expect(run(branch(40000)) == 1000,
+           "a new branch does not retire the republished branch point");
+  }
+}
+
 void TestCoincidentCacheBoundariesShareOneCopy() {
   for (const bool stable : {false, true}) {
     TemporaryDirectory directory;
@@ -1998,8 +2049,9 @@ void TestServerInstructionsAreFraming() {
   for (int i = 0; i < 256; ++i)
     vocab.emplace_back(1, static_cast<char>(i));
   std::unordered_map<std::string, TokenId> specials;
-  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<think>", "</think>",
-                            "<tool_call>", "</tool_call>"}) {
+  for (std::string_view token : std::initializer_list<std::string_view>{
+           kImStart, kImEnd, "<think>", "</think>", "<tool_call>",
+           "</tool_call>"}) {
     specials.emplace(token, vocab.size());
     vocab.emplace_back(token);
   }
@@ -2239,6 +2291,7 @@ int main() {
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestRamLearnsDivergenceBoundaries();
+  TestLearnedBoundarySurvivesExactRepublication();
   TestCoincidentCacheBoundariesShareOneCopy();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();
