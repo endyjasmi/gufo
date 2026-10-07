@@ -141,7 +141,57 @@ answer" shape.
   The per-row GDN/conv/PLE snapshot restore in `Executor::Rollback`
   (executor.cpp:2890) also audits clean on read-through.
 
-## Root-cause locus (current best)
+## Fix session (2026-10-07, later): kernel-level localization
+
+A GPU parity probe (`parity_probe.cpp`, committed) now reproduces the drift
+**at the engine session level, deterministically, without HTTP**: an AR
+session and a speculative session run the same 1,423-token prompt greedy.
+
+- Prefill frontiers: **bit-identical** (max|Δ|=0).
+- Width-1 decode (trunk kDecode + draft catch-up): **bit-identical over
+  250 steps**.
+- The **first multi-row verify cycle** diverges: frontier max|Δ| = 11.85,
+  **all 248,320 logits**, reproducibly at dense (1.4K-token) and sparse
+  (7.4K-token) positions.
+- The post-divergence state is **valid** — continuing the speculative
+  session with width-1 steps yields a perfectly coherent continuation. No
+  corruption.
+- Per-layer checksums: layer 0 bit-exact; **the divergence starts at
+  layer 1 (the PLE layer)** and cascades.
+- Ruled out by disabling one mechanism per build (delta bit-identical
+  11.8504 in every variant): snapshot stores + restore, the pinned-chain /
+  device-argmax path, the q8t staging cache, per-row n-gram hashing, trunk
+  speculative graphs, draft graphs.
+- State-restore proof: with everything eager, the **restored GDN/conv state
+  checksums (layers 0–2) are bit-identical to AR's at the same commit**, the
+  n-gram window restore is correct, the PLE history head is correct — and
+  the *next* verify forward, given those identical inputs, still diverges
+  at L1.
+
+**Root cause (proven by elimination): the multi-row (n ≥ 2) verify forward's
+kernels compute per-row results that differ from single-token decode through
+n-dependent reduction order / launch geometry — starting in the layer-1 op
+stack (PLE projections, GDN recurrence, or MoE), then amplified by MoE
+router top-k near-tie flips into large logit deltas.** This is the class the
+engine documents as accepted ("the single row route has a different
+floating-point reduction"; QUALITY.md: free-running C≥2 text may flip
+near-ties) — the existing parity gates only cover 8-token completions and
+matched prefill, where the effect is invisible.
+
+**Why it degrades generation quality:** every speculative cycle re-rolls
+router decisions, so MTP trajectories are a noisier sample of the model; on
+persona/memory fixtures at temp 1.0 this multiplies reasoning-phase
+degeneration (repetition loops, premature stops inside `<think>`) roughly
+tenfold (12/56 turns vs 1/56 AR-only across two full runs).
+
+**Fix path:** make the n ≤ 8 kernels' per-row results independent of the
+batch row count (grid/wave layout invariant reduction), verified by the new
+probe (phase 2 must read bit-exact) plus an n=1-vs-n=2 equivalence assertion
+in the op tests. Until then `--speculative off` is the only clean mode;
+`--repeat-penalty 1.1` was tested and does **not** help.
+
+Probe evidence: `results/probe-*` and `probe-exp*.log` next to this file
+(worktree root).
 
 With the MTP block loaded, every generated token's distribution comes from
 trunk forwards that run **with the MTP machinery active** — the trunk frontier

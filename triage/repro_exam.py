@@ -48,7 +48,8 @@ DENIAL_PATTERNS = [
 OUT_ROOT = Path(__file__).parent / "results"
 
 
-def server_args(port: int, label: str, no_speculative: bool, trace: bool) -> list[str]:
+def server_args(port: int, label: str, no_speculative: bool, trace: bool,
+                repeat_penalty: float = 1.0) -> list[str]:
     args = [
         str(GUFO), "serve",
         "--host", "127.0.0.1", "--port", str(port),
@@ -64,6 +65,9 @@ def server_args(port: int, label: str, no_speculative: bool, trace: bool) -> lis
         "--temperature", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0",
         "--mmproj", str(MMPROJ),
     ]
+    if repeat_penalty != 1.0:
+        args += ["--repeat-penalty", str(repeat_penalty),
+                 "--repeat-last-n", "128"]
     if no_speculative:
         args += ["--speculative", "off"]
     else:
@@ -185,6 +189,7 @@ def main() -> int:
     parser.add_argument("--no-speculative", action="store_true")
     parser.add_argument("--no-preserve", action="store_true")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--repeat-penalty", type=float, default=1.0)
     cli = parser.parse_args()
 
     out_dir = OUT_ROOT / cli.label
@@ -199,7 +204,8 @@ def main() -> int:
         print(f"== session {session} ({exam.name}) ==", flush=True)
         server_log = open(log_path.with_suffix(
             f".s{session}.log"), "w", encoding="utf-8")
-        args = server_args(cli.port, cli.label, cli.no_speculative, cli.trace)
+        args = server_args(cli.port, cli.label, cli.no_speculative, cli.trace,
+                           cli.repeat_penalty)
         if cli.no_preserve:
             index = args.index("--preserve-thinking")
             args[index + 1] = "off"

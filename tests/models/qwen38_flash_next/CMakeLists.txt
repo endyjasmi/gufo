@@ -60,4 +60,9 @@ if (ENGINE_ENABLE_HIP)
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next_reference)
+
+  add_executable(qwen38_flash_next_parity_probe EXCLUDE_FROM_ALL
+    parity_probe.cpp)
+  target_link_libraries(qwen38_flash_next_parity_probe PRIVATE
+    gufo_qwen38_flash_next hip::host)
 endif()
