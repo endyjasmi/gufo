@@ -1,9 +1,12 @@
 # Triage: endyjasmi/gufo#6 — reasoning-only empty turns + identity denials on `feature/window-native`
 
 **FIX LANDED (2026-10-08, see "The fix" below): per-row PLE injection +
-per-row LM head at decode sizes. Temp-1.0 empty-content turns drop from
-9/28 (32%) to 1/28 (3.6%) — the AR-only base rate. The issue's exact
-signature (finish=stop, empty content) is 0/28.**
+per-row head mixer at decode sizes with batched vocabulary projection.
+Temp-1.0 empty-content turns drop from 12/56 (21.4%) to 6/70 (8.6%, pooled
+bit-identical builds); the exact reported signature drops from 8/56 to
+4/70. Not yet at the AR-only rate (1/56) — the residual is the row>=1
+batched-body near-tie class (see Residual). Perf: no regression on pp or
+tg for AR/MTP at C1/C2 (matched interleaved benchmark).**
 
 **Date:** 2026-10-07 · **Binary under test:** `D:\gufo\build\windows-release\gufo.exe`
 (built from `feature/window-native` @ `1cfd681`, one commit past the reported `39d8378`)
@@ -175,20 +178,29 @@ frontiers are bit-exact and streams stay identical far longer.
   steps; post-reject rollback state bit-exact over 8 width-1 steps
   (max|Δ|=0); token streams identical for 40 emitted tokens (previously
   diverged at token 2-3).
-- **Serve, reporter's config, temp 1.0 (4 sessions × 7 turns): 0/28 exact
-  empty signature, 1/28 budget-burn = 1/28 (3.6%) total vs 9/28 (32%)
-  unfixed and 1/56 (1.8%) AR-only.** The remaining single burn is the base
-  model's own rare loop (AR shows it too).
+- **Serve, reporter's config, temp 1.0, pooled over three full/scaled runs
+  of the (probe-proven bit-identical) fixed binary: 6/70 empty-content
+  turns (8.6%) vs 12/56 (21.4%) unfixed and 1/56 (1.8%) AR-only.**
+  Per-run spread 1/28–3/14 — small-sample RNG variance on the same
+  distribution. The residual above the AR rate is the row>=1 batched-body
+  class, not state corruption.
 - Session test `--sampling-only`: all 25 serial serving-sampling cases pass
   including greedy AR/MTP parity. The final interleaved-pair check **fails
   identically on the pristine build** (verified by stashing the fix) — a
   pre-existing Windows-build failure in the batch path (AR-vs-AR token flip
   under concurrency), not a regression. Worth a separate issue.
-- Perf: single-request width sweep timings were 25→30 s (w7) / 31→34 s (w1)
-  in one noisy sample each — the per-row head re-reads the 248K×2560 head
-  weights n times per cycle. Needs a proper benchmark before/after; if it
-  lands >5%, a row-batched head kernel with per-row reductions is the
-  follow-up.
+- Perf (matched interleaved benchmark, per-request medians, greedy,
+  thinking off):
+  - pp2048 tok/s: AR C1 1422→1415 (−0.5%), MTP C1 1369→1372 (+0.3%);
+    C2 within the prefill-serialization artifact (bimodal ~1370/~900 both
+    builds; prefill does not scale with C).
+  - tg128 tok/s: AR C1 28.07→27.94 (−0.5%), AR C2 22.46→22.44 (−0.1%),
+    MTP C1 35.79→35.98 (+0.5%), MTP C2 25.85→26.61 (+2.9%).
+  The first fix revision (fully per-row head) measured MTP C1 −8.2% and
+  was optimized: the head mixer stays per-row (cheap, 2560-dim) while the
+  248K×2560 vocabulary projection runs batched (probe-verified per-row
+  exact), and the PLE loop uploads the batch once and reads rows by device
+  offset instead of n pageable H2D copies.
 
 **Residual (accepted):** greedy near-tie flips at row ≥ 1 of the body's
 batched middle layers (first at emitted token ~40 on the fixture, e.g.

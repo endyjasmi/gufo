@@ -1945,14 +1945,16 @@ bool Executor::WaitPle(std::string* error_msg) const {
 
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                    float* res, bool speculative, std::string* error_msg,
-                   bool embeddings_ready, PrefillCheckpoint* checkpoint) const {
+                   bool embeddings_ready, PrefillCheckpoint* checkpoint,
+                   const float* emb_override) const {
   const Config& c = config();
   // Decode-sized batches run the injection one row at a time: the batched
   // gate/conv routes reduce differently at n > 1 than single-token decode,
   // which perturbs every downstream router decision and desyncs speculative
   // verification from autoregressive decoding. Per-row calls keep the
   // arithmetic bit-identical; prefill keeps the batched route (AR and MTP
-  // prefill already match chunk for chunk).
+  // prefill already match chunk for chunk). The whole batch is uploaded
+  // once; each row reads its slice through `emb_override`.
   if (n > 1 && !prefill_phase && checkpoint == nullptr) {
     const std::size_t emb_count =
         static_cast<std::size_t>(n) * c.PleEmbeddingDim();
@@ -1967,18 +1969,11 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
         static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
         sizeof(float);
     for (std::uint32_t row = 0; row < n; ++row) {
-      if (!Check(hipMemcpyAsync(
-                     s_.ple_emb,
-                     host_emb_ + static_cast<std::size_t>(row) *
-                                     c.PleEmbeddingDim(),
-                     c.PleEmbeddingDim() * sizeof(float),
-                     hipMemcpyHostToDevice, stream_),
-                 "n-gram row upload", error_msg)) {
-        return false;
-      }
       if (!Ple(l, session, 1,
                res + static_cast<std::size_t>(row) * c.HcDim(), speculative,
-               error_msg, true, checkpoint)) {
+               error_msg, true, checkpoint,
+               s_.ple_emb + static_cast<std::size_t>(row) *
+                                c.PleEmbeddingDim())) {
         return false;
       }
       // Snapshot the rolling history after each row: rows[keep - 1] must be
@@ -2004,8 +1999,9 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
     return false;
   }
   const std::uint32_t hc_dim = c.HcDim();
+  const float* emb_source = emb_override != nullptr ? emb_override : s_.ple_emb;
   Q8Input emb;
-  if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
+  if (!Quantize(emb_source, n, c.PleEmbeddingDim(), &emb, error_msg) ||
       !Dense(l.ple_key, emb, s_.ple_key, error_msg) ||
       !Dense(l.ple_value, emb, s_.ple_value, error_msg)) {
     return false;
@@ -2925,17 +2921,22 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // decoding. Per-row calls are bit-identical to AR; prefill keeps the
     // batched route.
     if (decode_head && n_logits > 1) {
+      // Per-row mixer norm (row-invariant only one row at a time), one
+      // batched vocabulary projection: the vocab GEMV reduces each row
+      // independently, so its rows match single-token decode while the
+      // weights are read once.
       for (std::uint32_t row = 0; row < n_logits; ++row) {
         if (!HcMix(head,
                    s_.res +
                        (skip + static_cast<std::size_t>(row)) * c.HcDim(),
-                   false, s_.mixed, nullptr, 1, error_msg) ||
-            !Dense(model_->output(), s_.mixed,
-                   s_.logits +
-                       static_cast<std::size_t>(row) * c.vocab_size,
-                   1, error_msg)) {
+                   false,
+                   s_.mixed + static_cast<std::size_t>(row) * c.hidden_size,
+                   nullptr, 1, error_msg)) {
           return false;
         }
+      }
+      if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+        return false;
       }
     } else if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                       n_logits, error_msg) ||
