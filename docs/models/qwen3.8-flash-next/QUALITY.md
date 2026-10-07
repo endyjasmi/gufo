@@ -1,14 +1,17 @@
 # Qwen3.8 Flash-Next quality
 
-**All 63 measured tg128 requests match fresh AR completions:** 21 AR,
-21 mixed MTP and 21 repetitive MTP at C1/2/4/6/8. Unsloth UD-Q4_K_XL target,
+**Retained concurrency qualification: 63 tg128 requests match fresh AR completions:**
+21 AR, 21 mixed MTP and 21 repetitive MTP at C1/2/4/6/8. Unsloth UD-Q4_K_XL target,
 shared Q8_0 MTP; [identities](artifacts/model-identities.json).
 These are consistency checks, not original unquantized-model or GGUF-conversion
-qualification. HTTP measurements: September 20–23, 2026; attention review:
+qualification. Concurrency checks: September 20–23, 2026; attention review:
 September 27–28.
 
 | Check | Result |
 | --- | --- |
+| Unused final-layer outputs | Full-vocabulary logits match unpruned execution byte-for-byte through 133,120 tokens, also with mixed code/Unicode text and image input. Mixed batching and sampled RAM/serialized snapshot replay preserve logits and RNG state. [Evidence](artifacts/prefill-final-rows.json). |
+| Bounded selector scratch | After 133,824 prompt tokens, 15,892,480 logits are byte-identical to the previous build. Ragged chunks retain exact masks and the independent FP64 score check. [Evidence](artifacts/prefill-deep-context.json). |
+| Unused normalization removal | 15,892,480 logits are byte-identical to main; ragged residual-only fusion matches normalized fusion and the separate epilogue/combine. [Evidence](artifacts/prefill-normalization.json). |
 | MTP versus scalar CPU formulas, eight text/image states | Fusion/attention relative RMS <0.0008 (limit 0.002); full-width normalization, split projections, recursive carry and full Q8 head checked |
 | Batched MTP/AR, C2/C4/C6/C8 | Logits, tokens, acceptance, RNG and every 1–8-token rollback prefix match isolated execution |
 | Sampling | 25 AR/MTP configurations, including top-p zero; FP64 target filtering/CDF, p/q acceptance, residual correction, seeded replay and short token budgets pass |
@@ -17,6 +20,7 @@ September 27–28.
 | Seeded MTP cache rebuilding | Two seeds × 200 tokens replay exactly after different prefill splits, cache bypass and replacement. K/V-only prefill and compact catch-up preserve full-head candidates across 1/8/9/32/33-row chunks. [Evidence](artifacts/mtp-cache-replay.json). |
 | Scalar versus bulk prefill, 2176 tokens | Same top-1; logit RMSE 0.18, not bit-identical |
 | Serving | Cancellation, three-turn continuation, reasoning/tool history, concurrent image/text isolation and disk restart pass |
+| Prompt checkpoints | In-pass and borrowed checkpoints restore exactly in AR/MTP, including rewinds, branches, resets and destruction; 14 functional cache jobs pass correctness. [Details](PROMPT-CHECKPOINTS.md) |
 | Sparse attention | Independent FP64 operator error ≤2.83e-7 (limit 1e-6). At 32K/128K, 256 fixed-token code/prose rows: mean KL 5.82e-4 and 256/256 top-1 agreement with an FP64-attention diagnostic. [Evidence](artifacts/attention-tiles-review.json). |
 | Shortlisted chained draft head | Chained greedy steps rank proposals over the catch-up top-512 instead of the full 248,320-row head. Greedy outputs and token SHA traces byte-identical on three prompts; canonical pp1778/tg128 acceptance unchanged; sampled top-64 path keeps the exact full head. [Evidence](artifacts/chain-shortlist-review.json). |
 | Batched greedy heads over per-session shortlists | All-greedy batched rounds rank proposals through the exact Q4_0 head copy (full rows seeding per-session top-512 lists, gathered rows after); sampled sessions keep the full Q8 head. C1 outputs byte-identical; batched-vs-serial logits/tokens/RNG/acceptance exact at matched widths; free-running C≥2 text may flip near-ties when batch alignment shifts (the unmodified engine does the same for staggered identical requests). [Evidence](artifacts/batch-shortlist-review.json). |
@@ -47,8 +51,12 @@ embedding bytes but do not resolve this gap. [Evidence](artifacts/vision-parity.
 
 Tests live in [`tests/models/qwen38_flash_next`](../../../tests/models/qwen38_flash_next).
 Use `--batch-only`, `--sampling-only`, `--prefill-only` or `--cache-only` on the
-session test;
-the snapshot test covers persistent image/text state. For independent MTP checks:
+session test; the snapshot test covers persistent image/text state.
+
+`--execution-only 133120` runs the focused deep AR/MTP logit and snapshot-replay
+check without the other session suites.
+
+For independent MTP checks:
 
 ```sh
 nix develop -c cmake --build --preset gpu-test \
@@ -64,13 +72,14 @@ weights. [Vision reproduction](../qwen3.8-27b/QUALITY.md#vision).
 
 ## Benchmark method
 
-Gufo single-user TG refreshed September 27, 2026 (`f797b5b`); PP and other
-measurements retain September 22–23 provenance. One warmed sample per point,
-greedy, thinking off.
+Gufo single-user pp/tg refreshed October 6, 2026 (`4c5a00d2`); reference,
+concurrency, loading and memory measurements retain September 22–23 provenance.
+One warmed sample per point, greedy, thinking off, penalties disabled.
 Single-user uses pp2048/tg128; MTP pp is the maximum across mixed/repetitive
-workloads. C1/2/4/6/8 use the same d0 prompts; every session prefills before
-measured tg128, with at most four prompt-tail tokens reevaluated. Rates sum
-individual decode rates. Gufo d0/C1 agree within 0.4% with matching drafts/output.
+workloads. Gufo capacity is 133760; reference capacity is 35456 through 32K,
+68224 at 64K and 133760 at 128K. C1/2/4/6/8 use the same d0 prompts; every
+session prefills before measured tg128, with at most four prompt-tail tokens
+reevaluated. Rates sum individual decode rates.
 Depth calibration depends on the ordered sweep. Paired speed controls use
 the same depth list. Deep AR/MTP HTTP cache frontiers differ by one token;
 exact replay is checked separately with identical prefill boundaries.

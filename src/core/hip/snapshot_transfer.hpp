@@ -4,7 +4,9 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <functional>
 #include <stdexcept>
+#include <utility>
 
 namespace gufo::hip {
 
@@ -16,22 +18,31 @@ public:
   SnapshotTransfer() {
     Check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking));
   }
+  /// Borrows a nonblocking stream from a caller's pool and hands it to
+  /// `release` once every copy has finished.
+  SnapshotTransfer(hipStream_t stream, std::function<void(hipStream_t)> release)
+      : stream_(stream), owned_(false), release_(std::move(release)) {}
   ~SnapshotTransfer() {
     (void)hipStreamSynchronize(stream_);
-    (void)hipStreamDestroy(stream_);
+    if (owned_)
+      (void)hipStreamDestroy(stream_);
+    else if (release_)
+      release_(stream_);
   }
   SnapshotTransfer(const SnapshotTransfer&) = delete;
   SnapshotTransfer& operator=(const SnapshotTransfer&) = delete;
 
   void Copy(void* destination, const void* source, std::size_t bytes,
             hipMemcpyKind kind = hipMemcpyDeviceToHost) {
-    Check(hipMemcpyAsync(destination, source, bytes, kind, stream_));
-    Check(hipStreamSynchronize(stream_));
+    Enqueue(destination, source, bytes, kind);
+    Finish();
   }
 
-  /// Enqueues one segment without synchronizing; callers must Finish before
-  /// reading any destination. Batching turns per-segment submission stalls
-  /// into one wait, which dominates many-segment snapshots on WDDM.
+  /// Enqueues one segment without synchronizing; queue only independent
+  /// frozen regions, then Finish before reading any destination, publishing
+  /// their snapshot or mutating/freeing any source or destination storage.
+  /// Batching turns per-segment submission stalls into one wait, which
+  /// dominates many-segment snapshots on WDDM.
   void Enqueue(void* destination, const void* source, std::size_t bytes,
                hipMemcpyKind kind = hipMemcpyDeviceToHost) {
     Check(hipMemcpyAsync(destination, source, bytes, kind, stream_));
@@ -53,6 +64,8 @@ private:
       throw std::runtime_error(hipGetErrorString(status));
   }
   hipStream_t stream_{nullptr};
+  bool owned_{true};
+  std::function<void(hipStream_t)> release_;
 };
 
 }  // namespace gufo::hip
