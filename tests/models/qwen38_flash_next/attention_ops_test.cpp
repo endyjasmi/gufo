@@ -146,6 +146,233 @@ std::vector<float> DequantRowQ8_0Host(const unsigned char* src,
   return out;
 }
 
+/// Host mirror of the kernels' planar Q4_K row quantization: GGML's
+/// quantize_row_q4_K_ref machinery (per-32 sub-block weighted least-squares
+/// scale search, 6-bit scale/min packing, code requantization through the
+/// stored F16 scales) in the kernels' canonical XOR-butterfly reduction
+/// order, every op single-rounded IEEE so the bytes match the __f*_rn
+/// device code.
+float Q4KButterflySum32(const float* v) {
+  float cur[32];
+  std::memcpy(cur, v, sizeof(cur));
+  float next[32];
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int i = 0; i < 32; ++i)
+      next[i] = cur[i] + cur[i ^ offset];
+    std::memcpy(cur, next, sizeof(cur));
+  }
+  return cur[0];
+}
+
+int Q4KNearestIntHost(float fval) {
+  const float val = fval + 12582912.0F;
+  int i;
+  std::memcpy(&i, &val, sizeof(int));
+  return (i & 0x007fffff) - 0x00400000;
+}
+
+/// One 32-element sub-block: the reference's make_qkx2_quants(32, 15,
+/// rmin=-1, rdelta=0.1, nstep=20). `min_out` is the stored min (>= 0, the
+/// negated clamped block minimum); the search's min stays live across
+/// candidate iterations exactly like the reference.
+void Q4KSubBlockQuantHost(const float* x, float* scale_out, float* min_out) {
+  // Mean square (not rms) matches the kernels: see Q4KSubBlockQuant.
+  float sumsq[32];
+  for (int i = 0; i < 32; ++i)
+    sumsq[i] = x[i] * x[i];
+  const float mean_sq = Q4KButterflySum32(sumsq) * (1.0F / 32.0F);
+  float w[32];
+  for (int i = 0; i < 32; ++i)
+    w[i] = mean_sq + std::fabs(x[i]);
+
+  float mn = x[0], mx = x[0];
+  float sw[32], sx[32];
+  for (int i = 0; i < 32; ++i) {
+    mn = std::min(mn, x[i]);
+    mx = std::max(mx, x[i]);
+    sw[i] = w[i];
+    sx[i] = w[i] * x[i];
+  }
+  const float sum_w = Q4KButterflySum32(sw);
+  const float sum_x = Q4KButterflySum32(sx);
+  if (mn > 0.0F)
+    mn = 0.0F;
+  if (mx == mn) {
+    *scale_out = 0.0F;
+    *min_out = -mn;
+    return;
+  }
+  const float range = mx - mn;
+  const float iscale0 = 15.0F / range;
+  float scale = 1.0F / iscale0;
+  float err[32];
+  for (int i = 0; i < 32; ++i) {
+    const int l = std::clamp(Q4KNearestIntHost(iscale0 * (x[i] - mn)), 0, 15);
+    float diff = scale * static_cast<float>(l) + mn - x[i];
+    diff = diff * diff;
+    err[i] = w[i] * diff;
+  }
+  float best_error = Q4KButterflySum32(err);
+  for (int is = 0; is <= 20; ++is) {
+    // The reference re-divides by the live (mx - mn): an accepted candidate
+    // re-bases every later candidate's range.
+    const float iscale =
+        (-1.0F + 0.1F * static_cast<float>(is) + 15.0F) / (mx - mn);
+    float sl[32], sl2[32], sxl[32];
+    for (int i = 0; i < 32; ++i) {
+      const int l = std::clamp(Q4KNearestIntHost(iscale * (x[i] - mn)), 0, 15);
+      const float lf = static_cast<float>(l);
+      const float wl = w[i] * lf;
+      sl[i] = wl;
+      sl2[i] = wl * lf;
+      sxl[i] = wl * x[i];
+    }
+    const float sum_l = Q4KButterflySum32(sl);
+    const float sum_l2 = Q4KButterflySum32(sl2);
+    const float sum_xl = Q4KButterflySum32(sxl);
+    const float D = sum_w * sum_l2 - sum_l * sum_l;
+    if (D > 0.0F) {
+      float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+      float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+      if (this_min > 0.0F) {
+        this_min = 0.0F;
+        this_scale = sum_xl / sum_l2;
+      }
+      for (int i = 0; i < 32; ++i) {
+        const int l =
+            std::clamp(Q4KNearestIntHost(iscale * (x[i] - mn)), 0, 15);
+        float diff = this_scale * static_cast<float>(l) + this_min - x[i];
+        diff = diff * diff;
+        err[i] = w[i] * diff;
+      }
+      const float cur_error = Q4KButterflySum32(err);
+      if (cur_error < best_error) {
+        best_error = cur_error;
+        scale = this_scale;
+        mn = this_min;
+      }
+    }
+  }
+  *scale_out = scale;
+  *min_out = -mn;
+}
+
+/// Unpacks one super-block's 6-bit sub-block scale/min pair (GGML
+/// get_scale_min_k4 over the 12 bytes trailing the two F16 scales).
+void Q4KUnpackScalePair(const unsigned char* scales, std::uint32_t j,
+                        std::uint8_t* sc6, std::uint8_t* m6) {
+  const auto* q = scales + 4;
+  if (j < 4) {
+    *sc6 = q[j] & 63;
+    *m6 = q[j + 4] & 63;
+  } else {
+    *sc6 = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    *m6 = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+
+/// Planar Q4_K row: [row_dim/2 code bytes][row_dim/256 * 16 scale bytes];
+/// code nibble pairs are interleaved (byte 2l low = element 2l, high =
+/// 2l+1) and codes dequantize to code * (d * sc) - dmin * m by one FMA.
+void QuantizeRowQ4_KHost(const float* src, unsigned char* dst,
+                         std::uint32_t row_dim) {
+  const std::size_t code_bytes = row_dim / 2;
+  for (std::size_t s = 0; s < row_dim / 256; ++s) {
+    const float* x = src + s * 256;
+    auto* codes = dst + s * 128;
+    auto* scales = dst + code_bytes + s * 16;
+    float sub_scale[8], sub_min[8];
+    for (int j = 0; j < 8; ++j) {
+      Q4KSubBlockQuantHost(x + 32 * j, &sub_scale[j], &sub_min[j]);
+    }
+    float max_scale = 0.0F, max_min = 0.0F;
+    for (int j = 0; j < 8; ++j) {
+      max_scale = std::max(max_scale, sub_scale[j]);
+      max_min = std::max(max_min, sub_min[j]);
+    }
+    const float inv_scale = max_scale > 0.0F ? 63.0F / max_scale : 0.0F;
+    const float inv_min = max_min > 0.0F ? 63.0F / max_min : 0.0F;
+    std::uint8_t ls[8], lm[8];
+    for (int j = 0; j < 8; ++j) {
+      ls[j] = static_cast<std::uint8_t>(
+          std::min(63, Q4KNearestIntHost(inv_scale * sub_scale[j])));
+      lm[j] = static_cast<std::uint8_t>(
+          std::min(63, Q4KNearestIntHost(inv_min * sub_min[j])));
+    }
+    __half d = __float2half_rn(max_scale / 63.0F);
+    __half dmin = __float2half_rn(max_min / 63.0F);
+    // Floor at the smallest normal F16 like the kernels: a flushed-to-zero
+    // scale would collapse its super-block on dequant.
+    std::uint16_t d_bits, dmin_bits;
+    std::memcpy(&d_bits, &d, sizeof(d_bits));
+    std::memcpy(&dmin_bits, &dmin, sizeof(dmin_bits));
+    if (max_scale > 0.0F && d_bits < 0x0400) {
+      d_bits = 0x0400;
+      std::memcpy(&d, &d_bits, sizeof(d));
+    }
+    if (max_min > 0.0F && dmin_bits < 0x0400) {
+      dmin_bits = 0x0400;
+      std::memcpy(&dmin, &dmin_bits, sizeof(dmin));
+    }
+    std::uint8_t packed[12] = {};
+    for (int j = 0; j < 4; ++j) {
+      packed[j] = ls[j];
+      packed[j + 4] = lm[j];
+    }
+    for (int j = 4; j < 8; ++j) {
+      packed[j + 4] =
+          static_cast<std::uint8_t>((ls[j] & 0xF) | ((lm[j] & 0xF) << 4));
+      packed[j - 4] |= static_cast<std::uint8_t>((ls[j] >> 4) << 6);
+      packed[j] |= static_cast<std::uint8_t>((lm[j] >> 4) << 6);
+    }
+    std::memcpy(scales, &d, 2);
+    std::memcpy(scales + 2, &dmin, 2);
+    std::memcpy(scales + 4, packed, 12);
+    for (int j = 0; j < 8; ++j) {
+      std::uint8_t sc6, m6;
+      Q4KUnpackScalePair(scales, j, &sc6, &m6);
+      const float dsc = __half2float(d) * sc6;
+      const float dm = __half2float(dmin) * m6;
+      int codes32[32];
+      for (int i = 0; i < 32; ++i) {
+        int l = 0;
+        if (dsc > 0.0F) {
+          l = std::clamp(Q4KNearestIntHost((x[32 * j + i] + dm) / dsc), 0, 15);
+        }
+        codes32[i] = l;
+      }
+      auto* out = codes + 16 * j;
+      for (int i = 0; i < 16; ++i) {
+        out[i] = static_cast<std::uint8_t>(codes32[2 * i] |
+                                           (codes32[2 * i + 1] << 4));
+      }
+    }
+  }
+}
+
+/// Decodes a planar Q4_K row back to floats, optionally rounding through F16
+/// (the WMMA loaders dequantize into F16 registers).
+std::vector<float> DequantRowQ4_KHost(const unsigned char* src,
+                                      std::uint32_t row_dim, bool round_f16) {
+  std::vector<float> out(row_dim);
+  const unsigned char* codes = src;
+  const unsigned char* scales = src + row_dim / 2;
+  for (std::uint32_t i = 0; i < row_dim; ++i) {
+    const std::size_t sb = i / 256;
+    const std::uint32_t e = i % 256;
+    const auto* sc = scales + sb * 16;
+    std::uint8_t sc6, m6;
+    Q4KUnpackScalePair(sc, e / 32, &sc6, &m6);
+    const float d = __half2float(*reinterpret_cast<const __half*>(sc)) * sc6;
+    const float dm =
+        __half2float(*reinterpret_cast<const __half*>(sc + 2)) * m6;
+    const int nib = (codes[sb * 128 + e / 2] >> ((e % 2) * 4)) & 0xF;
+    const float value = std::fma(static_cast<float>(nib), d, -dm);
+    out[i] = round_f16 ? __half2float(__float2half_rn(value)) : value;
+  }
+  return out;
+}
+
 void CheckPreparation(std::uint32_t n, std::uint32_t start,
                       std::uint32_t rotary) {
   constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
@@ -699,11 +926,11 @@ void CheckQ8Preparation(std::uint32_t n, std::uint32_t start) {
   Upload(&k_ref, k_ref_host);
   Upload(&v_ref, v_ref_host);
 
-  if (!q::PrepareAttention(packed.get(), stride, q_gamma.get(), k_gamma.get(),
-                           q_out.get(), gate_out.get(), k_out.get(), v_out.get(),
-                           n, kHeads, kKvHeads, kDim, 64, pos.get(), 1e7F,
-                           1e-6F, nullptr, nullptr, false,
-                           qk::KvCacheDtype::kQ8_0)) {
+  if (!q::PrepareAttention(
+          packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
+          gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
+          64, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, false,
+          qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0})) {
     throw std::runtime_error("q8 preparation rejected geometry");
   }
   CheckHip(hipDeviceSynchronize(), "q8 preparation ready");
@@ -781,7 +1008,8 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
   // Per-token kernel: FP32 dequant products, single-block and split forms.
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
                nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
-               kRatio, nullptr, qk::KvCacheDtype::kQ8_0);
+               kRatio, nullptr,
+               qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0});
   q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
   constexpr std::uint32_t kSplits = 8;
   HipBuffer<float> d_split(q_count);
@@ -789,7 +1017,8 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
                               kSplits * (kDim + 2));
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_split.get(),
                d_partials.get(), kSplits, n_tokens, d_pos.get(), kHeads,
-               kKvHeads, kDim, kRatio, nullptr, qk::KvCacheDtype::kQ8_0);
+               kKvHeads, kDim, kRatio, nullptr,
+               qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0});
   q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
   CheckHip(hipDeviceSynchronize(), "q8 per-token attention");
   const auto single = Download(&d_out, q_count);
@@ -804,10 +1033,11 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
   }
   // WMMA route: dequantizes through F16 registers.
   HipBuffer<float> d_wmma(q_count);
-  if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
-                              nullptr, 0, d_wmma.get(), n_tokens, start_pos,
-                              kHeads, kKvHeads, kDim, kRatio, nullptr, false,
-                              qk::KvCacheDtype::kQ8_0)) {
+  if (!q::WmmaCausalAttention(
+          d_q.get(), d_gate.get(), d_k.get(), d_v.get(), nullptr, 0,
+          d_wmma.get(), n_tokens, start_pos, kHeads, kKvHeads, kDim, kRatio,
+          nullptr, false,
+          qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0})) {
     throw std::runtime_error("q8 WMMA attention rejected geometry");
   }
   CheckHip(hipDeviceSynchronize(), "q8 wmma attention");
@@ -830,13 +1060,250 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
   }
 }
 
+/// Q8_0 keys + Q4_K values write path: PrepareAttention's value rows must
+/// byte-match the host Q4_K quantization of the same raw F32 values (keys
+/// reuse the proven Q8_0 reference).
+void CheckQ4KPreparation(std::uint32_t n, std::uint32_t start) {
+  constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
+  const std::size_t cache_rows = start + n + 2;
+  const std::size_t k_row_bytes = kKvWidth + kKvWidth / 16;
+  const std::size_t v_row_bytes = kKvWidth / 2 + kKvWidth / 16;
+  HipBuffer<float> packed(static_cast<std::size_t>(n) * stride);
+  HipBuffer<float> q_gamma(kDim), k_gamma(kDim);
+  HipBuffer<float> k(std::size_t{n} * kKvWidth), v(std::size_t{n} * kKvWidth);
+  HipBuffer<unsigned char> k_ref(cache_rows * k_row_bytes),
+      v_ref(cache_rows * v_row_bytes);
+  HipBuffer<unsigned char> k_out(cache_rows * k_row_bytes),
+      v_out(cache_rows * v_row_bytes);
+  HipBuffer<float> q_out(std::size_t{n} * kQWidth),
+      gate_out(std::size_t{n} * kQWidth);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 23, 4.0F));
+  auto qg = MakeValues(kDim, 41, 0.5F);
+  auto kg = MakeValues(kDim, 97, 0.5F);
+  for (auto& x : qg)
+    x += 1.0F;
+  for (auto& x : kg)
+    x += 1.0F;
+  Upload(&q_gamma, qg);
+  Upload(&k_gamma, kg);
+  Upload(&pos, std::vector<std::uint32_t>{start});
+
+  q::UnpackQGate(packed.get(), stride, q_out.get(), gate_out.get(), k.get(),
+                 v.get(), n, kHeads, kDim, kKvWidth, nullptr);
+  q::RmsNormRows(k.get(), k_gamma.get(), k.get(), n * kKvHeads, kDim, 1, 1e-6F,
+                 nullptr);
+  q::Rope(k.get(), n, kKvHeads, kDim, 64, pos.get(), 1e7F, nullptr);
+  CheckHip(hipDeviceSynchronize(), "q4k preparation reference ready");
+  const auto kf = Download(&k, std::size_t{n} * kKvWidth);
+  const auto vf = Download(&v, std::size_t{n} * kKvWidth);
+  std::vector<unsigned char> k_ref_host(cache_rows * k_row_bytes, 0),
+      v_ref_host(cache_rows * v_row_bytes, 0);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    QuantizeRowQ8_0Host(kf.data() + std::size_t{t} * kKvWidth,
+                        k_ref_host.data() + (start + t) * k_row_bytes,
+                        kKvWidth);
+    QuantizeRowQ4_KHost(vf.data() + std::size_t{t} * kKvWidth,
+                        v_ref_host.data() + (start + t) * v_row_bytes,
+                        kKvWidth);
+  }
+  Upload(&k_ref, k_ref_host);
+  Upload(&v_ref, v_ref_host);
+
+  if (!q::PrepareAttention(
+          packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
+          gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
+          64, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, false,
+          qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K})) {
+    throw std::runtime_error("q4k preparation rejected geometry");
+  }
+  CheckHip(hipDeviceSynchronize(), "q4k preparation ready");
+  const auto k_out_host = DownloadBytes(&k_out);
+  const auto v_out_host = DownloadBytes(&v_out);
+  for (std::size_t i = 0; i < cache_rows * k_row_bytes; ++i) {
+    if (k_out_host[i] != k_ref_host[i]) {
+      std::cerr << "q4k key cache row " << i / k_row_bytes << " byte "
+                << i % k_row_bytes << " expected "
+                << static_cast<int>(k_ref_host[i]) << " got "
+                << static_cast<int>(k_out_host[i]) << '\n';
+      throw std::runtime_error("q4k key cache differs from host quantization");
+    }
+  }
+  // The Q8 key plane is byte-exact (its amax/scale math is deterministic).
+  // The Q4_K value search is a 21-candidate weighted least squares whose
+  // near-tied acceptances are ulp-sensitive across compilers (device
+  // -ffast-math contraction and approximate sqrt against the host), so the
+  // value plane is judged per element against the host reference's own
+  // quantization step: a candidate flip moves a code by exactly one step.
+  double worst_steps = 0.0;
+  int worst_t = -1, worst_elem = -1;
+  float worst_dev = 0.0f, worst_ref = 0.0f;
+  double worst_step = 1.0;
+  for (std::uint32_t t = 0; t < n; ++t) {
+    const auto* ref_row = v_ref_host.data() + (start + t) * v_row_bytes;
+    const auto dev_values = DequantRowQ4_KHost(
+        v_out_host.data() + (start + t) * v_row_bytes, kKvWidth, false);
+    const auto ref_values = DequantRowQ4_KHost(ref_row, kKvWidth, false);
+    for (std::uint32_t i = 0; i < kKvWidth; ++i) {
+      const auto* ref_scales = ref_row + kKvWidth / 2 + (i / 256) * 16;
+      std::uint8_t sc6 = 0, m6 = 0;
+      Q4KUnpackScalePair(ref_scales, (i % 256) / 32, &sc6, &m6);
+      const double step = std::max(
+          1e-30,
+          static_cast<double>(
+              __half2float(*reinterpret_cast<const __half*>(ref_scales)) *
+              sc6));
+      const double ratio =
+          std::abs(dev_values[i] - static_cast<double>(ref_values[i])) / step;
+      if (ratio > worst_steps) {
+        worst_steps = ratio;
+        worst_t = static_cast<int>(t);
+        worst_elem = static_cast<int>(i);
+        worst_dev = dev_values[i];
+        worst_ref = ref_values[i];
+        worst_step = step;
+      }
+    }
+  }
+  if (worst_steps > 1.05) {
+    std::cerr << "q4k worst at t=" << worst_t << " elem=" << worst_elem
+              << " dev=" << worst_dev << " ref=" << worst_ref
+              << " step=" << worst_step << '\n';
+    std::cerr << "q4k value cache worst dequant delta " << worst_steps
+              << " code steps\n";
+    throw std::runtime_error(
+        "q4k value cache dequant differs beyond one code step");
+  }
+  std::cout << "q4k preparation n=" << n << " start=" << start
+            << ": keys byte-exact, values worst dequant delta " << worst_steps
+            << " code steps\n";
+}
+
+/// Q8_0 keys + Q4_K values read paths: the per-token kernel (single and
+/// split) against FP64 over the F32-dequantized cache, and the WMMA route
+/// against FP64 over the F16 rounded dequantization it computes in
+/// registers.
+void CheckQ4KAttention(std::uint32_t n_tokens, std::uint32_t start_pos,
+                       std::uint32_t seed) {
+  const std::uint32_t n_kv = start_pos + n_tokens;
+  const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const std::size_t k_row_bytes = kKvWidth + kKvWidth / 16;
+  const std::size_t v_row_bytes = kKvWidth / 2 + kKvWidth / 16;
+  const auto qv = MakeValues(q_count, seed, 4.0F);
+  const auto gate = MakeValues(q_count, seed ^ 0x5555U, 3.0F);
+  const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+  const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+  std::vector<unsigned char> kh(static_cast<std::size_t>(n_kv) * k_row_bytes,
+                                0);
+  std::vector<unsigned char> vh(static_cast<std::size_t>(n_kv) * v_row_bytes,
+                                0);
+  std::vector<float> kd_f32(kv_count), vd_f32(kv_count);
+  std::vector<float> kd_f16(kv_count), vd_f16(kv_count);
+  for (std::uint32_t r = 0; r < n_kv; ++r) {
+    QuantizeRowQ8_0Host(kf.data() + std::size_t{r} * kKvWidth,
+                        kh.data() + std::size_t{r} * k_row_bytes, kKvWidth);
+    QuantizeRowQ4_KHost(vf.data() + std::size_t{r} * kKvWidth,
+                        vh.data() + std::size_t{r} * v_row_bytes, kKvWidth);
+    const auto k32 = DequantRowQ8_0Host(
+        kh.data() + std::size_t{r} * k_row_bytes, kKvWidth, false);
+    const auto v32 = DequantRowQ4_KHost(
+        vh.data() + std::size_t{r} * v_row_bytes, kKvWidth, false);
+    const auto k16 = DequantRowQ8_0Host(
+        kh.data() + std::size_t{r} * k_row_bytes, kKvWidth, true);
+    const auto v16 = DequantRowQ4_KHost(
+        vh.data() + std::size_t{r} * v_row_bytes, kKvWidth, true);
+    std::copy(k32.begin(), k32.end(),
+              kd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v32.begin(), v32.end(),
+              vd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(k16.begin(), k16.end(),
+              kd_f16.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v16.begin(), v16.end(),
+              vd_f16.begin() + std::size_t{r} * kKvWidth);
+  }
+
+  HipBuffer<float> d_q(q_count), d_gate(q_count);
+  HipBuffer<unsigned char> d_k(kh.size()), d_v(vh.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<float> d_out(q_count);
+  Upload(&d_q, qv);
+  Upload(&d_gate, gate);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+
+  const auto exact32 =
+      Fp64Attention(qv, gate, kd_f32, vd_f32, nullptr, 0, n_tokens, start_pos);
+  const auto exact16 =
+      Fp64Attention(qv, gate, kd_f16, vd_f16, nullptr, 0, n_tokens, start_pos);
+
+  q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
+               nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
+               kRatio, nullptr,
+               qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K});
+  q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
+  constexpr std::uint32_t kSplits = 8;
+  HipBuffer<float> d_split(q_count);
+  HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
+                              kSplits * (kDim + 2));
+  q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_split.get(),
+               d_partials.get(), kSplits, n_tokens, d_pos.get(), kHeads,
+               kKvHeads, kDim, kRatio, nullptr,
+               qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K});
+  q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
+  CheckHip(hipDeviceSynchronize(), "q4k per-token attention");
+  const auto single = Download(&d_out, q_count);
+  const auto split = Download(&d_split, q_count);
+  double single_error = 0.0, split_error = 0.0;
+  for (std::size_t i = 0; i < q_count; ++i) {
+    if (!std::isfinite(single[i]) || !std::isfinite(split[i])) {
+      throw std::runtime_error("q4k per-token attention output is not finite");
+    }
+    single_error = std::max(single_error, std::abs(single[i] - exact32[i]));
+    split_error = std::max(split_error, std::abs(split[i] - exact32[i]));
+  }
+  // WMMA route: dequantizes through F16 registers.
+  HipBuffer<float> d_wmma(q_count);
+  if (!q::WmmaCausalAttention(
+          d_q.get(), d_gate.get(), d_k.get(), d_v.get(), nullptr, 0,
+          d_wmma.get(), n_tokens, start_pos, kHeads, kKvHeads, kDim, kRatio,
+          nullptr, false,
+          qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K})) {
+    throw std::runtime_error("q4k WMMA attention rejected geometry");
+  }
+  CheckHip(hipDeviceSynchronize(), "q4k wmma attention");
+  const auto wmma = Download(&d_wmma, q_count);
+  double wmma_error = 0.0;
+  for (std::size_t i = 0; i < q_count; ++i) {
+    if (!std::isfinite(wmma[i])) {
+      throw std::runtime_error("q4k WMMA attention output is not finite");
+    }
+    wmma_error = std::max(wmma_error, std::abs(wmma[i] - exact16[i]));
+  }
+  std::cout << "q4k attention n=" << n_tokens << " start=" << start_pos
+            << " fp64 error single " << single_error << " split " << split_error
+            << " wmma " << wmma_error << '\n';
+  if (std::max(single_error, split_error) > 1e-4) {
+    throw std::runtime_error("q4k per-token attention exceeds its FP64 limit");
+  }
+  if (wmma_error > 1e-4) {
+    throw std::runtime_error("q4k WMMA attention exceeds its FP64 limit");
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
-    // The Q8_0 cache cases run first: the F16 query-preparation cases below
-    // hit this toolchain's pre-existing 1-ULP drift (fails identically on an
-    // unmodified build) and would otherwise abort before them.
+    // The quantized cache cases run first: the F16 query-preparation cases
+    // below hit this toolchain's pre-existing 1-ULP drift (fails identically
+    // on an unmodified build) and would otherwise abort before them.
+    CheckQ4KPreparation(8, 4096);
+    CheckQ4KPreparation(65, 131069);
+    CheckQ4KAttention(4, 4096, 0x51ED0011U);
+    CheckQ4KAttention(17, 2047, 0x51ED0012U);
+    CheckQ4KAttention(3, 90000, 0x51ED0013U);
     CheckQ8Preparation(8, 4096);
     CheckQ8Preparation(65, 131069);
     CheckQ8Attention(4, 4096, 0x51ED0001U);

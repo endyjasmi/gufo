@@ -166,6 +166,11 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
       "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
       "bytes, lossy)",
       "Speculative", &opt.kv_cache_q8_0);
+  parser.AddFlag(
+      "", "--kv-cache-v-q4-k",
+      "Store the Flash-Next attention value plane as Q4_K super-blocks "
+      "(~47% fewer V bytes; requires --kv-cache-q8-0)",
+      "Speculative", &opt.kv_cache_v_q4_k);
   parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -688,7 +693,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        .mtp_model_path = mtp_model_path,
        .max_draft_tokens = opt.draft_tokens,
        .vision_model_path = opt.vision_model_path,
-       .kv_cache_q8_0 = opt.kv_cache_q8_0},
+       .kv_cache_q8_0 = opt.kv_cache_q8_0,
+       .kv_cache_v_q4_k = opt.kv_cache_v_q4_k},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)

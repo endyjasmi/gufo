@@ -166,8 +166,8 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16 (or Q8_0 with `kv_dtype`),
-/// preserving separate rounding.
+/// Writes Q/gates in F32 and K/V caches in F16 (or quantized with
+/// `kv_dtypes`), preserving separate rounding.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
@@ -177,7 +177,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      KvCacheDtype kv_dtype = KvCacheDtype::kF16);
+                      KvDtypes kv_dtypes = {});
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -375,8 +375,7 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false,
-                      KvCacheDtype kv_dtype = KvCacheDtype::kF16);
+                      bool prefill = false, KvDtypes kv_dtypes = {});
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -388,7 +387,7 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           const qwen::vision::DeviceRope* rope = nullptr);
 
 /// Stores f32 rows into the cache at positions start_pos + t:
-/// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0
+/// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0/Q4_K
 /// blocks per `kv_dtype`.
 void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -436,7 +435,7 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream, KvCacheDtype kv_dtype = KvCacheDtype::kF16);
+               hipStream_t stream, KvDtypes kv_dtypes = {});
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
@@ -444,15 +443,14 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
 /// false, launching nothing, when the geometry is not the model's 24 x 256
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const void* k_cache, const void* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false,
-                         KvCacheDtype kv_dtype = KvCacheDtype::kF16);
+bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
+                         const void* v_cache, const std::uint32_t* mask,
+                         std::uint32_t mask_words, float* out,
+                         std::uint32_t n_tokens, std::uint32_t start_pos,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t d, std::uint32_t ratio,
+                         hipStream_t stream, bool last_only = false,
+                         KvDtypes kv_dtypes = {});
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

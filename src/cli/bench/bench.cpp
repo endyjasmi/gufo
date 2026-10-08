@@ -210,6 +210,11 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
       "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
       "bytes, lossy)",
       "Speculative", &opt.kv_cache_q8_0);
+  parser.AddFlag(
+      "", "--kv-cache-v-q4-k",
+      "Store the Flash-Next attention value plane as Q4_K super-blocks "
+      "(~47% fewer V bytes; requires --kv-cache-q8-0)",
+      "Speculative", &opt.kv_cache_v_q4_k);
   parser.AddCustomOption(
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
@@ -942,6 +947,7 @@ int RunQwen38FlashNextBenchmark(
           .mtp_model_path = mtp ? mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .kv_cache_q8_0 = options.kv_cache_q8_0,
+          .kv_cache_v_q4_k = options.kv_cache_v_q4_k,
       },
       &error);
   if (model == nullptr) {

@@ -141,6 +141,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  if (options.kv_cache_v_q4_k && !options.kv_cache_q8_0) {
+    AssignError(error_msg,
+                "kv_cache_v_q4_k requires kv_cache_q8_0: Q4_K value planes "
+                "always ride Q8_0 key planes");
+    return nullptr;
+  }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
   exec.max_logit_rows =
@@ -149,8 +155,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
-  exec.kv_cache_dtype = options.kv_cache_q8_0 ? KvCacheDtype::kQ8_0
-                                              : KvCacheDtype::kF16;
+  exec.kv_dtypes = {
+      .key = options.kv_cache_q8_0 ? KvCacheDtype::kQ8_0 : KvCacheDtype::kF16,
+      .value = options.kv_cache_v_q4_k ? KvCacheDtype::kQ4_K
+               : options.kv_cache_q8_0 ? KvCacheDtype::kQ8_0
+                                       : KvCacheDtype::kF16};
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {

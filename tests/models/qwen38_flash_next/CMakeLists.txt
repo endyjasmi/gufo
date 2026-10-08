@@ -22,6 +22,12 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  # The Q4_K host reference must mirror the kernels' un-fused __f*_rn ops:
+  # clang-cl's default contract=on fuses a*b+c into FMAs and flips near-tied
+  # search candidates against the device bytes. clang-cl only accepts the
+  # spelling through the -Xclang passthrough.
+  set_source_files_properties(attention_ops_test.cpp PROPERTIES
+    COMPILE_OPTIONS "-Xclang;-ffp-contract=off")
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops)

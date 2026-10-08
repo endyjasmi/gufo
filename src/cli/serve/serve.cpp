@@ -613,6 +613,7 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
     bool kv_cache_q8_0 = false;
+    bool kv_cache_v_q4_k = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -720,6 +721,11 @@ void PrintServeHelp(std::string_view program_name,
         "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
         "bytes, lossy)",
         "Cache", &kv_cache_q8_0);
+    parser.AddFlag(
+        "", "--kv-cache-v-q4-k",
+        "Store the Flash-Next attention value plane as Q4_K super-blocks "
+        "(~47% fewer V bytes; requires --kv-cache-q8-0)",
+        "Cache", &kv_cache_v_q4_k);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
@@ -1157,6 +1163,7 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
     bool kv_cache_q8_0 = false;
+    bool kv_cache_v_q4_k = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1260,6 +1267,11 @@ int RunServe(std::span<const char* const> args) {
         "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
         "bytes, lossy)",
         "Cache", &kv_cache_q8_0);
+    llm_parser.AddFlag(
+        "", "--kv-cache-v-q4-k",
+        "Store the Flash-Next attention value plane as Q4_K super-blocks "
+        "(~47% fewer V bytes; requires --kv-cache-q8-0)",
+        "Cache", &kv_cache_v_q4_k);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
@@ -1423,9 +1435,9 @@ int RunServe(std::span<const char* const> args) {
                            .model_artifact_fingerprint = {},
                        },
                        vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes},
-                       kv_cache_q8_0)) {
+                       server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                             cache_ram_bytes},
+                       kv_cache_q8_0, kv_cache_v_q4_k)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
