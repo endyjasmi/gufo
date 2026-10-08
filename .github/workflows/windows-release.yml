@@ -1,17 +1,10 @@
 name: Windows release
 
 on:
-  # Continuous verification: build the port against the newest nightly SDK
-  # every day so toolchain breakage is caught within a day, not discovered
-  # when somebody next needs a build. Scheduled runs are canary builds only:
-  # they publish nothing. They check out the Windows port branch explicitly
-  # (schedule otherwise uses the default branch).
-  schedule:
-    - cron: "23 21 * * *"
   workflow_dispatch:
     inputs:
       sdk:
-        description: Optional TheRock tarball to pin (default newest nightly)
+        description: Optional TheRock tarball to pin (default the validated release pin)
         required: false
         default: ""
       publish:
@@ -53,8 +46,8 @@ jobs:
           # Branch pushes that only touch CI/docs paths cannot change the
           # binary, so they skip the build entirely: a fork does not need a
           # 45-minute runner burn and a 358 MB release per README tweak.
-          # Anything unclear fails open and builds. Tag pushes, scheduled
-          # canaries and manual runs always build.
+          # Anything unclear fails open and builds. Tag pushes and manual
+          # runs always build.
           set -euo pipefail
           build=true
           if [ "${{ github.event_name }}" = push ] && [ "${{ github.ref_type }}" = branch ] \
@@ -90,8 +83,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'schedule' && 'feature/window-native' || github.ref }}
 
       - name: Verify this is the Windows port branch
         shell: pwsh
@@ -109,21 +100,6 @@ jobs:
           if ($env:SDK_OVERRIDE) {
             # A manual run explicitly chose a tarball.
             $tarball = $env:SDK_OVERRIDE
-          } elseif ($env:GITHUB_EVENT_NAME -eq 'schedule') {
-            # Canary builds check compile health against the newest nightly
-            # and publish nothing. The nightly index only keeps ~6 weeks of
-            # tarballs, so resolve the newest available one at run time.
-            $index = (Invoke-WebRequest -UseBasicParsing 'https://nightly.repo.amd.com/rocm/core/tarball/').Content
-            $match = [regex]::Match($index, 'const files = (\[.*?\]);', 'Singleline')
-            if (-not $match.Success) { throw 'could not parse the nightly tarball index' }
-            $files = $match.Groups[1].Value | ConvertFrom-Json
-            $latest = $files |
-              Where-Object { $_.name -like 'therock-dist-windows-gfx1151-*.tar.gz' -and
-                             $_.name -notlike '*-tests-*' } |
-              Sort-Object mtime -Descending |
-              Select-Object -First 1
-            if (-not $latest) { throw 'no windows gfx1151 tarball in the nightly index' }
-            $tarball = $latest.name
           } else {
             # Published builds ship from the validated pin, not the newest
             # nightly: nightly 10.2.0a20261005 compiled binaries that ran
@@ -262,7 +238,6 @@ jobs:
           $name = "gufo-$version-windows-gfx1151-$sha"
           # Every build publishes its own release: branch pushes and manual
           # runs tag windows-v<version>-<sha>, tag pushes use their own tag.
-          # Scheduled runs stop before publishing.
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME }
                  else { "windows-v$version-$sha" }
           $pkg = "$env:RUNNER_TEMP\$name"
@@ -319,8 +294,7 @@ jobs:
         with:
           # Branch pushes and manual runs publish a release per commit
           # (windows-v<version>-<sha>) and keep earlier ones; tag pushes
-          # publish pinned windows-vX.Y.Z snapshots. Scheduled runs are
-          # canary builds against the newest nightly SDK and publish nothing.
+          # publish pinned windows-vX.Y.Z snapshots.
           tag_name: ${{ steps.package.outputs.release_tag }}
           files: ${{ steps.package.outputs.zip }}
           body_path: ${{ runner.temp }}/release-notes.md

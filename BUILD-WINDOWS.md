@@ -91,10 +91,6 @@ SDK end to end on device before publishing from it:
 3. Serve a prompt through `/v1/chat/completions` and check `ttft_ms` and
    `decode_tps` in the request log line.
 
-The daily canary build still compiles against the newest nightly to catch
-toolchain *breakage* early; it publishes nothing and does not validate
-performance.
-
 To serve:
 
 ```cmd
