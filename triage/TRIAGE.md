@@ -207,6 +207,68 @@ batched middle layers (first at emitted token ~40 on the fixture, e.g.
 跟进/跟) — the documented "may flip near-ties" class; same-text or
 adjacent-token variants, no empty turns. Full removal requires per-row MoE
 attention/GDN reductions, which is kernel engineering beyond this fix.
+See the depth gate below: at deep context this residual is structural,
+not cosmetic.
+
+## Re-validation on the v0.9.0 base; the residual is depth-gated (2026-10-08, later)
+
+The branch fast-forwarded to `feature/window-native` @ `c1028db1` (upstream
+v0.9.0: 4096-token prefill chunks with overlapped n-gram gather,
+`next`-span prefill prefetch, cache-pressure fixes — all conflict-resolved
+in the parent merge; the per-row PLE and batched-vocabulary routes
+verified present in the merged tree). Rebuilt `windows-release` and
+re-ran the gates on the new base:
+
+- Session test `--sampling-only`: all serial sampling cases
+  `replay_exact=1`, ending in the same pre-existing interleaved-pair FAIL
+  (unchanged from the pre-merge base).
+- Empty-turns arm (8 fresh sessions, reporter config, temp 1.0, MTP,
+  `results/v090-fix/`): 9/56 empty (16.1%) — inside the post-fix run
+  spread (1/28–3/14); pooled with the earlier arms 15/126 (11.9%). The
+  0/56 AR-only reference stands.
+- Probe on the merged build, dense-region protocol (`--rounds 1`, 1,423
+  tokens — `probe-v090-r1.log`): prefill exact, width-1 identical,
+  restore-test bit-exact, stream flips at emitted token 40 with 跟进/跟 —
+  exactly the pre-merge post-fix signature (`4b4d7c10` in a fresh build
+  directory, `probe-oldcontrol-r1.log`, reproduces it identically).
+  **The v0.9.0 merge changes nothing measurable.**
+
+**New finding — the accepted residual is depth-gated.** The probe prompt
+is `--rounds` memory-card blocks; every validation before today ran
+`--rounds 1` (1,423 tokens, entirely inside the dense-attention region:
+positions < `indexer_top_k` = 2048 take the dense tiles). At the probe's
+default `--rounds 6` (7,407 tokens, entirely in the sparse-indexer
+region), the width-2 verify frontier diverges from width-1 by
+max|Δ|≈10 across all 248,320 logits from the FIRST cycle, and the
+post-reject restore test diverges (max|Δ|≈0.52) — on **every** build,
+including the pristine pre-merge fix head in a fresh build directory
+(`probe-oldcontrol.log`). A bisect across the merge's executor-side
+delta, engine-side delta, kernels, and the pristine base all produced
+byte-identical signatures — the merge is fully exonerated; the protocol
+drift (7,407- vs 1,423-token prompt) was the entire scare. Mechanism:
+the sparse attention/indexer decode path (positions ≥ 2048) is
+row-count-dependent at n ≥ 2, so verify-row logits differ from what
+width-1 decoding computes for the same token; the per-row PLE/head fix
+never claimed that path. At shallow context the same deficiency only
+flips near-ties (token ~40); at deep context it perturbs every verify
+cycle, which is consistent with the residual empty turns at the exam's
+2.4–4K-token contexts.
+
+**Full closure therefore = row-count-invariant decode kernels for the
+sparse attention/indexer path (plus MoE/GDN), with the `--rounds 6`
+probe as the acceptance test** (phase-2 frontier max|Δ|=0 from cycle 1
+is the bar). The dense-region probe (`--rounds 1`) remains the
+acceptance test for the landed fix.
+
+Ops notes from this session: (1) test/probe exes must be COPIED into the
+build root before running — from `tests/…/` the Windows DLL search finds
+`C:\Windows\System32\amdhip64_7.dll` (driver runtime) first, whose comgr
+cannot find matching device bitcode, and the process segfaults with a
+0-byte log (`run-session-v090.bat` does copy/run/delete); a fresh build
+directory additionally needs the HIP DLLs + `hipblaslt/` + `rocblas/`
+data dirs copied in before any exe runs from it. (2) RelWithDebInfo
+hipfb bytes embed build paths — never compare device binaries across
+build directories byte-wise.
 
 ## Fix session (2026-10-07, later): rollback restore isolated
 
