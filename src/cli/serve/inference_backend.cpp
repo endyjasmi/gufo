@@ -178,9 +178,8 @@ std::size_t DerivedDiskStagingBytes(
       config.retained_snapshot_capacity_bytes == 0) {
     return config.staging_capacity_bytes;
   }
-  return std::min({config.capacity_bytes,
-                   TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes,
-                   config.retained_snapshot_capacity_bytes / 4});
+  return std::min(config.capacity_bytes,
+                  config.retained_snapshot_capacity_bytes / 4);
 }
 
 bool IsSha256Hex(std::string_view value) noexcept {
