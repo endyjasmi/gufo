@@ -42,8 +42,17 @@ and the MTP predictor automatically:
   --temperature 1 --top-p 0.95 --top-k 20 --min-p 0 `
   --think on --reasoning-effort xhigh --preserve-thinking on `
   --repeat-penalty 1 --frequency-penalty 0 --presence-penalty 0 `
-  --host 0.0.0.0 --port 11434 --log-progress --kv-cache-q8-0
+  --host 0.0.0.0 --port 11434 --log-progress --kv-cache-q8-0 --kv-cache-v-q4-k
 ```
+
+The two `--kv-cache` flags shrink the attention KV cache so deep 256K
+sessions fit in memory: `--kv-cache-q8-0` stores both planes as Q8_0
+blocks (about half the bytes), and `--kv-cache-v-q4-k` additionally
+stores the value plane as Q4_K super-blocks (9,984 bytes per token vs
+24,576 for F16, −59%). Both are lossy and off by default; the value-plane
+flag requires `--kv-cache-q8-0`. Snapshots and disk-cache entries are not
+shared across cache formats, so toggling a flag re-prefills existing
+conversations once.
 
 When the server is up, point OpenAI-compatible clients at
 `http://localhost:11434/v1` (see the [API contract](docs/SERVER.md)).
