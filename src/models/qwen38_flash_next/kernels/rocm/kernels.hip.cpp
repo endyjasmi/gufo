@@ -6222,10 +6222,12 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             }
           }
           if constexpr (kVQ4K) {
-            if (!query && !gate) {
+            if (!query && !gate && !key) {
               // The wave's v[0..7] hold the whole value row: one sub-block
               // per iteration, lane = element. The search is warp-local, so
-              // no shared memory or barriers are needed.
+              // no shared memory or barriers are needed. Key waves (which
+              // also fail the query/gate tests) store planar Q8_0 codes in
+              // the per-column chain above and must not touch this plane.
               float q4k_scales[8], q4k_mins[8];
 #pragma unroll
               for (unsigned c = 0; c < 8; ++c)
