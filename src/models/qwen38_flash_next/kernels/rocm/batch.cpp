@@ -521,6 +521,17 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
                           nullptr) != 0) {
         return Fail(error, "batched Q4_0 head GEMV failed");
       }
+    } else if (!draft_output.empty()) {
+      // Sampled rounds must rank proposals through the same draft head copy
+      // the single-session head reads; the target head is a different
+      // distribution, and mixed greedy/sampled rounds still verify against
+      // it exactly later in the cycle.
+      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, base.mixed,
+                          s_.mtp_zero_ids, batch_logits_, output.rows,
+                          output.cols, n, 1, 1, stream_, nullptr,
+                          nullptr) != 0) {
+        return Fail(error, "batched draft head GEMV failed");
+      }
     } else if (!DenseBatch(output, base.mixed, batch_logits_, n, error)) {
       return false;
     }
