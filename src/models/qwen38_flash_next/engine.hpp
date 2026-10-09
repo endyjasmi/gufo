@@ -50,6 +50,11 @@ struct ModelOptions {
   /// one F16 scale) instead of F16 halves: roughly half the per-token bytes,
   /// lossy. Snapshots of the two formats are not interchangeable.
   bool kv_cache_q8_0 = false;
+  /// Store the value plane as Q4_K super-blocks (4.5 bits per element,
+  /// error-minimized 6-bit scale/min pairs) on top of Q8_0 keys: another 47%
+  /// off the value plane, lossy. Requires kv_cache_q8_0. Snapshots of the
+  /// three formats are not interchangeable.
+  bool kv_cache_v_q4_k = false;
 };
 
 class Session;
@@ -88,6 +93,9 @@ public:
   }
   [[nodiscard]] bool KvCacheQ8_0() const noexcept {
     return options_.kv_cache_q8_0;
+  }
+  [[nodiscard]] bool KvCacheVQ4K() const noexcept {
+    return options_.kv_cache_v_q4_k;
   }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
@@ -215,7 +223,10 @@ public:
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
   /// 17: KV cache sections may be planar Q8_0 (kv_dtype header field).
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 17;  /// Bytes a snapshot of the current context occupies.
+  /// 18: K/V planes carry separate dtypes (kv_v_dtype header field); Q4_K
+  /// value planes.
+  static constexpr std::uint32_t kSnapshotPayloadVersion =
+      18;  /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
       std::uint32_t position) const;

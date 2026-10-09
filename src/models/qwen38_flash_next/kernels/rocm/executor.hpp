@@ -147,8 +147,8 @@ private:
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
-    /// F16 halves or planar Q8_0 bytes by the executor's kv_cache_dtype;
-    /// rows are [max_context][KvRowBytes(kv_heads*d, dtype)].
+    /// F16 halves or planar Q8_0/Q4_K bytes by the executor's kv_dtypes;
+    /// rows are [max_context][KvRowBytes(kv_heads*d, plane dtype)].
     unsigned char* k_cache{nullptr};
     unsigned char* v_cache{nullptr};
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
@@ -234,10 +234,12 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
-    /// KV cache element format for every session of this executor. Q8_0
+    /// KV cache element formats for every session of this executor. Q8_0
     /// stores 32-element blocks (F32→int8 codes, trailing F16 scales) and
-    /// roughly halves the per-token bytes; attention dequantizes on load.
-    KvCacheDtype kv_cache_dtype{KvCacheDtype::kF16};
+    /// roughly halves the per-token bytes; Q4_K stores 256-element
+    /// super-blocks at 4.5 bits per element for the value plane. Attention
+    /// dequantizes on load.
+    KvDtypes kv_dtypes{};
   };
 
   ~Executor();

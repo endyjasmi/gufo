@@ -1210,7 +1210,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
   const std::size_t kv_row = c.AttentionKvDim();
-  const std::size_t kv_cache_row_bytes = KvRowBytes(kv_row, options_.kv_cache_dtype);
+  const std::size_t k_cache_row_bytes =
+      KvRowBytes(kv_row, options_.kv_dtypes.key);
+  const std::size_t v_cache_row_bytes =
+      KvRowBytes(kv_row, options_.kv_dtypes.value);
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
@@ -1223,12 +1226,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache =
-          Alloc<unsigned char>(a, max_context * kv_cache_row_bytes,
-                               error_msg, &s->allocated_bytes_);
-      at.v_cache =
-          Alloc<unsigned char>(a, max_context * kv_cache_row_bytes,
-                               error_msg, &s->allocated_bytes_);
+      at.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
+                                        error_msg, &s->allocated_bytes_);
+      at.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
+                                        error_msg, &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
@@ -1249,12 +1250,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
-    s->mtp_.k_cache =
-        Alloc<unsigned char>(a, max_context * kv_cache_row_bytes,
-                             error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache =
-        Alloc<unsigned char>(a, max_context * kv_cache_row_bytes,
-                             error_msg, &s->allocated_bytes_);
+    s->mtp_.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
+                                           error_msg, &s->allocated_bytes_);
+    s->mtp_.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
+                                           error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
@@ -1333,8 +1332,10 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv = 2 * max_context * KvRowBytes(c.AttentionKvDim(),
-                                                      options_.kv_cache_dtype);
+  const std::size_t kv_row_elems = c.AttentionKvDim();
+  const std::size_t kv =
+      max_context * (KvRowBytes(kv_row_elems, options_.kv_dtypes.key) +
+                     KvRowBytes(kv_row_elems, options_.kv_dtypes.value));
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
@@ -2237,7 +2238,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, options_.kv_cache_dtype);
+          s.rope, options_.kv_dtypes);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2251,8 +2252,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
           s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase,
-          options_.kv_cache_dtype);
+          c.rms_eps, stream_, s.rope, prefill_phase, options_.kv_dtypes);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -2280,9 +2280,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope);
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_,
-            options_.kv_cache_dtype);
+            options_.kv_dtypes.key);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_,
-            options_.kv_cache_dtype);
+            options_.kv_dtypes.value);
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -2374,13 +2374,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last, options_.kv_cache_dtype)) &&
+                c.compress_ratio, stream_, last, options_.kv_dtypes)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
             WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
                                 c.head_dim, c.compress_ratio, stream_, last,
-                                options_.kv_cache_dtype));
+                                options_.kv_dtypes));
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -2403,7 +2403,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
-                  c.compress_ratio, stream_, options_.kv_cache_dtype);
+                  c.compress_ratio, stream_, options_.kv_dtypes);
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
@@ -3173,7 +3173,8 @@ struct SnapshotHeader {
   std::uint32_t conv_elems;
   std::uint32_t state_elems;
   std::uint32_t kv_row;
-  std::uint32_t kv_dtype;  ///< KvCacheDtype of the serialized K/V sections
+  std::uint32_t kv_dtype;    ///< KvCacheDtype of the serialized K section
+  std::uint32_t kv_v_dtype;  ///< KvCacheDtype of the serialized V section
   std::uint32_t indexer_head_dim;
   std::uint32_t compress_ratio;
   std::uint32_t hc_dim;
@@ -3194,8 +3195,7 @@ static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
 namespace {
 
 SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
-                                  const Session& session,
-                                  KvCacheDtype kv_dtype) {
+                                  const Session& session, KvDtypes kv_dtypes) {
   SnapshotHeader h{};
   h.magic = kSnapshotMagic;
   h.num_layers = c.num_layers;
@@ -3203,7 +3203,8 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   h.state_elems = c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
   h.kv_row = c.AttentionKvDim();
-  h.kv_dtype = static_cast<std::uint32_t>(kv_dtype);
+  h.kv_dtype = static_cast<std::uint32_t>(kv_dtypes.key);
+  h.kv_v_dtype = static_cast<std::uint32_t>(kv_dtypes.value);
   h.indexer_head_dim = c.indexer_head_dim;
   h.compress_ratio = c.compress_ratio;
   h.hc_dim = c.HcDim();
@@ -3222,14 +3223,16 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
          h.kv_row == mine.kv_row && h.kv_dtype == mine.kv_dtype &&
+         h.kv_v_dtype == mine.kv_v_dtype &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
          h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
 }
 
 /// Per-token bytes of one serialized K or V section in `h`'s format.
-std::uint64_t SnapshotKvRowBytes(const SnapshotHeader& h) {
-  return KvRowBytes(h.kv_row, static_cast<KvCacheDtype>(h.kv_dtype));
+std::uint64_t SnapshotKvRowBytes(const SnapshotHeader& h, bool value_plane) {
+  return KvRowBytes(h.kv_row, static_cast<KvCacheDtype>(
+                                  value_plane ? h.kv_v_dtype : h.kv_dtype));
 }
 
 }  // namespace
@@ -3271,8 +3274,10 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
               std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
     return 0;
   }
-  const std::uint64_t kv_bytes =
-      std::uint64_t{h.position} * SnapshotKvRowBytes(h);
+  const std::uint64_t k_bytes =
+      std::uint64_t{h.position} * SnapshotKvRowBytes(h, false);
+  const std::uint64_t v_bytes =
+      std::uint64_t{h.position} * SnapshotKvRowBytes(h, true);
   const std::uint64_t index_row_bytes =
       std::uint64_t{h.indexer_head_dim} * sizeof(float);
   const std::uint32_t index_begin = h.blocks * h.compress_ratio;
@@ -3282,10 +3287,10 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half)) ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half))) {
+      if (!region(at != nullptr ? at->k_cache : nullptr, k_bytes, "K cache",
+                  SnapshotKvRowBytes(h, false)) ||
+          !region(at != nullptr ? at->v_cache : nullptr, v_bytes, "V cache",
+                  SnapshotKvRowBytes(h, true))) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -3332,14 +3337,14 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
             "draft pooled keys",
             std::uint64_t{h.indexer_head_dim} * sizeof(__half), true, true))
       return 0;
-    const std::uint64_t mtp_kv_bytes =
-        std::uint64_t{h.mtp_position} * SnapshotKvRowBytes(h);
-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache", std::uint64_t{h.kv_row} * sizeof(__half),
-                true) ||
-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache", std::uint64_t{h.kv_row} * sizeof(__half),
-                true) ||
+    const std::uint64_t mtp_k_bytes =
+        std::uint64_t{h.mtp_position} * SnapshotKvRowBytes(h, false);
+    const std::uint64_t mtp_v_bytes =
+        std::uint64_t{h.mtp_position} * SnapshotKvRowBytes(h, true);
+    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_k_bytes,
+                "draft K cache", SnapshotKvRowBytes(h, false), true) ||
+        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_v_bytes,
+                "draft V cache", SnapshotKvRowBytes(h, true), true) ||
         !region(
             mtp != nullptr ? mtp->h : nullptr,
             h.mtp_residual_valid ? std::uint64_t{h.hc_dim} * sizeof(float) : 0,
@@ -3356,8 +3361,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, options_.kv_cache_dtype);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_enabled_, session,
+                                        options_.kv_dtypes);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -3387,8 +3392,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, options_.kv_cache_dtype);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_enabled_, session,
+                                        options_.kv_dtypes);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -3517,8 +3522,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
 std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                                                std::uint32_t position) const {
   const auto& c = config();
-  auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session,
-                              options_.kv_cache_dtype);
+  auto h =
+      MakeSnapshotHeader(c, session.mtp_enabled_, session, options_.kv_dtypes);
   h.position = position;
   h.blocks = c.compress_ratio > 0 && position > c.indexer_top_k
                  ? position / c.compress_ratio
@@ -3551,8 +3556,8 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   SnapshotHeader h{};
   std::memcpy(&h, payload.data(), sizeof(h));
-  const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session, options_.kv_cache_dtype);
+  const SnapshotHeader mine = MakeSnapshotHeader(config(), session.mtp_enabled_,
+                                                 session, options_.kv_dtypes);
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;
@@ -4307,12 +4312,11 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
     kv.rows = 2 * c.AttentionKvDim();
     if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
-                          nullptr, attn.k_cache, attn.v_cache, n, 0,
-                          c.num_kv_heads, c.head_dim, c.rotary_dim,
-                          &session.control_->mtp_position, c.rope_theta,
-                          c.rms_eps, stream_, attn.rope, false,
-                          options_.kv_cache_dtype)) {
+        !PrepareAttention(
+            s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
+            attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
+            c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
+            c.rms_eps, stream_, attn.rope, false, options_.kv_dtypes)) {
       AssignError(error_msg, "MTP cache projection failed");
       return false;
     }

@@ -1,4 +1,5 @@
-// Event-timed A/B of the wide attention reader over F16 vs Q8_0 caches.
+// Event-timed A/B of the wide attention reader over F16, Q8_0 and
+// Q8_0-keys/Q4_K-values caches.
 // Timing-only: outputs are downloaded and checksummed so the compiler and
 // runtime cannot elide work, but no numerics are judged here (the operator
 // test owns correctness). Usage: kvq8_reader_bench [start_pos] [n_tokens]
@@ -159,10 +160,10 @@ int main(int argc, char** argv) {
   std::uint64_t sum16 = 0;
   CheckHip(hipMemcpy(&sum16, d_out, 8, hipMemcpyDeviceToHost), "download");
   const auto q8 = TimeKernel("Q8 reader", rounds, [&] {
-    if (!q::WmmaCausalAttention(d_q, d_gate, d_k8, d_v8, nullptr, 0, d_out,
-                                n_tokens, start_pos, kHeads, kKvHeads, kDim,
-                                kRatio, nullptr, false,
-                                qk::KvCacheDtype::kQ8_0)) {
+    if (!q::WmmaCausalAttention(
+            d_q, d_gate, d_k8, d_v8, nullptr, 0, d_out, n_tokens, start_pos,
+            kHeads, kKvHeads, kDim, kRatio, nullptr, false,
+            qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0})) {
       std::exit(2);
     }
   });
@@ -171,6 +172,31 @@ int main(int argc, char** argv) {
   std::printf("ratio q8/f16 = %.3f (checksums %llx / %llx)\n", q8 / f16,
               static_cast<unsigned long long>(sum16),
               static_cast<unsigned long long>(sum8));
+
+  // Planar Q4_K value rows (synthetic nonzero bytes; timing-only).
+  const std::size_t q4k_bytes =
+      std::size_t{n_kv} * (kKvWidth / 2 + kKvWidth / 16);
+  auto* d_v4k = DeviceBytes<unsigned char>(q4k_bytes);
+  {
+    std::vector<unsigned char> packed(q4k_bytes);
+    for (std::size_t i = 0; i < packed.size(); ++i) {
+      packed[i] = static_cast<unsigned char>(NextRandom(&seed) & 0xFF);
+    }
+    CheckHip(hipMemcpy(d_v4k, packed.data(), q4k_bytes, hipMemcpyHostToDevice),
+             "upload v4k packed");
+  }
+  const auto q4k = TimeKernel("Q8K+Q4KV reader", rounds, [&] {
+    if (!q::WmmaCausalAttention(
+            d_q, d_gate, d_k8, d_v4k, nullptr, 0, d_out, n_tokens, start_pos,
+            kHeads, kKvHeads, kDim, kRatio, nullptr, false,
+            qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K})) {
+      std::exit(2);
+    }
+  });
+  std::uint64_t sum4k = 0;
+  CheckHip(hipMemcpy(&sum4k, d_out, 8, hipMemcpyDeviceToHost), "download");
+  std::printf("ratio q8k+q4kv/f16 = %.3f (checksum %llx)\n", q4k / f16,
+              static_cast<unsigned long long>(sum4k));
 
   // Sparse selection, the shape serving actually runs: ~512 selected blocks
   // per query plus the visible tail.
@@ -202,13 +228,22 @@ int main(int argc, char** argv) {
     }
   });
   const auto q8s = TimeKernel("Q8 reader (sparse)", rounds, [&] {
-    if (!q::WmmaCausalAttention(d_q, d_gate, d_k8, d_v8, d_mask, mask_words,
-                                d_out, n_tokens, start_pos, kHeads, kKvHeads,
-                                kDim, kRatio, nullptr, false,
-                                qk::KvCacheDtype::kQ8_0)) {
+    if (!q::WmmaCausalAttention(
+            d_q, d_gate, d_k8, d_v8, d_mask, mask_words, d_out, n_tokens,
+            start_pos, kHeads, kKvHeads, kDim, kRatio, nullptr, false,
+            qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0})) {
       std::exit(2);
     }
   });
   std::printf("sparse ratio q8/f16 = %.3f\n", q8s / f16s);
+  const auto q4ks = TimeKernel("Q8K+Q4KV reader (sparse)", rounds, [&] {
+    if (!q::WmmaCausalAttention(
+            d_q, d_gate, d_k8, d_v4k, d_mask, mask_words, d_out, n_tokens,
+            start_pos, kHeads, kKvHeads, kDim, kRatio, nullptr, false,
+            qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K})) {
+      std::exit(2);
+    }
+  });
+  std::printf("sparse ratio q8k+q4kv/f16 = %.3f\n", q4ks / f16s);
   return 0;
 }

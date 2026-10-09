@@ -30,6 +30,8 @@ struct BenchOptions {
   std::uint32_t min_draft_tokens{1};
   /// Flash-Next: store attention K/V caches as Q8_0 blocks (lossy).
   bool kv_cache_q8_0{false};
+  /// Flash-Next: store the attention value plane as Q4_K (lossy).
+  bool kv_cache_v_q4_k{false};
   sampling::SamplingConfig sampling{.seed = 0};
   bool verbose{false};
 };

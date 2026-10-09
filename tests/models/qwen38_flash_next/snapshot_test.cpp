@@ -275,7 +275,8 @@ void CheckBorrowedSnapshots(const std::shared_ptr<qfn::Model>& model,
 
 void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
                               std::span<const std::int32_t> prompt,
-                              gufo::core::SessionMode mode) {
+                              gufo::core::SessionMode mode, bool kv_q8,
+                              bool kv_v_q4k) {
   std::string error;
   auto source = model->CreateSession(mode, 8192, &error);
   Require(source && source->Sync(prompt.first(32), &error), error);
@@ -289,7 +290,14 @@ void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
   Require(large != nullptr, error);
   source->Reset();
   Require(source->Sync(prompt.first(16), &error), error);
-  Require(large->DeviceBytes() > before + (80ULL << 20),
+  // The deep-only row delta scales with the cache format: per token and
+  // full-attention layer F16 stores 2 KiB (K+V), Q8_0 1.0625 KiB, and
+  // Q8_0+Q4_K 832 bytes. Scale the F16-calibrated floor to match.
+  const double kv_factor = kv_v_q4k ? 832.0 / 2048.0
+                           : kv_q8  ? 1152.0 / 2048.0
+                                    : 1.0;
+  Require(large->DeviceBytes() >
+              before + static_cast<std::uint64_t>(80.0 * (1 << 20) * kv_factor),
           "deep checkpoint did not preserve its overwritten rows");
   large.reset();
   // Count owned backing blocks rather than HIP's global heap cache. A short
@@ -309,13 +317,16 @@ void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
 
 int main(int argc, char** argv) {
   bool kv_q8 = false;
+  bool kv_v_q4k = false;
   if (argc == 6 && std::string_view(argv[5]) == "--kv-q8") {
     kv_q8 = true;
+  } else if (argc == 6 && std::string_view(argv[5]) == "--kv-v-q4k") {
+    kv_q8 = true;
+    kv_v_q4k = true;
   } else if (argc != 5 || std::string_view(argv[1]) != "--model" ||
              std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
-           "[--kv-q8]\n";
+    std::cerr << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--kv-q8|--kv-v-q4k]\n";
     return 77;
   }
   try {
@@ -325,7 +336,8 @@ int main(int argc, char** argv) {
                                   {.max_context = kContext,
                                    .mtp_model_path = argv[4],
                                    .max_draft_tokens = 7,
-                                   .kv_cache_q8_0 = kv_q8},
+                                   .kv_cache_q8_0 = kv_q8,
+                                   .kv_cache_v_q4_k = kv_v_q4k},
                                   &error);
     Require(model != nullptr, error);
     const auto pattern = model->Tokenize(
@@ -361,9 +373,10 @@ int main(int argc, char** argv) {
     CheckBorrowedSnapshots(model, prompt,
                            gufo::core::SessionMode::kSpeculative);
     CheckCheckpointRetention(model, prompt,
-                             gufo::core::SessionMode::kAutoregressive);
-    CheckCheckpointRetention(model, prompt,
-                             gufo::core::SessionMode::kSpeculative);
+                             gufo::core::SessionMode::kAutoregressive, kv_q8,
+                             kv_v_q4k);
+    CheckCheckpointRetention(
+        model, prompt, gufo::core::SessionMode::kSpeculative, kv_q8, kv_v_q4k);
     const sampling::SamplingConfig config{
         .temperature = 0.8F, .top_k = 40, .top_p = 0.9F, .seed = 7};
     constexpr std::size_t kTokens = 48;
