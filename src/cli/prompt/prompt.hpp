@@ -11,6 +11,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 
 namespace gufo::cli {
 
@@ -42,10 +43,9 @@ struct PromptOptions {
   std::string dspark_model_path;
   std::uint32_t draft_tokens = 7;
   std::uint32_t min_draft_tokens = 1;
-  /// Flash-Next: store attention K/V caches as Q8_0 blocks (lossy).
-  bool kv_cache_q8_0 = false;
-  /// Flash-Next: store the attention value plane as Q4_K (lossy).
-  bool kv_cache_v_q4_k = false;
+  /// Flash-Next attention KV cache storage mode (`--kv-cache`).
+  models::qwen38_flash_next::KvCacheMode kv_cache_mode{
+      models::qwen38_flash_next::KvCacheMode::kF16};
 };
 
 /// Prints help for `gufo prompt`.

@@ -48,6 +48,7 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::cli {
@@ -612,8 +613,8 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
-    bool kv_cache_q8_0 = false;
-    bool kv_cache_v_q4_k = false;
+    models::qwen38_flash_next::KvCacheMode kv_cache_mode =
+        models::qwen38_flash_next::KvCacheMode::kF16;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -716,16 +717,27 @@ void PrintServeHelp(std::string_view program_name,
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)",
         "Cache", &cache_ram_bytes);
-    parser.AddFlag(
-        "", "--kv-cache-q8-0",
-        "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
-        "bytes, lossy)",
-        "Cache", &kv_cache_q8_0);
-    parser.AddFlag(
-        "", "--kv-cache-v-q4-k",
-        "Store the Flash-Next attention value plane as Q4_K super-blocks "
-        "(~47% fewer V bytes; requires --kv-cache-q8-0)",
-        "Cache", &kv_cache_v_q4_k);
+    parser.AddCustomOption(
+        "", "--kv-cache", "MODE",
+        "KV cache storage for Flash-Next: f16 (default), q8_0 (both "
+        "planes, ~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, "
+        "~59% fewer bytes); lossy except f16",
+        "Cache",
+        [&kv_cache_mode](std::string_view, std::string_view value,
+                         std::string* error) -> bool {
+          if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                           &kv_cache_mode)) {
+            if (error != nullptr) {
+              *error =
+                  "Invalid mode for --kv-cache: '" + std::string(value) +
+                  "' (want " +
+                  std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                  ")";
+            }
+            return false;
+          }
+          return true;
+        });
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
@@ -1162,8 +1174,8 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
-    bool kv_cache_q8_0 = false;
-    bool kv_cache_v_q4_k = false;
+    models::qwen38_flash_next::KvCacheMode kv_cache_mode =
+        models::qwen38_flash_next::KvCacheMode::kF16;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1262,16 +1274,27 @@ int RunServe(std::span<const char* const> args) {
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)",
         "Cache", &cache_ram_bytes);
-    llm_parser.AddFlag(
-        "", "--kv-cache-q8-0",
-        "Store attention K/V caches as Q8_0 blocks (Flash-Next; ~half the "
-        "bytes, lossy)",
-        "Cache", &kv_cache_q8_0);
-    llm_parser.AddFlag(
-        "", "--kv-cache-v-q4-k",
-        "Store the Flash-Next attention value plane as Q4_K super-blocks "
-        "(~47% fewer V bytes; requires --kv-cache-q8-0)",
-        "Cache", &kv_cache_v_q4_k);
+    llm_parser.AddCustomOption(
+        "", "--kv-cache", "MODE",
+        "KV cache storage for Flash-Next: f16 (default), q8_0 (both "
+        "planes, ~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, "
+        "~59% fewer bytes); lossy except f16",
+        "Cache",
+        [&kv_cache_mode](std::string_view, std::string_view value,
+                         std::string* error) -> bool {
+          if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                           &kv_cache_mode)) {
+            if (error != nullptr) {
+              *error =
+                  "Invalid mode for --kv-cache: '" + std::string(value) +
+                  "' (want " +
+                  std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                  ")";
+            }
+            return false;
+          }
+          return true;
+        });
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
@@ -1437,7 +1460,7 @@ int RunServe(std::span<const char* const> args) {
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{.capacity_bytes =
                                                              cache_ram_bytes},
-                       kv_cache_q8_0, kv_cache_v_q4_k)) {
+                       kv_cache_mode)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

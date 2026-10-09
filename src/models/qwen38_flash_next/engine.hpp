@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
 namespace gufo::core {
@@ -46,15 +47,10 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
-  /// Store the attention K/V caches as Q8_0 blocks (32 F32→int8 codes plus
-  /// one F16 scale) instead of F16 halves: roughly half the per-token bytes,
-  /// lossy. Snapshots of the two formats are not interchangeable.
-  bool kv_cache_q8_0 = false;
-  /// Store the value plane as Q4_K super-blocks (4.5 bits per element,
-  /// error-minimized 6-bit scale/min pairs) on top of Q8_0 keys: another 47%
-  /// off the value plane, lossy. Requires kv_cache_q8_0. Snapshots of the
-  /// three formats are not interchangeable.
-  bool kv_cache_v_q4_k = false;
+  /// Attention KV cache storage: F16 halves by default, Q8_0 blocks for
+  /// both planes, or Q8_0 keys with Q4_K super-block values. Lossy beyond
+  /// F16; snapshots of different modes are not interchangeable.
+  KvCacheMode kv_cache_mode = KvCacheMode::kF16;
 };
 
 class Session;
@@ -91,11 +87,8 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
-  [[nodiscard]] bool KvCacheQ8_0() const noexcept {
-    return options_.kv_cache_q8_0;
-  }
-  [[nodiscard]] bool KvCacheVQ4K() const noexcept {
-    return options_.kv_cache_v_q4_k;
+  [[nodiscard]] KvCacheMode kv_cache_mode() const noexcept {
+    return options_.kv_cache_mode;
   }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;

@@ -26,6 +26,7 @@
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen35moe/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -205,16 +206,26 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
-  parser.AddFlag(
-      "", "--kv-cache-q8-0",
-      "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
-      "bytes, lossy)",
-      "Speculative", &opt.kv_cache_q8_0);
-  parser.AddFlag(
-      "", "--kv-cache-v-q4-k",
-      "Store the Flash-Next attention value plane as Q4_K super-blocks "
-      "(~47% fewer V bytes; requires --kv-cache-q8-0)",
-      "Speculative", &opt.kv_cache_v_q4_k);
+  parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8_0 (both planes, "
+      "~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, ~59% fewer "
+      "bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
   parser.AddCustomOption(
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
@@ -409,6 +420,11 @@ int RunDeepSeekBenchmark(
   if (dspark && options.min_draft_tokens != 1) {
     std::cerr << "Error: DSpark uses model-owned adaptive drafting; custom "
                  "draft floors are unsupported\n";
+    return 1;
+  }
+  if (options.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
     return 1;
   }
 
@@ -946,8 +962,7 @@ int RunQwen38FlashNextBenchmark(
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
-          .kv_cache_q8_0 = options.kv_cache_q8_0,
-          .kv_cache_v_q4_k = options.kv_cache_v_q4_k,
+          .kv_cache_mode = options.kv_cache_mode,
       },
       &error);
   if (model == nullptr) {
@@ -1210,6 +1225,11 @@ int RunOrnithBenchmark(const BenchOptions& options,
   }
   if (required_context > std::numeric_limits<std::uint32_t>::max()) {
     std::cerr << "Error: Ornith context is out of range\n";
+    return 1;
+  }
+  if (options.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
     return 1;
   }
 

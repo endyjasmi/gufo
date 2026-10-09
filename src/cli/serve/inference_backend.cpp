@@ -225,7 +225,8 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency, bool kv_q8_0, bool kv_v_q4_k) {
+    std::uint32_t decode_concurrency,
+    models::qwen38_flash_next::KvCacheMode kv_cache_mode) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -249,9 +250,11 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << models::qwen38_flash_next::Session::kSnapshotPayloadVersion
            << '\n'
            << "kv_cache="
-           << (kv_v_q4_k ? "k-q8_0-v-q4_k-block-v1"
-               : kv_q8_0 ? "q8_0-block-v1"
-                         : "f16-v1")
+           << (kv_cache_mode == models::qwen38_flash_next::KvCacheMode::kQ8_0Q4K
+                   ? "k-q8_0-v-q4_k-block-v1"
+               : kv_cache_mode == models::qwen38_flash_next::KvCacheMode::kQ8_0
+                   ? "q8_0-block-v1"
+                   : "f16-v1")
            << '\n'
            << "context_tokens=" << max_context << '\n'
            << "position_policy=absolute-v1\n"
@@ -2508,8 +2511,7 @@ public:
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
               use_mtp_, max_context_, max_draft_tokens_,
-              model_->DecodeConcurrency(), model_->KvCacheQ8_0(),
-              model_->KvCacheVQ4K()),
+              model_->DecodeConcurrency(), model_->kv_cache_mode()),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -3697,16 +3699,15 @@ InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 
 InferenceBackend::~InferenceBackend() = default;
 
-bool InferenceBackend::load(const std::string& model_path, std::string* error,
-                            std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config,
-                            bool kv_cache_q8_0, bool kv_cache_v_q4_k) {
+bool InferenceBackend::load(
+    const std::string& model_path, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    const TextSpeculativeConfig& speculative_config,
+    const TextDiskCacheConfig& disk_cache_config,
+    const std::string& vision_model_path,
+    TextRunnerRamCacheOptions ram_cache_config,
+    models::qwen38_flash_next::KvCacheMode kv_cache_mode) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3731,6 +3732,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
 
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+    if (kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+      SetError(error, "--kv-cache applies only to Qwen3.8-Flash-Next models");
+      return false;
+    }
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
       return false;
@@ -3838,8 +3843,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
-            .kv_cache_q8_0 = kv_cache_q8_0,
-            .kv_cache_v_q4_k = kv_cache_v_q4_k,
+            .kv_cache_mode = kv_cache_mode,
         },
         &load_error);
     if (model == nullptr) {
@@ -3869,6 +3873,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    if (kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+      SetError(error, "--kv-cache applies only to Qwen3.8-Flash-Next models");
+      return false;
+    }
     const bool ornith_dflash =
         speculative_config.backend == TextSpeculativeBackend::kDFlash;
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&

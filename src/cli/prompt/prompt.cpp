@@ -23,6 +23,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -161,16 +162,26 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
-  parser.AddFlag(
-      "", "--kv-cache-q8-0",
-      "Store Flash-Next attention K/V caches as Q8_0 blocks (~half the "
-      "bytes, lossy)",
-      "Speculative", &opt.kv_cache_q8_0);
-  parser.AddFlag(
-      "", "--kv-cache-v-q4-k",
-      "Store the Flash-Next attention value plane as Q4_K super-blocks "
-      "(~47% fewer V bytes; requires --kv-cache-q8-0)",
-      "Speculative", &opt.kv_cache_v_q4_k);
+  parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8_0 (both planes, "
+      "~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, ~59% fewer "
+      "bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
   parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -324,6 +335,12 @@ constexpr std::uint32_t kDefaultContext = 4096;
 std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
+  if (opt.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
   if (opt.force_cpu) {
     std::cerr << "DeepSeek V4 Flash is supported only by the ROCm backend\n";
     PrintModelLoadTime(load_start, false);
@@ -693,8 +710,7 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        .mtp_model_path = mtp_model_path,
        .max_draft_tokens = opt.draft_tokens,
        .vision_model_path = opt.vision_model_path,
-       .kv_cache_q8_0 = opt.kv_cache_q8_0,
-       .kv_cache_v_q4_k = opt.kv_cache_v_q4_k},
+       .kv_cache_mode = opt.kv_cache_mode},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -706,6 +722,11 @@ std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
   std::string error;
+  if (opt.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
+    return nullptr;
+  }
   const bool dflash = opt.speculative_backend == "dflash2";
   if (opt.force_cpu ||
       (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp" &&
