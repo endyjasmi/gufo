@@ -65,4 +65,9 @@ if (ENGINE_ENABLE_HIP)
     parity_probe.cpp)
   target_link_libraries(qwen38_flash_next_parity_probe PRIVATE
     gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_interleave_probe EXCLUDE_FROM_ALL
+    interleave_probe.cpp)
+  target_link_libraries(qwen38_flash_next_interleave_probe PRIVATE
+    gufo_qwen38_flash_next hip::host)
 endif()
