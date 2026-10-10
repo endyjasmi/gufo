@@ -148,6 +148,19 @@ public:
                                  double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
+  /// Widest verify pass TeacherForce accepts; 1 without MTP.
+  [[nodiscard]] std::uint32_t MaxVerifyWidth() const noexcept;
+  /// Feeds `tokens` through the target arithmetic without consulting the
+  /// draft head and writes every row's logits (n * vocab floats): one token
+  /// as a decode step, 2..MaxVerifyWidth() as a verify pass whose every row
+  /// is kept, or — with `prefill` on an MTP-free session — prompt
+  /// arithmetic at any width. Teacher-forced dumps compare targets,
+  /// schedules and builds bit for bit; the session continues from the last
+  /// row.
+  [[nodiscard]] bool TeacherForce(std::span<const std::int32_t> tokens,
+                                  std::vector<float>* rows,
+                                  std::string* error_msg = nullptr,
+                                  bool prefill = false);
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};

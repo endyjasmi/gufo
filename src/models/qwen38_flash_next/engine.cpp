@@ -724,6 +724,48 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return ok;
 }
 
+std::uint32_t Session::MaxVerifyWidth() const noexcept {
+  return MtpEnabled() ? model_->executor_->max_speculative() : 1;
+}
+
+bool Session::TeacherForce(std::span<const std::int32_t> tokens,
+                           std::vector<float>* rows, std::string* error_msg,
+                           bool prefill) {
+  if (!valid_ || tokens_.empty()) {
+    AssignError(error_msg, "teacher forcing needs a synced session");
+    return false;
+  }
+  const std::size_t n = tokens.size();
+  if (n == 0 || (prefill ? MtpEnabled() : n > MaxVerifyWidth()) ||
+      tokens_.size() + n > ContextSize()) {
+    AssignError(error_msg, "teacher forcing width or context out of range");
+    return false;
+  }
+  rocm::Executor& exec = *model_->executor_;
+  const std::size_t vocab = model_->VocabSize();
+  rows->resize(n * vocab);
+  valid_ = false;
+  // The same Forward calls decode makes: a one-token decode step, or a
+  // verify pass whose every row is kept. The draft head is never consulted,
+  // so sessions driven only by TeacherForce carry no draft state.
+  const auto mode = prefill  ? rocm::Executor::ForwardMode::kPrefill
+                    : n == 1 ? rocm::Executor::ForwardMode::kDecode
+                             : rocm::Executor::ForwardMode::kVerify;
+  const auto base = static_cast<std::uint32_t>(tokens_.size());
+  if (!exec.Forward(*session_, tokens, static_cast<std::uint32_t>(n),
+                    rows->data(), mode, error_msg) ||
+      (mode == rocm::Executor::ForwardMode::kVerify &&
+       !exec.Rollback(*session_, static_cast<std::uint32_t>(n), error_msg))) {
+    return false;
+  }
+  std::copy_n(rows->data() + (n - 1) * vocab, vocab, logits_.begin());
+  hidden_base_ = static_cast<std::uint32_t>(
+      base + n - std::min<std::size_t>(n, exec.max_speculative()));
+  tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+  valid_ = true;
+  return true;
+}
+
 struct Session::PendingDecode {
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;

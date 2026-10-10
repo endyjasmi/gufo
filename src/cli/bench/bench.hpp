@@ -22,6 +22,14 @@ struct BenchOptions {
   std::vector<std::size_t> concurrency{1};
   std::size_t repetitions{1};
   std::size_t validate_prefill_tokens{0};
+  /// Teacher-forced logit dump (`--logit-eval`): feed a text file through
+  /// the decode arithmetic and write per-position target/top-64 log-probs
+  /// for cross-build and cross-schedule bit comparisons.
+  std::string logit_eval_path;
+  std::string logit_out;
+  /// Colon-separated schedules of comma-separated widths, `p`-prefixed for
+  /// prompt arithmetic (`--logit-schedules 1:2,4:p8`).
+  std::string logit_schedules{"1"};
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;
