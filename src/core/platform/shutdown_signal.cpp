@@ -112,7 +112,9 @@ ShutdownSignalGuard::~ShutdownSignalGuard() {
 }
 
 void NotifyShutdownHandled() noexcept {
+#if defined(_WIN32)
   g_cleanup_complete.store(true, std::memory_order_release);
+#endif
 }
 
 }  // namespace gufo::platform
