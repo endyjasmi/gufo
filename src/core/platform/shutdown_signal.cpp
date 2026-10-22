@@ -4,6 +4,7 @@
 #include <csignal>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
