@@ -19,6 +19,7 @@
 #include "src/core/platform/net.hpp"
 
 namespace {
+namespace net = gufo::net;
 using namespace gufo::server;
 namespace json = gufo::json;
 

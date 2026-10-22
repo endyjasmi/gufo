@@ -31,6 +31,7 @@
 #include "src/core/platform/net.hpp"
 
 namespace {
+namespace net = gufo::net;
 
 using gufo::server::HttpServer;
 using gufo::server::Logger;
