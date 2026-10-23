@@ -1,9 +1,11 @@
 #include "src/models/qwen_image_21/weights.hpp"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +16,7 @@
 #include <stdexcept>
 
 #include "src/core/mapped_prefetch.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::qwen_image_21 {
 namespace {
@@ -217,21 +220,17 @@ Weights::Weights(const std::filesystem::path& root) {
 
 void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
-  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  struct stat st{};
-  if (fd < 0)
-    throw std::runtime_error("cannot open " + path.string());
-  if (fstat(fd, &st) != 0 || st.st_size < 8) {
-    close(fd);
+  auto* mapped = new platform::RawMappedFile();
+  if (!mapped->Open(path.string().c_str()) || mapped->size < 8) {
+    delete mapped;
     throw std::runtime_error("invalid safetensors file " + path.string());
   }
-  const auto size = static_cast<std::size_t>(st.st_size);
-  void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-  if (data == MAP_FAILED)
-    throw std::runtime_error("cannot map " + path.string());
-  auto owner =
-      std::shared_ptr<void>(data, [size](void* p) { munmap(p, size); });
+  const auto size = mapped->size;
+  void* data = mapped->data;
+  auto owner = std::shared_ptr<void>(data, [mapped](void*) {
+    mapped->Close();
+    delete mapped;
+  });
   std::uint64_t header_size;
   std::memcpy(&header_size, data, 8);
   if (!header_size || header_size > (32U << 20U) || header_size > size - 8)

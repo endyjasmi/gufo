@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "model.h"
+#include "src/core/platform/mapped_file.hpp"
 #include "tensor_types.h"
 
 inline constexpr float DS4_NEG_INF = -1.0e30F;
@@ -48,98 +49,99 @@ inline constexpr float DS4_COMPRESS_ROPE_FREQ_BASE = 160000.0F;
 inline constexpr uint64_t DS4_ROPE_ORIG_CTX = 65536;
 
 struct ds4_str {
-    const char *ptr;
-    uint64_t len;
+  const char* ptr;
+  uint64_t len;
 };
 
 struct ds4_kv {
-    ds4_str key;
-    uint32_t type;
-    uint64_t value_pos;
+  ds4_str key;
+  uint32_t type;
+  uint64_t value_pos;
 };
 
 struct ds4_tensor {
-    ds4_str name;
-    uint32_t ndim;
-    uint64_t dim[DS4_MAX_DIMS];
-    uint32_t type;
-    uint64_t rel_offset;
-    uint64_t abs_offset;
-    uint64_t elements;
-    uint64_t bytes;
+  ds4_str name;
+  uint32_t ndim;
+  uint64_t dim[DS4_MAX_DIMS];
+  uint32_t type;
+  uint64_t rel_offset;
+  uint64_t abs_offset;
+  uint64_t elements;
+  uint64_t bytes;
 };
 
 struct ds4_model {
-    int fd;
-    const uint8_t *map;
-    uint64_t size;
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint64_t alignment;
-    uint64_t tensor_data_pos;
-    uint64_t max_tensor_bytes;
-    ds4_kv *kv;
-    ds4_tensor *tensors;
+  int fd;
+  gufo::platform::RawMappedFile mapping;
+  const uint8_t* map;
+  uint64_t size;
+  uint32_t version;
+  uint64_t n_kv;
+  uint64_t n_tensors;
+  uint64_t alignment;
+  uint64_t tensor_data_pos;
+  uint64_t max_tensor_bytes;
+  ds4_kv* kv;
+  ds4_tensor* tensors;
 };
 
 struct ds4_layer_weights {
-    ds4_tensor *hc_attn_fn;
-    ds4_tensor *hc_attn_scale;
-    ds4_tensor *hc_attn_base;
-    ds4_tensor *attn_norm;
-    ds4_tensor *attn_q_a;
-    ds4_tensor *attn_q_a_norm;
-    ds4_tensor *attn_q_b;
-    ds4_tensor *attn_kv;
-    ds4_tensor *attn_kv_a_norm;
-    ds4_tensor *attn_sinks;
-    ds4_tensor *attn_output_a;
-    ds4_tensor *attn_output_b;
-    ds4_tensor *attn_compressor_ape;
-    ds4_tensor *attn_compressor_kv;
-    ds4_tensor *attn_compressor_gate;
-    ds4_tensor *attn_compressor_norm;
-    ds4_tensor *indexer_attn_q_b;
-    ds4_tensor *indexer_proj;
-    ds4_tensor *indexer_compressor_ape;
-    ds4_tensor *indexer_compressor_kv;
-    ds4_tensor *indexer_compressor_gate;
-    ds4_tensor *indexer_compressor_norm;
-    ds4_tensor *hc_ffn_fn;
-    ds4_tensor *hc_ffn_scale;
-    ds4_tensor *hc_ffn_base;
-    ds4_tensor *ffn_norm;
-    ds4_tensor *ffn_gate_tid2eid;
-    ds4_tensor *ffn_gate_inp;
-    ds4_tensor *ffn_exp_probs_b;
-    ds4_tensor *ffn_gate_exps;
-    ds4_tensor *ffn_up_exps;
-    ds4_tensor *ffn_down_exps;
-    ds4_tensor *ffn_gate_shexp;
-    ds4_tensor *ffn_up_shexp;
-    ds4_tensor *ffn_down_shexp;
+  ds4_tensor* hc_attn_fn;
+  ds4_tensor* hc_attn_scale;
+  ds4_tensor* hc_attn_base;
+  ds4_tensor* attn_norm;
+  ds4_tensor* attn_q_a;
+  ds4_tensor* attn_q_a_norm;
+  ds4_tensor* attn_q_b;
+  ds4_tensor* attn_kv;
+  ds4_tensor* attn_kv_a_norm;
+  ds4_tensor* attn_sinks;
+  ds4_tensor* attn_output_a;
+  ds4_tensor* attn_output_b;
+  ds4_tensor* attn_compressor_ape;
+  ds4_tensor* attn_compressor_kv;
+  ds4_tensor* attn_compressor_gate;
+  ds4_tensor* attn_compressor_norm;
+  ds4_tensor* indexer_attn_q_b;
+  ds4_tensor* indexer_proj;
+  ds4_tensor* indexer_compressor_ape;
+  ds4_tensor* indexer_compressor_kv;
+  ds4_tensor* indexer_compressor_gate;
+  ds4_tensor* indexer_compressor_norm;
+  ds4_tensor* hc_ffn_fn;
+  ds4_tensor* hc_ffn_scale;
+  ds4_tensor* hc_ffn_base;
+  ds4_tensor* ffn_norm;
+  ds4_tensor* ffn_gate_tid2eid;
+  ds4_tensor* ffn_gate_inp;
+  ds4_tensor* ffn_exp_probs_b;
+  ds4_tensor* ffn_gate_exps;
+  ds4_tensor* ffn_up_exps;
+  ds4_tensor* ffn_down_exps;
+  ds4_tensor* ffn_gate_shexp;
+  ds4_tensor* ffn_up_shexp;
+  ds4_tensor* ffn_down_shexp;
 };
 
 struct ds4_weights {
-    ds4_tensor *token_embd;
-    ds4_tensor *output_hc_base;
-    ds4_tensor *output_hc_fn;
-    ds4_tensor *output_hc_scale;
-    ds4_tensor *output_norm;
-    ds4_tensor *output;
-    ds4_layer_weights layer[DS4_MAX_LAYER];
+  ds4_tensor* token_embd;
+  ds4_tensor* output_hc_base;
+  ds4_tensor* output_hc_fn;
+  ds4_tensor* output_hc_scale;
+  ds4_tensor* output_norm;
+  ds4_tensor* output;
+  ds4_layer_weights layer[DS4_MAX_LAYER];
 };
 
 using token_vec = ds4_tokens;
 
 uint32_t ds4_layer_compress_ratio(uint32_t layer);
-void *ds4_xcalloc(size_t count, size_t size);
-void *ds4_xmalloc(size_t size);
-void *ds4_xrealloc(void *pointer, size_t size);
+void* ds4_xcalloc(size_t count, size_t size);
+void* ds4_xmalloc(size_t size);
+void* ds4_xrealloc(void* pointer, size_t size);
 double ds4_now_seconds(void);
 uint64_t ds4_align_up(uint64_t value, uint64_t alignment);
-const char *ds4_tensor_type_name(uint32_t type);
-uint64_t ds4_routed_expert_row_bytes(const ds4_tensor *tensor);
+const char* ds4_tensor_type_name(uint32_t type);
+uint64_t ds4_routed_expert_row_bytes(const ds4_tensor* tensor);
 
 #endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_

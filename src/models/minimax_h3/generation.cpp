@@ -1,6 +1,10 @@
 #include "src/models/minimax_h3/generation.hpp"
 
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -137,7 +141,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(::getpid()) + "-" +
+                                        std::to_string(_getpid()) + "-" +
                                         std::to_string(NextOutputNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);
@@ -199,7 +203,7 @@ bool WriteFramesAtomic(const std::filesystem::path& directory,
   const std::filesystem::path partial =
       parent /
       (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(::getpid()) + "-" + std::to_string(NextOutputNonce()));
+       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);
@@ -295,7 +299,7 @@ bool WriteLatentsAtomic(const std::filesystem::path& directory,
   const std::filesystem::path partial =
       parent /
       (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(::getpid()) + "-" + std::to_string(NextOutputNonce()));
+       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);
