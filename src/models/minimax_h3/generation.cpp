@@ -6,6 +6,20 @@
 #include <unistd.h>
 #endif
 
+namespace gufo::minimax_h3 {
+
+/// The host process id, used only to make temporary output names
+/// collision-free between concurrent processes.
+int HostProcessId() noexcept {
+#if defined(_WIN32)
+  return _getpid();
+#else
+  return getpid();
+#endif
+}
+
+}  // namespace gufo::minimax_h3
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -141,7 +155,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(_getpid()) + "-" +
+                                        std::to_string(HostProcessId()) + "-" +
                                         std::to_string(NextOutputNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);
@@ -201,9 +215,9 @@ bool WriteFramesAtomic(const std::filesystem::path& directory,
     return false;
   }
   const std::filesystem::path partial =
-      parent /
-      (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
+      parent / (directory.filename().string() + ".gufo-partial-" +
+                std::to_string(HostProcessId()) + "-" +
+                std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);
@@ -297,9 +311,9 @@ bool WriteLatentsAtomic(const std::filesystem::path& directory,
     return false;
   }
   const std::filesystem::path partial =
-      parent /
-      (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
+      parent / (directory.filename().string() + ".gufo-partial-" +
+                std::to_string(HostProcessId()) + "-" +
+                std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);
