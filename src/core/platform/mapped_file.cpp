@@ -191,9 +191,80 @@ std::size_t SystemPageSize() noexcept {
 #endif
 }
 
-bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
+bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
+                         std::string* error) noexcept {
+  const auto fail = [&](const char* what) {
 #if defined(_WIN32)
-  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
+    if (error != nullptr)
+      *error = FormatWindowsError(what, GetLastError());
+#else
+    if (error != nullptr)
+      *error = FormatErrno(what, errno);
+#endif
+    return false;
+  };
+#if defined(_WIN32)
+  const DWORD attributes = hint == MapHint::kSequential
+                               ? FILE_FLAG_SEQUENTIAL_SCAN
+                               : FILE_ATTRIBUTE_NORMAL;
+  const HANDLE file = OpenForRead(path, attributes);
+  if (file == INVALID_HANDLE_VALUE)
+    return fail("cannot open");
+  LARGE_INTEGER file_size{};
+  if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
+    CloseHandle(file);
+    return fail("cannot stat");
+  }
+  const HANDLE section =
+      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (section == nullptr) {
+    CloseHandle(file);
+    return fail("cannot create mapping");
+  }
+  void* view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
+  if (view == nullptr) {
+    const DWORD code = GetLastError();
+    CloseHandle(section);
+    CloseHandle(file);
+    return fail("cannot map");
+  }
+  data = view;
+  size = static_cast<std::size_t>(file_size.QuadPart);
+  view_base = view;
+  view_size = size;
+  this->file = file;
+  this->section = section;
+  return true;
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return fail("cannot open");
+  struct stat status{};
+  if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
+    ::close(fd);
+    return fail("cannot stat");
+  }
+  const auto file_size = static_cast<std::size_t>(status.st_size);
+  void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  ::close(fd);
+  if (mapping == MAP_FAILED)
+    return fail("cannot mmap");
+  if (hint == MapHint::kSequential)
+    (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
+  data = mapping;
+  size = file_size;
+  view_base = mapping;
+  view_size = file_size;
+  return true;
+#endif
+}
+bool RawMappedFile::Open(const std::filesystem::path& path,
+                         MapHint hint) noexcept {
+#if defined(_WIN32)
+  const DWORD attributes = hint == MapHint::kSequential
+                               ? FILE_FLAG_SEQUENTIAL_SCAN
+                               : FILE_ATTRIBUTE_NORMAL;
+  const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
     return false;
   LARGE_INTEGER file_size{};
@@ -234,7 +305,8 @@ bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
   ::close(fd);
   if (mapping == MAP_FAILED)
     return false;
-  (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
+  if (hint == MapHint::kSequential)
+    (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
   data = mapping;
   size = file_size;
   view_base = mapping;
@@ -244,10 +316,20 @@ bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
 }
 
 bool RawMappedFile::OpenRange(const std::filesystem::path& path,
-                              std::uint64_t offset,
-                              std::size_t length) noexcept {
-  if (length == 0)
+                              std::uint64_t offset, std::size_t length,
+                              MapHint hint, std::string* error) noexcept {
+  const auto fail = [&](const char* what) {
+#if defined(_WIN32)
+    if (error != nullptr)
+      *error = FormatWindowsError(what, GetLastError());
+#else
+    if (error != nullptr)
+      *error = FormatErrno(what, errno);
+#endif
     return false;
+  };
+  if (length == 0)
+    return fail("zero length");
 #if defined(_WIN32)
   SYSTEM_INFO info{};
   GetSystemInfo(&info);
@@ -259,37 +341,42 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
   const std::uint64_t base = offset - (offset % granularity);
   const std::uint64_t span = offset - base + length;
   if (span > (std::numeric_limits<std::size_t>::max)())
-    return false;
+    return fail("range overflow");
 #if defined(_WIN32)
-  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
+  const DWORD attributes = hint == MapHint::kSequential
+                               ? FILE_FLAG_SEQUENTIAL_SCAN
+                               : FILE_ATTRIBUTE_NORMAL;
+  const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
-    return false;
+    return fail("cannot open");
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
     CloseHandle(file);
-    return false;
+    return fail("cannot create mapping");
   }
   void* view =
       MapViewOfFile(section, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
                     static_cast<DWORD>(base), static_cast<std::size_t>(span));
   if (view == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(section);
     CloseHandle(file);
-    return false;
+    return fail("cannot map");
   }
   this->file = file;
   this->section = section;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return false;
+    return fail("cannot open");
   void* view = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ,
                       MAP_PRIVATE, fd, static_cast<off_t>(base));
   ::close(fd);
   if (view == MAP_FAILED)
-    return false;
-  (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
+    return fail("cannot mmap");
+  if (hint == MapHint::kSequential)
+    (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
 #endif
   data = static_cast<std::uint8_t*>(view) + (offset - base);
   size = length;
@@ -318,11 +405,18 @@ void RawMappedFile::Close() noexcept {
   view_size = 0;
 }
 
-PlatformFile OpenReadFile(const std::filesystem::path& path) noexcept {
+PlatformFile OpenReadFile(const std::filesystem::path& path,
+                          std::string* error) noexcept {
 #if defined(_WIN32)
-  return OpenForRead(path, FILE_ATTRIBUTE_NORMAL);
+  const HANDLE file = OpenForRead(path, FILE_ATTRIBUTE_NORMAL);
+  if (file == INVALID_HANDLE_VALUE && error != nullptr)
+    *error = FormatWindowsError("CreateFileW", GetLastError());
+  return file;
 #else
-  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0 && error != nullptr)
+    *error = FormatErrno("cannot open", errno);
+  return fd;
 #endif
 }
 

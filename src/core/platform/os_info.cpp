@@ -2,7 +2,9 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #else
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -34,6 +36,32 @@ std::uint64_t AvailableMemoryBytes() {
   return (pages > 0 && page_size > 0)
              ? static_cast<std::uint64_t>(pages) * page_size
              : 0;
+#endif
+}
+
+int ProcessId() noexcept {
+#if defined(_WIN32)
+  return static_cast<int>(GetCurrentProcessId());
+#else
+  return ::getpid();
+#endif
+}
+
+std::uint64_t ReadPageFaults() noexcept {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  counters.cb = sizeof(counters);
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters,
+                            sizeof(counters)))
+    return 0;
+  return counters.PageFaultCount;
+#elif defined(__APPLE__)
+  return 0;
+#else
+  struct rusage usage{};
+  if (::getrusage(RUSAGE_SELF, &usage) != 0)
+    return 0;
+  return static_cast<std::uint64_t>(usage.ru_majflt);
 #endif
 }
 

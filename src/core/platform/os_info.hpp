@@ -16,6 +16,14 @@ std::size_t PageSizeBytes();
 /// when the OS cannot answer.
 std::uint64_t AvailableMemoryBytes();
 
+/// Id of the running process. Used to make temporary output names
+/// collision-free between concurrent processes.
+int ProcessId() noexcept;
+
+/// Major page faults of this process since it started. Returns 0 when
+/// the platform cannot report the count.
+std::uint64_t ReadPageFaults() noexcept;
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_OS_INFO_HPP_
