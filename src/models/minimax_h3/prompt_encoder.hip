@@ -345,7 +345,8 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       mapping.shard = interval.shard;
       std::string map_error;
       if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
-                                          platform::MapHint::kNone, &map_error)) {
+                                          platform::MapHint::kNone,
+                                          &map_error)) {
         result.error =
             "cannot map H3 text shard " + path.string() + ": " + map_error;
         return result;

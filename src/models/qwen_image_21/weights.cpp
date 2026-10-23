@@ -215,7 +215,8 @@ void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
   auto* mapped = new platform::RawMappedFile();
   std::string open_error;
-  if (!mapped->Open(path, platform::MapHint::kNone) || mapped->size < 8) {
+  if (!mapped->Open(path, platform::MapHint::kNone, &open_error) ||
+      mapped->size < 8) {
     delete mapped;
     throw std::runtime_error(open_error.empty()
                                  ? "invalid safetensors file " + path.string()

@@ -158,9 +158,8 @@ std::string Sha256File(const std::filesystem::path& path) {
     throw std::runtime_error("cannot open file for SHA-256: " + path.string());
   }
   Context context;
-  // 64 KiB keeps this off the 1 MiB default stack on Windows; throughput is
-  // unchanged for the manifests and shard hashes this serves.
-  std::array<unsigned char, 1U << 16U> buffer{};
+  // A heap buffer keeps the 1 MiB working set off the Windows stack.
+  std::vector<unsigned char> buffer(1U << 20);
   while (stream) {
     stream.read(reinterpret_cast<char*>(buffer.data()),
                 static_cast<std::streamsize>(buffer.size()));

@@ -717,9 +717,11 @@ std::optional<PhaseSession> PhaseSession::Load(
       const std::size_t length = static_cast<std::size_t>(length64);
       Mapping mapping;
       mapping.shard = interval.shard;
+      std::string map_error;
       if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
-                                          platform::MapHint::kSequential)) {
-        SetError(error, "cannot map " + path.string());
+                                          platform::MapHint::kSequential,
+                                          &map_error)) {
+        SetError(error, "cannot map " + path.string() + ": " + map_error);
         return std::nullopt;
       }
       mapping.host = mapping.mapping_file.data;

@@ -193,13 +193,12 @@ std::size_t SystemPageSize() noexcept {
 
 bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
                          std::string* error) noexcept {
-  const auto fail = [&](const char* what) {
+  const auto fail = [&](const char* what, std::uint64_t code) {
+    if (error != nullptr)
 #if defined(_WIN32)
-    if (error != nullptr)
-      *error = FormatWindowsError(what, GetLastError());
+      *error = FormatWindowsError(what, static_cast<DWORD>(code));
 #else
-    if (error != nullptr)
-      *error = FormatErrno(what, errno);
+      *error = FormatErrno(what, static_cast<int>(code));
 #endif
     return false;
   };
@@ -209,24 +208,25 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
                                : FILE_ATTRIBUTE_NORMAL;
   const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
-    return fail("cannot open");
+    return fail("cannot open", GetLastError());
   LARGE_INTEGER file_size{};
   if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return fail("cannot stat");
+    return fail("cannot stat", code);
   }
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
     CloseHandle(file);
-    return fail("cannot create mapping");
+    return fail("cannot create mapping", GetLastError());
   }
   void* view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
   if (view == nullptr) {
     const DWORD code = GetLastError();
     CloseHandle(section);
     CloseHandle(file);
-    return fail("cannot map");
+    return fail("cannot map", code);
   }
   data = view;
   size = static_cast<std::size_t>(file_size.QuadPart);
@@ -238,17 +238,21 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return fail("cannot open");
+    return fail("cannot open", errno);
   struct stat status{};
   if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
+    const int code = errno;
     ::close(fd);
-    return fail("cannot stat");
+    return fail("cannot stat", code);
   }
   const auto file_size = static_cast<std::size_t>(status.st_size);
   void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mapping == MAP_FAILED) {
+    const int code = errno;
+    ::close(fd);
+    return fail("cannot mmap", code);
+  }
   ::close(fd);
-  if (mapping == MAP_FAILED)
-    return fail("cannot mmap");
   if (hint == MapHint::kSequential)
     (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
   data = mapping;
@@ -261,18 +265,17 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
 bool RawMappedFile::OpenRange(const std::filesystem::path& path,
                               std::uint64_t offset, std::size_t length,
                               MapHint hint, std::string* error) noexcept {
-  const auto fail = [&](const char* what) {
+  const auto fail = [&](const char* what, std::uint64_t code) {
+    if (error != nullptr)
 #if defined(_WIN32)
-    if (error != nullptr)
-      *error = FormatWindowsError(what, GetLastError());
+      *error = FormatWindowsError(what, static_cast<DWORD>(code));
 #else
-    if (error != nullptr)
-      *error = FormatErrno(what, errno);
+      *error = FormatErrno(what, static_cast<int>(code));
 #endif
     return false;
   };
   if (length == 0)
-    return fail("zero length");
+    return fail("zero length", 0);
 #if defined(_WIN32)
   SYSTEM_INFO info{};
   GetSystemInfo(&info);
@@ -284,19 +287,19 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
   const std::uint64_t base = offset - (offset % granularity);
   const std::uint64_t span = offset - base + length;
   if (span > (std::numeric_limits<std::size_t>::max)())
-    return fail("range overflow");
+    return fail("range overflow", 0);
 #if defined(_WIN32)
   const DWORD attributes = hint == MapHint::kSequential
                                ? FILE_FLAG_SEQUENTIAL_SCAN
                                : FILE_ATTRIBUTE_NORMAL;
   const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
-    return fail("cannot open");
+    return fail("cannot open", GetLastError());
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
     CloseHandle(file);
-    return fail("cannot create mapping");
+    return fail("cannot create mapping", GetLastError());
   }
   void* view =
       MapViewOfFile(section, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
@@ -305,19 +308,22 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
     const DWORD code = GetLastError();
     CloseHandle(section);
     CloseHandle(file);
-    return fail("cannot map");
+    return fail("cannot map", code);
   }
   this->file = file;
   this->section = section;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return fail("cannot open");
+    return fail("cannot open", errno);
   void* view = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ,
                       MAP_PRIVATE, fd, static_cast<off_t>(base));
+  if (view == MAP_FAILED) {
+    const int code = errno;
+    ::close(fd);
+    return fail("cannot mmap", code);
+  }
   ::close(fd);
-  if (view == MAP_FAILED)
-    return fail("cannot mmap");
   if (hint == MapHint::kSequential)
     (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
 #endif

@@ -1,7 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include "src/core/platform/mapped_file.hpp"
-
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
@@ -20,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/mapped_file.hpp"
 #include "src/models/minimax_h3/attention.hip.hpp"
 #include "src/models/minimax_h3/dense.hip.hpp"
 #include "src/models/minimax_h3/dit.hpp"
@@ -271,9 +270,11 @@ bool LoadWeight(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const platform::PlatformFile file = platform::OpenReadFile(path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
   if (!platform::FileValid(file)) {
-    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string());
+    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string() + ": " +
+                        open_error);
     return false;
   }
   std::size_t copied = 0;

@@ -65,19 +65,22 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
 /// asks the memory manager to prefetch the range into the standby list and
 /// then touches pages in parallel so failures surface before registration.
 inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  // Host-only population never runs in a device pass of a .hip translation
+  // unit; the device pass only needs this declaration to parse.
+  static_cast<void>(data);
+  static_cast<void>(bytes);
+  return;
+#else
   if (bytes == 0)
     return;
-#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(_WIN32)
   const std::size_t page_size = [] {
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     return info.dwPageSize != 0 ? static_cast<std::size_t>(info.dwPageSize)
                                 : static_cast<std::size_t>(4096);
   }();
-#elif defined(__HIP_DEVICE_COMPILE__)
-  // Device pass of a .hip translation unit: host-only population never
-  // runs here; the body only needs to parse.
-  const std::size_t page_size = 4096;
 #else
   const long page_size = ::sysconf(_SC_PAGESIZE);
 #endif
@@ -96,12 +99,11 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
   const auto chunks = bytes / kChunkBytes + (bytes % kChunkBytes != 0);
   std::atomic<std::size_t> next{0};
   std::atomic<int> failure{0};
-#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(_WIN32)
   // Windows 8+; returns immediately, prefetching into the standby list.
   WIN32_MEMORY_RANGE_ENTRY entry{reinterpret_cast<void*>(begin), bytes};
   PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 #endif
-#if !defined(__HIP_DEVICE_COMPILE__)
   auto populate = [&] {
     while (failure.load(std::memory_order_relaxed) == 0) {
       const auto index = next.fetch_add(1, std::memory_order_relaxed);
@@ -128,7 +130,6 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
     populate();
     // Join before a caller can register, upload, or unmap any of these pages.
   }
-#endif  // !defined(__HIP_DEVICE_COMPILE__)
   if (const int code = failure.load(); code != 0) {
 #if defined(_WIN32)
     throw std::system_error(code, std::system_category(),
@@ -138,6 +139,7 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
                             "cannot read mapped weights");
 #endif
   }
+#endif  // !__HIP_DEVICE_COMPILE__
 }
 
 }  // namespace gufo::platform

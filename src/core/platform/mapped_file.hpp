@@ -76,6 +76,8 @@ struct RawMappedFile {
   bool Open(const std::filesystem::path& path, MapHint hint = MapHint::kNone,
             std::string* error = nullptr) noexcept;
   /// at the requested offset, which need not be page-aligned. Zero `length`
+  /// Maps the byte range [offset, offset + length) of `path`. `data` points
+  /// at the requested offset, which need not be page-aligned. Zero `length`
   /// fails; on failure the object is left untouched.
   bool OpenRange(const std::filesystem::path& path, std::uint64_t offset,
                  std::size_t length, MapHint hint = MapHint::kNone,

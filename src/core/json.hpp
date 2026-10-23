@@ -45,9 +45,10 @@ public:
   Value(long long v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(unsigned long long v)
       : type_(Type::kNumber), num_(static_cast<double>(v)) {}
-  // Integral constructor for widths not covered by the overloads above
-  // (size_t on LP64). Constrained so it never duplicates them on platforms
-  // where the widths coincide (size_t == unsigned long long on Windows).
+  // Integral constructor for the widths the explicit overloads above do not
+  // cover (size_t, plus narrower types such as char and short, which
+  // previously converted through int). The constraints keep it from
+  // duplicating those overloads on platforms where the widths coincide.
   template<
       typename T,
       typename = std::enable_if_t<
