@@ -1,12 +1,5 @@
 #include "src/models/qwen3_tts/loader.hpp"
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -52,7 +45,7 @@ public:
 
   /// Maps the file read-only. Returns false on failure.
   bool Open(const std::string& path) {
-    if (!mapped_.Open(path.c_str()))
+    if (!mapped_.Open(path, platform::MapHint::kNone))
       return false;
     base_ = mapped_.data;
     size_ = mapped_.size;

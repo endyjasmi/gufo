@@ -2,14 +2,6 @@
 
 #include "src/core/platform/mapped_file.hpp"
 
-#if defined(_WIN32)
-#include <windows.h>
-#include <io.h>
-#endif
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 

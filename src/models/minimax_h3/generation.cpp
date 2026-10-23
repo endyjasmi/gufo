@@ -1,25 +1,5 @@
 #include "src/models/minimax_h3/generation.hpp"
 
-#if defined(_WIN32)
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
-
-namespace gufo::minimax_h3 {
-
-/// The host process id, used only to make temporary output names
-/// collision-free between concurrent processes.
-int HostProcessId() noexcept {
-#if defined(_WIN32)
-  return _getpid();
-#else
-  return getpid();
-#endif
-}
-
-}  // namespace gufo::minimax_h3
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -31,6 +11,7 @@ int HostProcessId() noexcept {
 #include <system_error>
 #include <utility>
 
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
@@ -155,8 +136,8 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(HostProcessId()) + "-" +
-                                        std::to_string(NextOutputNonce());
+                                        std::to_string(platform::ProcessId()) +
+                                        "-" + std::to_string(NextOutputNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);
     output.write(contents.data(),
@@ -216,7 +197,7 @@ bool WriteFramesAtomic(const std::filesystem::path& directory,
   }
   const std::filesystem::path partial =
       parent / (directory.filename().string() + ".gufo-partial-" +
-                std::to_string(HostProcessId()) + "-" +
+                std::to_string(platform::ProcessId()) + "-" +
                 std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
@@ -312,7 +293,7 @@ bool WriteLatentsAtomic(const std::filesystem::path& directory,
   }
   const std::filesystem::path partial =
       parent / (directory.filename().string() + ".gufo-partial-" +
-                std::to_string(HostProcessId()) + "-" +
+                std::to_string(platform::ProcessId()) + "-" +
                 std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();

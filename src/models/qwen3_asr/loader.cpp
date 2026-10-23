@@ -1,12 +1,5 @@
 #include "src/models/qwen3_asr/loader.hpp"
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +28,7 @@ public:
   MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] bool Open(const std::filesystem::path& path) {
-    if (!mapped_.Open(path.string().c_str()))
+    if (!mapped_.Open(path, platform::MapHint::kSequential))
       return false;
     data_ = mapped_.data;
     size_ = mapped_.size;

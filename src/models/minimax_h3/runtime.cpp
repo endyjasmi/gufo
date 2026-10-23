@@ -1,12 +1,5 @@
 #include "src/models/minimax_h3/runtime.hpp"
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -39,14 +32,6 @@ void SetError(std::string* error, std::string message) {
     *error = std::move(message);
   }
 }
-
-#if !defined(_WIN32)
-std::string ErrnoMessage(std::string_view operation,
-                         const std::filesystem::path& path) {
-  return std::string(operation) + " " + path.string() + ": " +
-         std::strerror(errno);
-}
-#endif
 
 const json::Value& RequireField(const json::Value& object,
                                 std::string_view key) {
@@ -153,10 +138,13 @@ struct ParsedHeader {
 
 ParsedHeader ParseSafetensorsHeader(const std::filesystem::path& path,
                                     InspectionTelemetry* telemetry) {
+  std::string open_error;
   const platform::PlatformFile descriptor =
-      platform::OpenReadFile(path.string());
+          platform::OpenReadFile(path, &open_error);
   if (!platform::FileValid(descriptor)) {
-    throw json::Error("cannot open " + path.string());
+    throw json::Error(open_error.empty()
+                          ? "cannot open " + path.string()
+                          : open_error);
   }
   const auto file_size = platform::FileSizeBytes(descriptor);
   if (!file_size.has_value() || *file_size < 8) {
@@ -730,8 +718,8 @@ std::optional<PhaseSession> PhaseSession::Load(
       const std::size_t length = static_cast<std::size_t>(length64);
       Mapping mapping;
       mapping.shard = interval.shard;
-      if (!mapping.mapping_file.OpenRange(path.string().c_str(), interval.begin,
-                                          length)) {
+      if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
+                                          platform::MapHint::kSequential)) {
         SetError(error, "cannot map " + path.string());
         return std::nullopt;
       }

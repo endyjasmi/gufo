@@ -1,15 +1,9 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#if defined(_WIN32)
-#include <windows.h>
-#endif
-#if !defined(_WIN32)
-#include <sys/resource.h>
-#include <unistd.h>
-#endif
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/os_info.hpp"
 #include <rocblas/rocblas.h>
 
 #include <algorithm>
@@ -100,23 +94,8 @@ bool ValidateTarget(int* device, std::string* error) {
   return true;
 }
 
-struct Faults {
-  std::uint64_t minor{0};
-  std::uint64_t major{0};
-};
-
-Faults ReadFaults() {
-#if defined(_WIN32)
-  return {};  // No per-process fault counters on Windows.
-#else
-  struct rusage usage{};
-  if (getrusage(RUSAGE_SELF, &usage) != 0) {
-    return {};
-  }
-  return {static_cast<std::uint64_t>(usage.ru_minflt),
-          static_cast<std::uint64_t>(usage.ru_majflt)};
-#endif
-}
+using Faults = platform::PageFaults;
+Faults ReadFaults() { return platform::ReadPageFaults(); }
 
 std::uint64_t ReadSwapBytes() {
   std::ifstream status("/proc/self/status");
