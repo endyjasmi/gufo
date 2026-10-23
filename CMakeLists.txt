@@ -879,6 +879,12 @@ if (BUILD_TESTING)
   add_test(NAME platform_prefault_test COMMAND platform_prefault_test)
   set_tests_properties(platform_prefault_test PROPERTIES LABELS "cpu;platform")
 
+  add_executable(platform_mapped_file_test
+    tests/core/platform_mapped_file_test.cpp src/core/platform/mapped_file.cpp)
+  add_test(NAME platform_mapped_file_test COMMAND platform_mapped_file_test)
+  set_tests_properties(platform_mapped_file_test PROPERTIES
+    LABELS "cpu;platform")
+
   add_executable(hipblaslt_plan_cache_test
     tests/core/hipblaslt_plan_cache_test.cpp)
   target_link_libraries(hipblaslt_plan_cache_test PRIVATE gufo_core)
