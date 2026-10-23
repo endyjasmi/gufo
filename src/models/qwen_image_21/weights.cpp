@@ -219,7 +219,8 @@ void Weights::Load(const std::filesystem::path& path,
     delete mapped;
     throw std::runtime_error(open_error.empty()
                                  ? "invalid safetensors file " + path.string()
-                                 : "cannot open " + path.string() + ": " + open_error);
+                                 : "cannot open " + path.string() + ": " +
+                                       open_error);
   }
   const auto size = mapped->size;
   void* data = mapped->data;

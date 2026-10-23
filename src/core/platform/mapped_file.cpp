@@ -258,63 +258,6 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
   return true;
 #endif
 }
-bool RawMappedFile::Open(const std::filesystem::path& path,
-                         MapHint hint) noexcept {
-#if defined(_WIN32)
-  const DWORD attributes = hint == MapHint::kSequential
-                               ? FILE_FLAG_SEQUENTIAL_SCAN
-                               : FILE_ATTRIBUTE_NORMAL;
-  const HANDLE file = OpenForRead(path, attributes);
-  if (file == INVALID_HANDLE_VALUE)
-    return false;
-  LARGE_INTEGER file_size{};
-  if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
-    CloseHandle(file);
-    return false;
-  }
-  const HANDLE section =
-      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-  if (section == nullptr) {
-    CloseHandle(file);
-    return false;
-  }
-  void* view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
-  if (view == nullptr) {
-    CloseHandle(section);
-    CloseHandle(file);
-    return false;
-  }
-  data = view;
-  size = static_cast<std::size_t>(file_size.QuadPart);
-  view_base = view;
-  view_size = size;
-  this->file = file;
-  this->section = section;
-  return true;
-#else
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return false;
-  struct stat status{};
-  if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
-    ::close(fd);
-    return false;
-  }
-  const auto file_size = static_cast<std::size_t>(status.st_size);
-  void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  ::close(fd);
-  if (mapping == MAP_FAILED)
-    return false;
-  if (hint == MapHint::kSequential)
-    (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
-  data = mapping;
-  size = file_size;
-  view_base = mapping;
-  view_size = file_size;
-  return true;
-#endif
-}
-
 bool RawMappedFile::OpenRange(const std::filesystem::path& path,
                               std::uint64_t offset, std::size_t length,
                               MapHint hint, std::string* error) noexcept {

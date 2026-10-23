@@ -140,11 +140,10 @@ ParsedHeader ParseSafetensorsHeader(const std::filesystem::path& path,
                                     InspectionTelemetry* telemetry) {
   std::string open_error;
   const platform::PlatformFile descriptor =
-          platform::OpenReadFile(path, &open_error);
+      platform::OpenReadFile(path, &open_error);
   if (!platform::FileValid(descriptor)) {
-    throw json::Error(open_error.empty()
-                          ? "cannot open " + path.string()
-                          : open_error);
+    throw json::Error(open_error.empty() ? "cannot open " + path.string()
+                                         : open_error);
   }
   const auto file_size = platform::FileSizeBytes(descriptor);
   if (!file_size.has_value() || *file_size < 8) {
