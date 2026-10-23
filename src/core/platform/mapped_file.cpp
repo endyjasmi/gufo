@@ -194,12 +194,16 @@ std::size_t SystemPageSize() noexcept {
 bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
                          std::string* error) noexcept {
   const auto fail = [&](const char* what, std::uint64_t code) {
-    if (error != nullptr)
+    if (error != nullptr) {
+      if (code == 0)
+        *error = what;
+      else
 #if defined(_WIN32)
-      *error = FormatWindowsError(what, static_cast<DWORD>(code));
+        *error = FormatWindowsError(what, static_cast<DWORD>(code));
 #else
-      *error = FormatErrno(what, static_cast<int>(code));
+        *error = FormatErrno(what, static_cast<int>(code));
 #endif
+    }
     return false;
   };
 #if defined(_WIN32)
@@ -210,16 +214,21 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
   if (file == INVALID_HANDLE_VALUE)
     return fail("cannot open", GetLastError());
   LARGE_INTEGER file_size{};
-  if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
+  if (!GetFileSizeEx(file, &file_size)) {
     const DWORD code = GetLastError();
     CloseHandle(file);
     return fail("cannot stat", code);
   }
+  if (file_size.QuadPart <= 0) {
+    CloseHandle(file);
+    return fail("file is empty", 0);
+  }
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return fail("cannot create mapping", GetLastError());
+    return fail("cannot create mapping", code);
   }
   void* view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
   if (view == nullptr) {
@@ -240,10 +249,14 @@ bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
   if (fd < 0)
     return fail("cannot open", errno);
   struct stat status{};
-  if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
+  if (::fstat(fd, &status) != 0) {
     const int code = errno;
     ::close(fd);
     return fail("cannot stat", code);
+  }
+  if (status.st_size <= 0) {
+    ::close(fd);
+    return fail("file is empty", 0);
   }
   const auto file_size = static_cast<std::size_t>(status.st_size);
   void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -266,12 +279,16 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
                               std::uint64_t offset, std::size_t length,
                               MapHint hint, std::string* error) noexcept {
   const auto fail = [&](const char* what, std::uint64_t code) {
-    if (error != nullptr)
+    if (error != nullptr) {
+      if (code == 0)
+        *error = what;
+      else
 #if defined(_WIN32)
-      *error = FormatWindowsError(what, static_cast<DWORD>(code));
+        *error = FormatWindowsError(what, static_cast<DWORD>(code));
 #else
-      *error = FormatErrno(what, static_cast<int>(code));
+        *error = FormatErrno(what, static_cast<int>(code));
 #endif
+    }
     return false;
   };
   if (length == 0)
@@ -298,8 +315,9 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return fail("cannot create mapping", GetLastError());
+    return fail("cannot create mapping", code);
   }
   void* view =
       MapViewOfFile(section, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
