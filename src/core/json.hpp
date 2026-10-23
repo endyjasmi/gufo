@@ -45,7 +45,10 @@ public:
   Value(long long v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(unsigned long long v)
       : type_(Type::kNumber), num_(static_cast<double>(v)) {}
+#ifndef _WIN32
+  // On Windows size_t is unsigned long long and the overload above covers it.
   Value(std::size_t v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
+#endif
   Value(const char* v) : type_(Type::kString), str_(v) {}
   Value(const std::string& v) : type_(Type::kString), str_(v) {}
   Value(std::string&& v) : type_(Type::kString), str_(std::move(v)) {}
