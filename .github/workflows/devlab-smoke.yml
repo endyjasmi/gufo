@@ -625,19 +625,36 @@ jobs:
           restore-keys: |
             gufo-vcpkg-v1-${{ runner.os }}-
 
+      # The 2.4 GiB SDK archive is cached too: the next runs skip the download.
+      - name: Restore TheRock SDK archive
+        id: therock-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/therock-archive
+          key: gufo-therock-v1-therock-dist-windows-gfx1151-7.14.0a20260612
+
       - name: Provision the TheRock SDK and vcpkg
+        id: provision
         env:
           THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
         run: |
           set -euo pipefail
           toolchain="$RUNNER_TEMP/gufo-toolchain"
+          archive="$RUNNER_TEMP/therock-archive/$THEROCK_TARBALL"
           rm -rf -- "$toolchain"
-          mkdir -p "$toolchain/therock" "$RUNNER_TEMP/vcpkg-archives"
-          curl -fL --retry 3 --retry-delay 10 -o "$toolchain/therock.tar.gz" \
-            "https://therock-nightly-tarball.s3.amazonaws.com/$THEROCK_TARBALL"
+          mkdir -p "$toolchain/therock" "$RUNNER_TEMP/vcpkg-archives" "$RUNNER_TEMP/therock-archive"
+          if [[ ! -f "$archive" ]]; then
+            # The CloudFront mirror of the nightly bucket: the raw S3 endpoint
+            # crawls at tens of KB/s from this runner. Stalls below 1 MB/s for
+            # two minutes fail the job instead of running into the timeout.
+            curl -fL --retry 3 --retry-delay 10 --speed-limit 1048576 --speed-time 120 \
+              --no-progress-meter -o "$archive.part" \
+              "https://rocm.nightlies.amd.com/tarball/$THEROCK_TARBALL"
+            mv -- "$archive.part" "$archive"
+          fi
+          echo "archive=ready" >> "$GITHUB_OUTPUT"
           # --force-local: GNU tar would read "C:..." as a remote host.
-          tar --force-local -xzf "$toolchain/therock.tar.gz" -C "$toolchain/therock"
-          rm -f -- "$toolchain/therock.tar.gz"
+          tar --force-local -xzf "$archive" -C "$toolchain/therock"
           baseline=$(python -c 'import json; print(json.load(open("candidate/vcpkg.json"))["builtin-baseline"])')
           git clone --quiet https://github.com/microsoft/vcpkg.git "$toolchain/vcpkg"
           git -C "$toolchain/vcpkg" checkout --quiet --detach "$baseline"
@@ -716,6 +733,13 @@ jobs:
           tr '\r' '\n' < "$RUNNER_TEMP/gufo-weights.log" | grep -v '^\s*$' | tail -n 60
           [[ "$weights" == 0 ]] || echo "::error::Selected-model downloads failed ($weights)."
           [[ "$build" == 0 && "$weights" == 0 ]]
+
+      - name: Save TheRock SDK archive
+        if: always() && steps.therock-cache.outputs.cache-hit != 'true' && steps.provision.outputs.archive == 'ready'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/therock-archive
+          key: gufo-therock-v1-therock-dist-windows-gfx1151-7.14.0a20260612
 
       # Saved even when the build fails, so the next run skips the packages
       # that did build.
