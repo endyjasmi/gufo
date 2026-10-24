@@ -574,9 +574,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vcpkg-archives
-          key: gufo-vcpkg-v1-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          key: gufo-vcpkg-v2-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
           restore-keys: |
-            gufo-vcpkg-v1-${{ runner.os }}-
+            gufo-vcpkg-v2-${{ runner.os }}-
 
       - name: Restore TheRock SDK archive
         id: therock-cache
@@ -619,7 +619,7 @@ jobs:
             wait "$download"
             elapsed=$((SECONDS - started))
             awk -v t="$total" -v e="$elapsed" 'BEGIN {
-              printf "TheRock: %.0f MiB in %d s (%.2f MB/s)\n", t / 1048576, e, e > 0 ? t / e / 1e6 : 0
+              printf "TheRock: %.0f MiB in %d s (%.2f MB/s)\n", t / 1048576, e, (e > 0 ? t / e / 1e6 : 0)
             }' | tee -a "$GITHUB_STEP_SUMMARY"
             mv -- "$archive.part" "$archive"
           fi
@@ -691,12 +691,14 @@ jobs:
 
       # Saved even when the build fails, so the next run skips the packages
       # that did build.
+      # Only once the build ran: an earlier failure would save an empty cache
+      # under the manifest's key and block later saves.
       - name: Save vcpkg binary cache
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.build.outcome != 'skipped'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vcpkg-archives
-          key: gufo-vcpkg-v1-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          key: gufo-vcpkg-v2-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
 
   windows:
     name: Selected model checks on Windows Strix Halo
@@ -801,7 +803,7 @@ jobs:
             sleep 60
             size=$(du -sb "$GUFO_CACHE_ROOT" 2>/dev/null | cut -f1)
             awk -v s="${size:-0}" -v e=$((SECONDS - started)) 'BEGIN {
-              printf "Weights: %.2f GiB so far, %.2f MB/s\n", s / 1073741824, e > 0 ? s / e / 1e6 : 0
+              printf "Weights: %.2f GiB so far, %.2f MB/s\n", s / 1073741824, (e > 0 ? s / e / 1e6 : 0)
             }'
           done
           wait "$download"
