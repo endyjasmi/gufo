@@ -212,16 +212,16 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_diagnostics STATIC
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/core/diagnostics/gpu_queues.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/core/diagnostics/linux_sysfs.cpp>"
+  src/core/diagnostics/gpu_queues.cpp
+  src/core/diagnostics/linux_sysfs.cpp
   src/core/diagnostics/system_inventory.cpp
   src/core/diagnostics/compatibility.cpp
   src/core/diagnostics/fingerprint.cpp
   src/core/diagnostics/artifact_validator.cpp
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/core/diagnostics/allocation_benchmark.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/core/diagnostics/bandwidth.cpp>"
+  src/core/diagnostics/allocation_benchmark.cpp
+  src/core/diagnostics/bandwidth.cpp
   src/core/hip/bandwidth.cpp
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/core/diagnostics/report.cpp>"
+  src/core/diagnostics/report.cpp
   src/cli/diagnose/diagnose.cpp
 )
 target_include_directories(gufo_diagnostics PUBLIC ${CMAKE_SOURCE_DIR})
@@ -861,7 +861,7 @@ if (BUILD_TESTING)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
   endif()
 
-  # links the Linux-only diagnostics reports
+  # Not yet validated on Windows; the library itself builds there.
   if (NOT WIN32)
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
@@ -871,7 +871,7 @@ if (BUILD_TESTING)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
   endif()
 
-  # links the Linux-only diagnostics reports
+  # Not yet validated on Windows; the library itself builds there.
   if (NOT WIN32)
   add_executable(allocation_benchmark_test
     tests/diagnostics/allocation_benchmark_test.cpp)

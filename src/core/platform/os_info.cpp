@@ -10,6 +10,7 @@
 // clang-format on
 #else
 #include <sys/resource.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #endif
 
@@ -49,6 +50,41 @@ int ProcessId() noexcept {
   return static_cast<int>(GetCurrentProcessId());
 #else
   return ::getpid();
+#endif
+}
+
+std::optional<HostIdentity> QueryHostIdentity() {
+#if defined(_WIN32)
+  // RtlGetVersion reports the real NT version; GetVersionEx is capped by the
+  // application manifest.
+  using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  const auto get_version = ntdll == nullptr
+                               ? nullptr
+                               : reinterpret_cast<RtlGetVersionFn>(
+                                     GetProcAddress(ntdll, "RtlGetVersion"));
+  OSVERSIONINFOW version{};
+  version.dwOSVersionInfoSize = sizeof(version);
+  if (get_version == nullptr || get_version(&version) != 0)
+    return std::nullopt;
+  HostIdentity identity;
+  identity.sysname = "Windows";
+  char name[MAX_COMPUTERNAME_LENGTH + 1]{};
+  DWORD length = sizeof(name);
+  if (GetComputerNameA(name, &length))
+    identity.nodename.assign(name, length);
+  identity.release = std::to_string(version.dwMajorVersion) + "." +
+                     std::to_string(version.dwMinorVersion) + "." +
+                     std::to_string(version.dwBuildNumber);
+  identity.version = "build " + std::to_string(version.dwBuildNumber);
+  identity.machine = "x86_64";
+  return identity;
+#else
+  struct utsname uts{};
+  if (::uname(&uts) != 0)
+    return std::nullopt;
+  return HostIdentity{uts.sysname, uts.nodename, uts.release, uts.version,
+                      uts.machine};
 #endif
 }
 
