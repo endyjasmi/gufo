@@ -1,4 +1,5 @@
 #include "src/core/diagnostics/allocation_benchmark.h"
+#include "src/core/platform/os_info.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -20,7 +21,7 @@ std::string CurrentIso8601Utc() {
   const auto now = std::chrono::system_clock::now();
   const auto time = std::chrono::system_clock::to_time_t(now);
   std::tm utc{};
-  gmtime_r(&time, &utc);
+  gufo::platform::UtcTime(&time, &utc);
   std::ostringstream output;
   output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
   return output.str();

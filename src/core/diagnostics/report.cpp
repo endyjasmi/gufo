@@ -1,4 +1,5 @@
 #include "src/core/diagnostics/report.h"
+#include "src/core/platform/os_info.hpp"
 
 #include <chrono>
 #include <ctime>
@@ -13,7 +14,7 @@ std::string CurrentIso8601Utc() {
   const auto now = std::chrono::system_clock::now();
   const auto time_t_now = std::chrono::system_clock::to_time_t(now);
   std::tm tm_utc{};
-  gmtime_r(&time_t_now, &tm_utc);
+  gufo::platform::UtcTime(&time_t_now, &tm_utc);
 
   std::ostringstream oss;
   oss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
