@@ -186,6 +186,10 @@ PlatformFile OpenAt(const Directory& dir, std::string_view name, FileMode mode,
       access = GENERIC_READ | GENERIC_WRITE;
       disposition = OPEN_ALWAYS;
       break;
+    case FileMode::kAppend:
+      access = FILE_APPEND_DATA;
+      disposition = OPEN_ALWAYS;
+      break;
   }
   HANDLE file = CreateFileW(path.c_str(), access, kDirectoryShare, nullptr,
                             disposition, flags, nullptr);
@@ -463,6 +467,30 @@ std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
 
 bool OwnerOnly(const FileInfo&, std::uint32_t) noexcept {
   // No owner model until ACL checks exist.
+  return true;
+}
+
+std::uint64_t SeekToEnd(PlatformFile file, std::error_code& ec) noexcept {
+  ec.clear();
+  LARGE_INTEGER distance{};
+  LARGE_INTEGER end{};
+  if (!SetFilePointerEx(file, distance, &end, FILE_END)) {
+    ec = LastError();
+    return 0;
+  }
+  return static_cast<std::uint64_t>(end.QuadPart);
+}
+
+bool Truncate(PlatformFile file, std::uint64_t bytes,
+              std::error_code& ec) noexcept {
+  ec.clear();
+  LARGE_INTEGER distance{};
+  distance.QuadPart = static_cast<LONGLONG>(bytes);
+  if (!SetFilePointerEx(file, distance, nullptr, FILE_BEGIN) ||
+      !SetEndOfFile(file)) {
+    ec = LastError();
+    return false;
+  }
   return true;
 }
 

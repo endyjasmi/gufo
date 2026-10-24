@@ -1,9 +1,12 @@
 #include "src/core/platform/os_info.hpp"
 
 #if defined(_WIN32)
-// clang-format off: psapi.h needs the windows.h types above it.
+// clang-format off: psapi.h needs the windows.h types above it, and the
+// console and CRT isatty calls need the io and stdio headers.
 #include <windows.h>
 #include <psapi.h>
+#include <io.h>
+#include <stdio.h>
 // clang-format on
 #else
 #include <sys/resource.h>
@@ -46,6 +49,30 @@ int ProcessId() noexcept {
   return static_cast<int>(GetCurrentProcessId());
 #else
   return ::getpid();
+#endif
+}
+
+bool LocalTime(std::time_t seconds, std::tm* out) noexcept {
+#if defined(_WIN32)
+  return ::localtime_s(out, &seconds) == 0;
+#else
+  return ::localtime_r(&seconds, out) != nullptr;
+#endif
+}
+
+bool UtcTime(std::time_t seconds, std::tm* out) noexcept {
+#if defined(_WIN32)
+  return ::gmtime_s(out, &seconds) == 0;
+#else
+  return ::gmtime_r(&seconds, out) != nullptr;
+#endif
+}
+
+bool StderrIsTerminal() noexcept {
+#if defined(_WIN32)
+  return ::_isatty(::_fileno(stderr)) != 0;
+#else
+  return ::isatty(STDERR_FILENO) != 0;
 #endif
 }
 

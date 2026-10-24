@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 
 namespace gufo::platform {
 
@@ -19,6 +20,18 @@ std::uint64_t AvailableMemoryBytes();
 /// Id of the running process. Used to make temporary output names
 /// collision-free between concurrent processes.
 int ProcessId() noexcept;
+
+/// Fills `out` with the process's local calendar time for `seconds`.
+/// Returns false when the platform cannot convert the time.
+bool LocalTime(std::time_t seconds, std::tm* out) noexcept;
+
+/// Fills `out` with the UTC calendar time for `seconds`. Returns false when
+/// the platform cannot convert the time.
+bool UtcTime(std::time_t seconds, std::tm* out) noexcept;
+
+/// Whether standard error is attached to a terminal. Log and trace sinks
+/// use it to decide between plain and colored output.
+bool StderrIsTerminal() noexcept;
 
 /// Minor and major page faults of this process since it started.
 struct PageFaults {

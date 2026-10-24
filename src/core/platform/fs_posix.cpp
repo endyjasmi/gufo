@@ -50,6 +50,8 @@ int OpenFlags(FileMode mode) noexcept {
       return O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW;
     case FileMode::kOpenOrCreate:
       return O_RDWR | O_CREAT | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW;
+    case FileMode::kAppend:
+      return O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW;
   }
   return 0;
 }
@@ -377,6 +379,26 @@ std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
 
 bool OwnerOnly(const FileInfo& info, std::uint32_t forbidden) noexcept {
   return info.user_id == ::geteuid() && (info.permissions & forbidden) == 0;
+}
+
+std::uint64_t SeekToEnd(PlatformFile file, std::error_code& ec) noexcept {
+  ec.clear();
+  const off_t end = ::lseek(file, 0, SEEK_END);
+  if (end < 0) {
+    ec = Errno();
+    return 0;
+  }
+  return static_cast<std::uint64_t>(end);
+}
+
+bool Truncate(PlatformFile file, std::uint64_t bytes,
+              std::error_code& ec) noexcept {
+  ec.clear();
+  if (::ftruncate(file, static_cast<off_t>(bytes)) != 0) {
+    ec = Errno();
+    return false;
+  }
+  return true;
 }
 
 bool RestrictToOwner(const std::filesystem::path& path) noexcept {

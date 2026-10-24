@@ -48,6 +48,7 @@ enum class FileMode {
   kRead,          ///< O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
   kCreateNew,     ///< O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
   kOpenOrCreate,  ///< O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+  kAppend,        ///< O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC
 };
 
 /// Move-only handle to an open directory. POSIX holds a directory file
@@ -204,6 +205,15 @@ std::size_t Read(PlatformFile file, void* output, std::size_t bytes,
 /// file position; nothing may mix Read and ReadAt on one handle.
 std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
                    std::size_t bytes, std::error_code& ec) noexcept;
+
+/// Moves the read/write position to the end of the file. Returns the file
+/// size in bytes, or 0 with `ec` set on failure.
+std::uint64_t SeekToEnd(PlatformFile file, std::error_code& ec) noexcept;
+
+/// Sets the file size to `bytes`, shrinking or growing like ftruncate(2).
+/// Returns false and sets `ec` on failure.
+bool Truncate(PlatformFile file, std::uint64_t bytes,
+              std::error_code& ec) noexcept;
 
 /// Owner-consistency policy for files written by this user. POSIX requires
 /// the file to belong to the current user and to carry none of the
