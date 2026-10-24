@@ -1,6 +1,6 @@
 #include "src/core/platform/net.hpp"
 
-#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -35,7 +35,7 @@ void CloseSocket(Socket socket) noexcept {
 #endif
 }
 
-Socket CreateStreamSocket(int address_family) {
+Socket CreateStreamSocket(int address_family) noexcept {
   return ::socket(address_family, SOCK_STREAM, 0);
 }
 
@@ -50,10 +50,9 @@ int PollSocket(void* descriptors, std::uint32_t count, int timeout_ms) {
 std::intptr_t SendNoSignal(Socket socket, const void* data, std::size_t bytes) {
 #if defined(_WIN32)
   // Winsock's send takes an int length; clamp each call so oversized buffers
-  // narrow safely. The send loops handle partial writes. windows.h may define
-  // min and max as macros, so the clamp avoids both names.
-  constexpr auto kMaxChunk = static_cast<std::size_t>(INT32_MAX);
-  const auto chunk = static_cast<int>(bytes < kMaxChunk ? bytes : kMaxChunk);
+  // narrow safely. The send loops handle partial writes.
+  const int chunk = static_cast<int>(std::min<std::size_t>(
+      bytes, static_cast<std::size_t>(std::numeric_limits<int>::max())));
   return ::send(socket, static_cast<const char*>(data), chunk, 0);
 #else
 #ifdef MSG_NOSIGNAL
@@ -76,13 +75,13 @@ bool SetNonBlocking(Socket socket) noexcept {
 #endif
 }
 
-std::intptr_t Receive(Socket socket, void* data, std::size_t bytes, int flags) {
+std::intptr_t Receive(Socket socket, void* data, std::size_t bytes,
+                      int flags) noexcept {
 #if defined(_WIN32)
   // Winsock's recv takes an int length; clamp each call so oversized reads
-  // narrow safely. windows.h may define min and max as macros, so the clamp
-  // avoids both names.
-  constexpr auto kMaxChunk = static_cast<std::size_t>(INT32_MAX);
-  const auto chunk = static_cast<int>(bytes < kMaxChunk ? bytes : kMaxChunk);
+  // narrow safely.
+  const int chunk = static_cast<int>(std::min<std::size_t>(
+      bytes, static_cast<std::size_t>(std::numeric_limits<int>::max())));
   return ::recv(socket, static_cast<char*>(data), chunk, flags);
 #else
   return ::recv(socket, data, bytes, flags);
