@@ -1,8 +1,5 @@
 #include "src/cli/serve/http_server.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -335,9 +332,9 @@ public:
     worker.join();
   }
 
-  int Connect(const std::string& peer = "127.0.0.1") {
+  net::Socket Connect(const std::string& peer = "127.0.0.1") {
     sockaddr_storage address{};
-    socklen_t length = 0;
+    net::SocklenT length = 0;
     auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
     auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
     if (::inet_pton(AF_INET, peer.c_str(), &ipv4->sin_addr) == 1) {
@@ -350,8 +347,8 @@ public:
       ipv6->sin6_port = htons(server.port());
       length = sizeof(*ipv6);
     }
-    const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
-    assert(fd >= 0);
+    const net::Socket fd = net::CreateStreamSocket(address.ss_family);
+    assert(fd != net::kInvalidSocket);
     assert(net::SetSocketTimeouts(fd, 3'000));
     assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) ==
            0);
@@ -359,7 +356,7 @@ public:
   }
   std::string Send(std::string_view request, bool half_close = false,
                    const std::string& peer = "127.0.0.1") {
-    const int fd = Connect(peer);
+    const net::Socket fd = Connect(peer);
     while (!request.empty()) {
       const auto count = net::SendNoSignal(fd, request.data(), request.size());
       assert(count > 0);
@@ -368,11 +365,11 @@ public:
     // A half-close allows malformed/truncated-body tests to complete without
     // timing-dependent sleeps.
     if (half_close)
-      ::shutdown(fd, SHUT_WR);
+      net::ShutdownSocket(fd, net::ShutdownHow::kWrite);
     std::string response;
     char buffer[4096];
     for (;;) {
-      const auto count = ::read(fd, buffer, sizeof(buffer));
+      const auto count = net::Receive(fd, buffer, sizeof(buffer));
       assert(count >= 0);
       if (count == 0) {
         break;
@@ -776,17 +773,18 @@ void TestExpectContinue() {
   RunningServer server({.max_request_body_bytes = 8192});
   for (const std::string expect :
        {"Expect: 100-continue", "expect: 100-Continue"}) {
-    const int fd = server.Connect();
+    const net::Socket fd = server.Connect();
     const std::string head =
         "POST /echo HTTP/1.1\r\n" + expect + "\r\nContent-Length: 5\r\n\r\n";
     assert(net::SendNoSignal(fd, head.data(), head.size()) ==
-           static_cast<ssize_t>(head.size()));
+           static_cast<std::intptr_t>(head.size()));
     // The interim response arrives before any body byte is sent.
     const std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
     std::string response;
     char buffer[4096];
     while (response.size() < interim.size()) {
-      const auto count = ::read(fd, buffer, interim.size() - response.size());
+      const auto count =
+          net::Receive(fd, buffer, interim.size() - response.size());
       assert(count > 0);
       response.append(buffer, static_cast<std::size_t>(count));
     }
@@ -794,7 +792,7 @@ void TestExpectContinue() {
     assert(net::SendNoSignal(fd, "hello", 5) == 5);
     response.clear();
     for (;;) {
-      const auto count = ::read(fd, buffer, sizeof(buffer));
+      const auto count = net::Receive(fd, buffer, sizeof(buffer));
       assert(count >= 0);
       if (count == 0)
         break;
@@ -2445,18 +2443,19 @@ void TestDeviceLossWhileWriterBlocked() {
   });
   const int fd = server.Connect();
   const int receive_buffer = 1024;
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                      reinterpret_cast<const char*>(&receive_buffer),
                       sizeof(receive_buffer)) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
   assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-         static_cast<ssize_t>(request.size()));
+         static_cast<std::intptr_t>(request.size()));
   assert(writing.try_acquire_for(std::chrono::seconds(2)));
   // The peer never drains the response. No health request or completed write
   // is available to trigger shutdown; the listener must observe the loss.
   server.backend->lost = true;
   assert(hook_called.try_acquire_for(std::chrono::seconds(2)));
   assert(hook_calls == 1 && !write_finished);
-  ::shutdown(fd, SHUT_RDWR);
+  net::ShutdownSocket(fd, net::ShutdownHow::kReadWrite);
   net::CloseSocket(fd);
 }
 
@@ -2475,8 +2474,8 @@ void TestInvalidBindSettings() {
 
 // Some CI containers have no IPv6 loopback; listener checks skip there.
 bool HasIpv6Loopback() {
-  const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
-  if (fd < 0)
+  const net::Socket fd = net::CreateStreamSocket(AF_INET6);
+  if (fd == net::kInvalidSocket)
     return false;
   sockaddr_in6 address{};
   address.sin6_family = AF_INET6;
@@ -2516,7 +2515,7 @@ void TestListenAddresses() {
 // Binds port 0 to find a free port, then releases it for the code under test.
 int FreePort(const std::string& host = "127.0.0.1") {
   sockaddr_storage address{};
-  socklen_t length = 0;
+  net::SocklenT length = 0;
   auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
   auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
   if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
@@ -2527,8 +2526,8 @@ int FreePort(const std::string& host = "127.0.0.1") {
     ipv6->sin6_family = AF_INET6;
     length = sizeof(*ipv6);
   }
-  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
-  assert(fd >= 0);
+  const net::Socket fd = net::CreateStreamSocket(address.ss_family);
+  assert(fd != net::kInvalidSocket);
   assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
   assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
          0);
@@ -2537,9 +2536,9 @@ int FreePort(const std::string& host = "127.0.0.1") {
                                              : ipv4->sin_port);
 }
 
-int ConnectTo(const std::string& host, int port) {
+net::Socket ConnectTo(const std::string& host, int port) {
   sockaddr_storage address{};
-  socklen_t length = 0;
+  net::SocklenT length = 0;
   auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
   auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
   if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
@@ -2552,12 +2551,12 @@ int ConnectTo(const std::string& host, int port) {
     ipv6->sin6_port = htons(static_cast<std::uint16_t>(port));
     length = sizeof(*ipv6);
   }
-  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
-  assert(fd >= 0);
+  const net::Socket fd = net::CreateStreamSocket(address.ss_family);
+  assert(fd != net::kInvalidSocket);
   assert(net::SetSocketTimeouts(fd, 3'000));
   if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
     net::CloseSocket(fd);
-    return -1;
+    return net::kInvalidSocket;
   }
   return fd;
 }
@@ -2565,18 +2564,18 @@ int ConnectTo(const std::string& host, int port) {
 // Sends each part separately, pausing between them, and reads to EOF.
 std::string SendParts(const std::string& host, int port,
                       const std::vector<std::string>& parts) {
-  const int fd = ConnectTo(host, port);
-  assert(fd >= 0);
+  const net::Socket fd = ConnectTo(host, port);
+  assert(fd != net::kInvalidSocket);
   for (std::size_t index = 0; index < parts.size(); ++index) {
     if (index > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(net::SendNoSignal(fd, parts[index].data(), parts[index].size()) ==
-           static_cast<ssize_t>(parts[index].size()));
+           static_cast<std::intptr_t>(parts[index].size()));
   }
   std::string response;
   char buffer[4096];
   for (;;) {
-    const auto count = ::read(fd, buffer, sizeof(buffer));
+    const auto count = net::Receive(fd, buffer, sizeof(buffer));
     assert(count >= 0);
     if (count == 0)
       break;
@@ -2726,7 +2725,7 @@ void TestPeerDisconnect() {
       "Content-Type: application/json\r\nContent-Length: " +
       std::to_string(body.size()) + "\r\n\r\n" + body;
   assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-         static_cast<ssize_t>(request.size()));
+         static_cast<std::intptr_t>(request.size()));
   assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
   net::CloseSocket(fd);
   assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
@@ -3077,7 +3076,7 @@ void TestSignalShutdown() {
                 "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\n\r\n" + body;
             assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-                   static_cast<ssize_t>(request.size()));
+                   static_cast<std::intptr_t>(request.size()));
             assert(server.backend->entered.try_acquire_for(
                 std::chrono::seconds(2)));
           }
