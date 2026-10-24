@@ -560,7 +560,21 @@ jobs:
             echo "::error::The Windows job requires Windows x86-64."
             exit 1
           }
-          hip_info="${HIP_PATH:-C:/TheRock/build}/bin/hipInfo.exe"
+          # The windows-base preset resolves the toolchain from these two
+          # variables (cmake/toolchains/windows-therock.cmake).
+          missing=()
+          for variable in HIP_PATH VCPKG_ROOT; do
+            if [[ -z "${!variable:-}" || ! -d "${!variable}" ]]; then
+              missing+=("$variable")
+            else
+              printf -- '- %s: %s\n' "$variable" "${!variable}" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          [[ ${#missing[@]} == 0 ]] || {
+            echo "::error::The runner must set ${missing[*]} to existing directories (see BUILD-WINDOWS.md)."
+            exit 1
+          }
+          hip_info="$HIP_PATH/bin/hipInfo.exe"
           if [[ -x "$hip_info" ]]; then
             "$hip_info" | tee "$RUNNER_TEMP/devlab-hipinfo.txt"
             grep -Eq 'gfx1151' "$RUNNER_TEMP/devlab-hipinfo.txt" || {
@@ -666,6 +680,13 @@ jobs:
             ./build/windows-release/gufo.exe diagnose
           ) || build=$?
           weights=0
+          if [[ "$build" != 0 ]]; then
+            # Nothing can use the weights: fail now. The step's process tree,
+            # downloader included, ends with it.
+            kill "$downloads" 2>/dev/null || true
+            echo "::error::The Windows build failed ($build)."
+            exit 1
+          fi
           wait "$downloads" || weights=$?
           tr '\r' '\n' < "$RUNNER_TEMP/gufo-weights.log" | grep -v '^\s*$' | tail -n 60
           [[ "$weights" == 0 ]] || echo "::error::Selected-model downloads failed ($weights)."

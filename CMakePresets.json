@@ -26,15 +26,13 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "VCPKG_MANIFEST_INSTALL": "ON",
-        "CMAKE_C_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_CXX_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_HIP_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_PREFIX_PATH": "C:/TheRock/build"
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/windows-therock.cmake"
       }
     },
-            {
+    {
       "name": "windows-cpu-test",
       "displayName": "Windows CPU Tests",
       "description": "Host-contract suite on Windows without HIP",
@@ -104,7 +102,7 @@
     }
   ],
   "buildPresets": [
-        {
+    {
       "name": "windows-cpu-test",
       "displayName": "Windows CPU Tests",
       "configurePreset": "windows-cpu-test"

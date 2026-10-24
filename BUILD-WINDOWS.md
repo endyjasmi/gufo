@@ -12,20 +12,21 @@ packages are still cut from the Linux build.
 - **Visual Studio 2022/18** with the "Desktop development with C++"
   workload (MSVC x64 — the device compiler comes from TheRock below, not
   VS).
-- **Git**, **CMake ≥ 3.29**, **Ninja** (VS bundles both under
-  `Common7\IDE\CommonExtensions\Microsoft\CMake\bin`), **Python 3**.
-- **vcpkg** cloned somewhere fixed, e.g. `C:\vcpkg`:
+- **Git**, **CMake ≥ 3.29**, **Ninja** (VS bundles both; `vs-env.cmd` puts
+  them on `PATH`), **Python 3**.
+- **vcpkg**, with `VCPKG_ROOT` set to its directory:
 
   ```cmd
   git clone https://github.com/microsoft/vcpkg.git C:\vcpkg && C:\vcpkg\bootstrap-vcpkg.bat
+  setx VCPKG_ROOT C:\vcpkg
   ```
 
 - **TheRock HIP SDK** (the AMD ROCm development distribution built by the
   TheRock project) — a **Windows nightly distribution for gfx1151**,
-  extracted to exactly **`C:\TheRock\build`**. The build presets hardcode
-  `C:/TheRock/build`, so if you put it elsewhere, also update the
-  compiler/prefix paths in `CMakePresets.json` (`windows-base` preset). Use
-  a **nightly** build — the stable ROCm 7.x SDK runtimes currently crash
+  extracted anywhere, with `HIP_PATH` set to that directory (for example
+  `setx HIP_PATH C:\TheRock\build`). The `windows-base` preset chain-loads
+  `cmake/toolchains/windows-therock.cmake`, which takes `clang-cl` and the
+  runtime from `HIP_PATH`. Use a **nightly** build — the stable ROCm 7.x SDK runtimes currently crash
   (`hipStreamCreateWithFlags` hangs/segfaults) with shipping drivers.
 
 ## 2. Patch the SDK's HIP headers (once, and after every SDK reinstall)
@@ -34,25 +35,17 @@ MSVC 14.40+ conflicts with Clang's HIP math headers. The repo ships an
 idempotent fixer:
 
 ```cmd
-python tools\windows\patch_sdk_math.py C:\TheRock\build
+python tools\windows\patch_sdk_math.py %HIP_PATH%
 ```
 
-## 3. Fix the VS path in the env script
-
-`tools\windows\vs-env.cmd` loads the MSVC x64 environment for the build.
-It hardcodes `C:\Program Files\Microsoft Visual Studio\18\Community\...`;
-if your VS is installed elsewhere (e.g. `2022` instead of `18`, or a
-different edition), edit that one `call ... vcvars64.bat` line to point at
-your `vcvars64.bat`.
-
-## 4. Configure + build
+## 3. Configure + build
 
 ```cmd
-tools\windows\vs-env.cmd cmake --preset windows-release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+tools\windows\vs-env.cmd cmake --preset windows-release
 tools\windows\vs-env.cmd cmake --build --preset windows-release
 ```
 
-(Adjust the vcpkg path to where you put it. First configure downloads
+(`vs-env.cmd` finds Visual Studio with `vswhere`. First configure downloads
 dependencies via vcpkg. The build itself is a few minutes and produces
 `build\windows-release\gufo.exe` plus the staged ROCm runtime DLLs and the
 `rocblas\` / `hipblaslt\` kernel-library directories.)
@@ -60,7 +53,7 @@ dependencies via vcpkg. The build itself is a few minutes and produces
 For the hosted test suite without an AMD GPU, use the CPU preset instead:
 
 ```cmd
-tools\windows\vs-env.cmd cmake --preset windows-cpu-test -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+tools\windows\vs-env.cmd cmake --preset windows-cpu-test
 tools\windows\vs-env.cmd cmake --build --preset windows-cpu-test
 tools\windows\vs-env.cmd ctest --preset windows-cpu-test --output-on-failure
 ```
@@ -73,7 +66,7 @@ and run by the Linux CI.
 DLLs are resolved relative to the executable, which must precede System32
 on the DLL search path.
 
-## 5. Verify
+## 4. Verify
 
 ```cmd
 build\windows-release\gufo.exe diagnose

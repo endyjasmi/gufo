@@ -107,12 +107,10 @@ if (ENGINE_ENABLE_HIP)
     # The AMD driver installs an older amdhip64 into System32 that shadows
     # the TheRock runtime on the DLL search path; executables must carry the
     # matching runtime beside them (the exe directory precedes System32).
+    # ROCM_PATH comes from cmake/toolchains/windows-therock.cmake (HIP_PATH).
     file(GLOB GUFO_HIP_RUNTIME_DLLS "${ROCM_PATH}/bin/*.dll")
     if (NOT GUFO_HIP_RUNTIME_DLLS)
-      file(GLOB GUFO_HIP_RUNTIME_DLLS "C:/TheRock/build/bin/*.dll")
-    endif()
-    if (NOT GUFO_HIP_RUNTIME_DLLS)
-      message(FATAL_ERROR "Cannot locate TheRock runtime DLLs for the Windows HIP build")
+      message(FATAL_ERROR "No HIP runtime DLLs under ROCM_PATH=${ROCM_PATH}/bin")
     endif()
     message(STATUS "gufo: staging ${GUFO_HIP_RUNTIME_DLLS}")
   endif()
@@ -171,13 +169,16 @@ if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   # CMake drives lld-link directly, which skips the clang-cl driver and its
   # runtime selection. Code using __builtin_cpu_supports (the disk CRC
   # dispatch) needs the builtins' __cpu_model at link time.
-  get_filename_component(GUFO_LLVM_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  get_filename_component(GUFO_LLVM_DIR "${GUFO_LLVM_DIR}" DIRECTORY)
-  file(GLOB GUFO_CLANG_RT_BUILTINS
-       "${GUFO_LLVM_DIR}/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
-  if (GUFO_CLANG_RT_BUILTINS)
-    list(GET GUFO_CLANG_RT_BUILTINS 0 GUFO_CLANG_RT_BUILTINS)
+  # Ask the compiler in use for its runtime directory.
+  execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-runtime-dir
+                  OUTPUT_VARIABLE GUFO_CLANG_RT_DIR
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  set(GUFO_CLANG_RT_BUILTINS
+      "${GUFO_CLANG_RT_DIR}/clang_rt.builtins-x86_64.lib")
+  if (EXISTS "${GUFO_CLANG_RT_BUILTINS}")
     add_link_options("${GUFO_CLANG_RT_BUILTINS}")
+  else()
+    message(WARNING "clang_rt.builtins not found under '${GUFO_CLANG_RT_DIR}'")
   endif()
 endif()
 
