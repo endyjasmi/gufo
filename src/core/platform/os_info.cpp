@@ -1,14 +1,16 @@
 #include "src/core/platform/os_info.hpp"
 
 #if defined(_WIN32)
-// clang-format off: psapi.h needs the windows.h types above it, and the
-// console and CRT isatty calls need the io and stdio headers.
+// clang-format off: psapi.h and bcrypt.h need the windows.h types above them,
+// and the console and CRT isatty calls need the io and stdio headers.
 #include <windows.h>
+#include <bcrypt.h>
 #include <psapi.h>
 #include <io.h>
 #include <stdio.h>
 // clang-format on
 #else
+#include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -127,6 +129,18 @@ PageFaults ReadPageFaults() noexcept {
     return {};
   return {static_cast<std::uint64_t>(usage.ru_minflt),
           static_cast<std::uint64_t>(usage.ru_majflt)};
+#endif
+}
+
+bool FillRandomBytes(std::span<std::uint8_t> out) noexcept {
+  if (out.empty())
+    return true;
+#if defined(_WIN32)
+  return BCryptGenRandom(nullptr, out.data(), static_cast<ULONG>(out.size()),
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+  return ::getrandom(out.data(), out.size(), 0) ==
+         static_cast<ssize_t>(out.size());
 #endif
 }
 

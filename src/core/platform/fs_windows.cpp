@@ -461,7 +461,7 @@ std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
   return read_bytes;
 }
 
-bool OwnerOnly(const FileInfo&, std::uint32_t) noexcept {
+bool OwnerOnly(const FileInfo&, std::uint32_t, std::uint32_t) noexcept {
   // No owner model until ACL checks exist.
   return true;
 }
@@ -490,6 +490,71 @@ std::uint64_t SeekToEnd(PlatformFile file, std::error_code& ec) noexcept {
     return 0;
   }
   return static_cast<std::uint64_t>(end.QuadPart);
+}
+
+bool SeekTo(PlatformFile file, std::uint64_t offset,
+            std::error_code& ec) noexcept {
+  ec.clear();
+  LARGE_INTEGER distance{};
+  distance.QuadPart = static_cast<LONGLONG>(offset);
+  if (!SetFilePointerEx(file, distance, nullptr, FILE_BEGIN)) {
+    ec = LastError();
+    return false;
+  }
+  return true;
+}
+
+bool TouchAt(const Directory& dir, std::string_view name) noexcept {
+  HANDLE handle = OpenNoFollow(Join(dir, name), FILE_WRITE_ATTRIBUTES, 0);
+  if (handle == INVALID_HANDLE_VALUE)
+    return false;
+  if (IsReparsePoint(handle)) {
+    CloseHandle(handle);
+    return false;
+  }
+  FILETIME now{};
+  GetSystemTimeAsFileTime(&now);
+  const bool ok = SetFileTime(handle, nullptr, &now, &now) != 0;
+  CloseHandle(handle);
+  return ok;
+}
+
+bool LockDirectoryShared(const Directory& dir) noexcept {
+  return dir.valid();
+}
+
+bool TryLockDirectoryExclusive(const Directory& dir) noexcept {
+  return dir.valid();
+}
+
+void UnlockDirectory(const Directory&) noexcept {}
+
+std::FILE* OpenMemoryWriteStream(void*, std::size_t) noexcept {
+  return std::tmpfile();
+}
+
+bool FinishMemoryWriteStream(std::FILE* stream, void* buffer,
+                             std::size_t expected_bytes) noexcept {
+  if (stream == nullptr)
+    return false;
+  const bool ok =
+      std::fseek(stream, 0, SEEK_SET) == 0 &&
+      std::fread(buffer, 1, expected_bytes, stream) == expected_bytes;
+  const bool closed = std::fclose(stream) == 0;
+  return ok && closed;
+}
+
+std::FILE* OpenMemoryReadStream(const void* buffer,
+                                std::size_t bytes) noexcept {
+  std::FILE* stream = std::tmpfile();
+  if (stream == nullptr)
+    return nullptr;
+  if (std::fwrite(buffer, 1, bytes, stream) != bytes ||
+      std::fseek(stream, 0, SEEK_SET) != 0) {
+    std::fclose(stream);
+    return nullptr;
+  }
+  return stream;
 }
 
 bool Truncate(PlatformFile file, std::uint64_t bytes,

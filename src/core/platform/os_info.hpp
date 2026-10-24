@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <ctime>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace gufo::platform {
@@ -57,6 +58,9 @@ struct PageFaults {
 /// Reads the process page-fault counters. Returns zeros when the
 /// platform cannot report them; Windows reports every fault as minor.
 PageFaults ReadPageFaults() noexcept;
+
+/// Fills `out` with OS-provided cryptographically random bytes.
+bool FillRandomBytes(std::span<std::uint8_t> out) noexcept;
 
 }  // namespace gufo::platform
 

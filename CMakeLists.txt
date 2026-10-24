@@ -183,8 +183,8 @@ if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 endif()
 
 if (WIN32)
-  # Platform layer: WinSock (net), process memory counters (logging).
-  set(GUFO_PLATFORM_LIBS ws2_32 iphlpapi)
+  # Platform layer: WinSock (net), process memory counters (logging), BCrypt (os_info).
+  set(GUFO_PLATFORM_LIBS ws2_32 iphlpapi bcrypt)
 endif()
 
 add_subdirectory(src/cache)
@@ -346,23 +346,18 @@ add_library(gufo_http STATIC
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
-  # The HTTP runtime keeps platform-specific wakeup and drain mechanics;
-  # they land with the Windows runtime-correctness work.
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/video_jobs.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/http_server.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/websocket.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/asr_websocket.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/tts_websocket.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/openai_chat.cpp>"
+  src/cli/serve/video_jobs.cpp
+  src/cli/serve/http_server.cpp
+  src/cli/serve/websocket.cpp
+  src/cli/serve/asr_websocket.cpp
+  src/cli/serve/tts_websocket.cpp
+  src/cli/serve/openai_chat.cpp
   # The DeepSeek tool-call scanner lives with its model; its renderer stays in
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
 
-# The CLI composes the HTTP serve path; Windows links it once the
-# runtime-correctness work lands.
-if (NOT WIN32)
 add_executable(gufo
   src/cli/main.cpp
   src/cli/banner.cpp
@@ -392,11 +387,15 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
-endif()
 
 if (NOT WIN32)
   add_custom_target(gufo-server ALL
     COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
+    DEPENDS gufo
+  )
+else()
+  add_custom_target(gufo-server ALL
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
     DEPENDS gufo
   )
 endif()
@@ -429,9 +428,7 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   target_link_libraries(wmma_layout_test PRIVATE gufo_core hip::device)
 endif()
 
-if (NOT WIN32)
-  install(TARGETS gufo DESTINATION bin)
-endif()
+install(TARGETS gufo DESTINATION bin)
 install(FILES
   src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
   DESTINATION share/gufo/models/minimax_h3)

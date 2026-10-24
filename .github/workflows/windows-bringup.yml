@@ -114,14 +114,14 @@ jobs:
           cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
-      - name: Run gufo --version and --help
+      - name: Run gufo --version and diagnose
         run: |
           $gufo = 'build\windows-release\gufo.exe'
           if (-not (Test-Path $gufo)) { throw "$gufo was not built" }
           & $gufo --version
           if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
-          & $gufo --help
-          if ($LASTEXITCODE -ne 0) { throw 'gufo --help failed' }
+          & $gufo diagnose
+          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
 
       - name: Upload configure logs on failure
         if: failure()
