@@ -261,15 +261,10 @@ int main() {
     fs::create_symlink("inner.bin", root / "linked-target" / "file-link");
     platform::Directory through_link;
     CHECK(!through_link.Open(root / "dir-link", ec));
-    if (ec != std::errc::too_many_symbolic_link_levels) {
-      std::fprintf(stderr,
-                   "dir-link ec=%d (%s)
-                   ", ec.value(),
-                   ec.message()
-                       .c_str());
-      std::fflush(stderr);
-    }
-    CHECK(ec == std::errc::too_many_symbolic_link_levels);
+    // POSIX allows either code for O_DIRECTORY | O_NOFOLLOW on a link; Linux
+    // reports ENOTDIR.
+    CHECK(ec == std::errc::too_many_symbolic_link_levels ||
+          ec == std::errc::not_a_directory);
     platform::PlatformFile file_link =
         platform::OpenAt(target, "file-link", platform::FileMode::kRead, ec);
     CHECK(!platform::FileValid(file_link));
@@ -282,10 +277,9 @@ int main() {
           regular += info.regular ? 1 : 0;
         },
         ec));
-    CHECK(entries == 1);  // inner.bin only; the link is listed, not fatal...
-    CHECK(regular == 1);
-    // ...and a listing that contains a link still succeeds, reporting it
-    // as a non-regular entry.
+    CHECK(entries == 2);  // inner.bin and file-link; the link is not fatal...
+    CHECK(regular == 1);  // ...and only inner.bin is regular.
+    // A listing that contains a directory link succeeds too.
     std::size_t seen = 0, link_entries = 0;
     CHECK(platform::ListDirectory(
         dir,
