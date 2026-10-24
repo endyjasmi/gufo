@@ -534,10 +534,11 @@ jobs:
       run:
         shell: pwsh
     env:
-      # The validated stable SDK: nightly 10.2.0a builds produced binaries
-      # that ran ~100x slower on gfx1151, and AMD's nightly index purges
-      # tarballs after about six weeks, so the archive is also cached below.
-      SDK_TARBALL: therock-dist-windows-gfx1151-10.0.0.tar.gz
+      # From AMD's official index, which keeps about six weeks of nightlies;
+      # the archive is also cached below, so a purge only matters once the
+      # cache expires (then bump the pin). The Windows port saw 10.2.0a
+      # binaries run slower on gfx1151; the smoke checks correctness only.
+      SDK_TARBALL: therock-dist-windows-gfx1151-10.2.0a20261022.tar.gz
       # Forward slashes: CMake reads backslashes in -D values as escapes.
       SDK_ROOT: C:/TheRock/build
     steps:
@@ -566,17 +567,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Split-Path $archive), $env:SDK_ROOT | Out-Null
           if (-not (Test-Path $archive)) {
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            # AMD's index purges tarballs after about six weeks; the Windows
-            # port mirrors the validated SDK on its toolchain releases.
-            $version = $env:SDK_TARBALL -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', ''
-            $sources = @("https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL",
-                         "https://github.com/endyjasmi/gufo/releases/download/toolchain/therock-$version/$env:SDK_TARBALL")
-            $downloaded = $false
-            foreach ($url in $sources) {
-              curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" $url
-              if ($LASTEXITCODE -eq 0) { "TheRock source: $url"; $downloaded = $true; break }
+            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" `
+              "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+            if ($LASTEXITCODE -ne 0) {
+              throw "cannot download $env:SDK_TARBALL: AMD's index may have purged it; pin a current one from https://nightly.repo.amd.com/rocm/core/tarball/"
             }
-            if (-not $downloaded) { throw "cannot download $env:SDK_TARBALL from $($sources -join ' or ')" }
             Move-Item "$archive.part" $archive
             $mib = (Get-Item $archive).Length / 1MB
             "TheRock: {0:N0} MiB in {1:N0} s" -f $mib, $watch.Elapsed.TotalSeconds | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
