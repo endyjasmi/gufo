@@ -1,5 +1,3 @@
-#include <unistd.h>
-
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -12,6 +10,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/image.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 
@@ -546,17 +545,27 @@ int main(int argc, char** argv) {
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
-    std::array<char, 64> pattern{};
-    const std::string temporary = "/tmp/gufo-vision-cache-XXXXXX";
-    std::copy(temporary.begin(), temporary.end(), pattern.begin());
-    Require(::mkdtemp(pattern.data()) != nullptr, "cannot create test cache");
+    const auto cache_base = std::filesystem::temp_directory_path();
+    std::filesystem::path cache_directory;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::error_code error;
+      const auto candidate =
+          cache_base /
+          ("gufo-vision-cache-" + std::to_string(gufo::platform::ProcessId()) +
+           "-" + std::to_string(attempt));
+      if (std::filesystem::create_directory(candidate, error)) {
+        cache_directory = candidate;
+        break;
+      }
+    }
+    Require(!cache_directory.empty(), "cannot create test cache");
     struct Cleanup {
       std::filesystem::path path;
       ~Cleanup() {
         std::error_code ignored;
         std::filesystem::remove_all(path, ignored);
       }
-    } cleanup{pattern.data()};
+    } cleanup{cache_directory};
     server::TextDiskCacheConfig cache{
         .directory = cleanup.path,
         .capacity_bytes = std::size_t{2} << 30,

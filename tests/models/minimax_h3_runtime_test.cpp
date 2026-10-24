@@ -1,7 +1,4 @@
-#include <unistd.h>
-
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -17,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
@@ -42,13 +40,19 @@ void Expect(bool condition, const std::string& message) {
 
 struct TemporaryDirectory {
   TemporaryDirectory() {
-    std::array<char, 64> pattern{};
-    std::strcpy(pattern.data(), "/tmp/gufo-h3-runtime-XXXXXX");
-    char* result = mkdtemp(pattern.data());
-    if (result == nullptr) {
-      throw std::runtime_error("mkdtemp failed");
+    const auto base = std::filesystem::temp_directory_path();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::error_code error;
+      const auto candidate =
+          base /
+          ("gufo-h3-runtime-" + std::to_string(gufo::platform::ProcessId()) +
+           "-" + std::to_string(attempt));
+      if (std::filesystem::create_directory(candidate, error)) {
+        path = candidate;
+        return;
+      }
     }
-    path = result;
+    throw std::runtime_error("failed to create temporary directory");
   }
   ~TemporaryDirectory() {
     std::error_code error;

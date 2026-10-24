@@ -1,8 +1,5 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -25,6 +22,7 @@
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace {
 
@@ -60,14 +58,19 @@ void Expect(bool condition, std::string_view message) {
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
-    std::string pattern = (std::filesystem::temp_directory_path() /
-                           "gufo-continuation-disk-XXXXXX")
-                              .string();
-    char* created = ::mkdtemp(pattern.data());
-    if (created == nullptr) {
-      throw std::runtime_error("failed to create temporary directory");
+    const auto base = std::filesystem::temp_directory_path();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::error_code error;
+      const auto candidate =
+          base / ("gufo-continuation-disk-" +
+                  std::to_string(gufo::platform::ProcessId()) + "-" +
+                  std::to_string(attempt));
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = candidate;
+        return;
+      }
     }
-    path_ = created;
+    throw std::runtime_error("failed to create temporary directory");
   }
 
   ~TemporaryDirectory() {

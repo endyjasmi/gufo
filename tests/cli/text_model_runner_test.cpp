@@ -1,7 +1,5 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -24,6 +22,7 @@
 
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 
@@ -774,14 +773,19 @@ private:
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
-    std::string pattern = (std::filesystem::temp_directory_path() /
-                           "gufo-runner-disk-cache-XXXXXX")
-                              .string();
-    const char* created = ::mkdtemp(pattern.data());
-    if (created == nullptr) {
-      throw std::runtime_error("failed to create runner cache directory");
+    const auto base = std::filesystem::temp_directory_path();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::error_code error;
+      const auto candidate =
+          base / ("gufo-runner-disk-cache-" +
+                  std::to_string(gufo::platform::ProcessId()) + "-" +
+                  std::to_string(attempt));
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = candidate;
+        return;
+      }
     }
-    path_ = created;
+    throw std::runtime_error("failed to create runner cache directory");
   }
 
   ~TemporaryDirectory() {
@@ -2081,8 +2085,9 @@ void TestCgroupAvailableCountsReclaimableCache() {
   namespace fs = std::filesystem;
   using gufo::server::CgroupAvailableBytes;
   constexpr std::uint64_t gib = std::uint64_t{1} << 30;
-  const auto root = fs::temp_directory_path() /
-                    ("gufo_cgroup_test_" + std::to_string(::getpid()));
+  const auto root =
+      fs::temp_directory_path() /
+      ("gufo_cgroup_test_" + std::to_string(gufo::platform::ProcessId()));
   fs::remove_all(root);
   const auto write = [&](const fs::path& dir, const char* name,
                          const std::string& text) {

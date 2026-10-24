@@ -725,7 +725,7 @@ if (BUILD_TESTING)
     LABELS "cpu;tools;profiling")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
-  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics)
+  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
   add_test(NAME gpu_queues_test COMMAND gpu_queues_test)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
 
