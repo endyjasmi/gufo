@@ -545,9 +545,9 @@ int main(int argc, char** argv) {
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
-    TemporaryDirectory cache("gufo-vision-cache");
+    TemporaryDirectory cache_root("gufo-vision-cache");
     server::TextDiskCacheConfig cache{
-        .directory = cache.path(),
+        .directory = cache_root.path(),
         .capacity_bytes = std::size_t{2} << 30,
         .staging_capacity_bytes = std::size_t{512} << 20,
         .model_artifact_fingerprint = core::GgufIdentityHex(*reader)};
@@ -585,7 +585,7 @@ int main(int argc, char** argv) {
     for (const bool use_spec : {false, true}) {
       if (use_spec && draft.empty())
         continue;
-      cache.directory = cleanup.path / (use_spec ? "spec" : "ar");
+      cache.directory = cache_root.path() / (use_spec ? "spec" : "ar");
       auto first = load(use_spec, cache);
       const auto red = first->chat(requests[0], 16, greedy);
       const auto sampled_red = first->chat(requests[0], 16, sampled);
