@@ -652,6 +652,11 @@ jobs:
           } >> "$GITHUB_ENV"
           CCACHE_DIR="$GUFO_CACHE_ROOT/ccache" ccache --zero-stats
 
+      # MSVC 14.40+ clashes with clang's HIP math headers; the script is
+      # idempotent and the ephemeral runner starts from a clean SDK.
+      - name: Patch the HIP SDK math headers
+        run: python candidate/tools/windows/patch_sdk_math.py "$HIP_PATH"
+
       # A Windows step ends with its process tree, so the downloads overlap the
       # build inside one step instead of running in the background across steps.
       - name: Build Gufo and fetch the selected weights
