@@ -566,9 +566,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Split-Path $archive), $env:SDK_ROOT | Out-Null
           if (-not (Test-Path $archive)) {
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" `
-              "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
-            if ($LASTEXITCODE -ne 0) { throw "cannot download $env:SDK_TARBALL" }
+            # AMD's index purges tarballs after about six weeks; the Windows
+            # port mirrors the validated SDK on its toolchain releases.
+            $version = $env:SDK_TARBALL -replace '^therock-dist-windows-gfx1151-', '' -replace '\.tar\.gz$', ''
+            $sources = @("https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL",
+                         "https://github.com/endyjasmi/gufo/releases/download/toolchain/therock-$version/$env:SDK_TARBALL")
+            $downloaded = $false
+            foreach ($url in $sources) {
+              curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" $url
+              if ($LASTEXITCODE -eq 0) { "TheRock source: $url"; $downloaded = $true; break }
+            }
+            if (-not $downloaded) { throw "cannot download $env:SDK_TARBALL from $($sources -join ' or ')" }
             Move-Item "$archive.part" $archive
             $mib = (Get-Item $archive).Length / 1MB
             "TheRock: {0:N0} MiB in {1:N0} s" -f $mib, $watch.Elapsed.TotalSeconds | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
@@ -619,9 +627,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: gufo-vcpkg-v3-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            gufo-vcpkg-v3-${{ runner.os }}-
+            gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}-
+            gufo-vcpkg-v4-${{ runner.os }}-
 
       # A full clone: the manifest baseline resolves through vcpkg's history.
       # vcvars points VCPKG_ROOT at the VS-bundled copy, which is not one.
@@ -702,14 +711,15 @@ jobs:
           path: ${{ runner.temp }}\therock-archive
           key: gufo-therock-v2-${{ env.SDK_TARBALL }}
 
-      # Once configure ran, even if the build failed: the next run skips the
-      # packages that did build. Earlier failures would cache nothing useful.
+      # Once configure ran, even if the build failed, under a fresh key per
+      # run: a restored partial set plus this run's new packages is saved
+      # whole, as the CI package ccache does.
       - name: Save vcpkg binary cache
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.configure.outcome != 'skipped'
+        if: always() && steps.configure.outcome != 'skipped'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: gufo-vcpkg-v3-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   windows:
     name: Weight-free GPU checks on Windows Strix Halo
