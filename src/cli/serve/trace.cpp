@@ -75,16 +75,9 @@ std::string CurrentTimestamp() {
 }  // namespace
 
 std::optional<std::string> Trace::Open(const std::string& path) {
-  const std::filesystem::path file(path);
-  const auto parent = file.parent_path();
   std::error_code ec;
-  platform::Directory dir;
-  if (!dir.Open(parent.empty() ? "." : parent, ec)) {
-    return ec.message();
-  }
   const platform::PlatformFile fd =
-      platform::OpenAt(dir, file.filename().string(),
-                       platform::FileMode::kAppend, ec);
+      platform::OpenForAppend(std::filesystem::path(path), ec);
   if (fd == platform::kInvalidFile) {
     return ec.message();
   }
@@ -147,8 +140,8 @@ void Trace::Write(const json::Value& record) {
   const bool seeked = !ec;
   std::string_view pending = text;
   while (!pending.empty()) {
-    const std::size_t written = platform::Write(fd, pending.data(),
-                                                pending.size(), ec);
+    const std::size_t written =
+        platform::Write(fd, pending.data(), pending.size(), ec);
     if (written == 0 && ec == std::errc::interrupted) {
       continue;
     }

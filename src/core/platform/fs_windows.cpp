@@ -186,10 +186,6 @@ PlatformFile OpenAt(const Directory& dir, std::string_view name, FileMode mode,
       access = GENERIC_READ | GENERIC_WRITE;
       disposition = OPEN_ALWAYS;
       break;
-    case FileMode::kAppend:
-      access = FILE_APPEND_DATA;
-      disposition = OPEN_ALWAYS;
-      break;
   }
   HANDLE file = CreateFileW(path.c_str(), access, kDirectoryShare, nullptr,
                             disposition, flags, nullptr);
@@ -468,6 +464,21 @@ std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
 bool OwnerOnly(const FileInfo&, std::uint32_t) noexcept {
   // No owner model until ACL checks exist.
   return true;
+}
+
+PlatformFile OpenForAppend(const std::filesystem::path& path,
+                           std::error_code& ec) noexcept {
+  ec.clear();
+  // FILE_WRITE_DATA lets Truncate cut a torn record back; callers seek to
+  // the end before every write, so appends still land at the end.
+  HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_WRITE_DATA,
+                            kDirectoryShare, nullptr, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    ec = LastError();
+    return kInvalidFile;
+  }
+  return file;
 }
 
 std::uint64_t SeekToEnd(PlatformFile file, std::error_code& ec) noexcept {

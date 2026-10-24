@@ -48,7 +48,6 @@ enum class FileMode {
   kRead,          ///< O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
   kCreateNew,     ///< O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
   kOpenOrCreate,  ///< O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
-  kAppend,        ///< O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC
 };
 
 /// Move-only handle to an open directory. POSIX holds a directory file
@@ -107,6 +106,14 @@ private:
 /// Opens `name` inside `dir` with `mode`. Returns kInvalidFile on failure.
 PlatformFile OpenAt(const Directory& dir, std::string_view name, FileMode mode,
                     std::error_code& ec) noexcept;
+
+/// Opens `path` for appending, creating it with owner-only permissions.
+/// Unlike OpenAt it follows symlinks and accepts devices and pipes, so
+/// user-chosen sinks such as /dev/stdout work. The handle may also be
+/// truncated (Truncate) to cut back a torn record. Returns kInvalidFile and
+/// sets `ec` on failure.
+PlatformFile OpenForAppend(const std::filesystem::path& path,
+                           std::error_code& ec) noexcept;
 
 /// Opens the subdirectory `name` of `dir`; `name` may be "." or "..".
 /// Returns an invalid Directory on failure.
