@@ -44,12 +44,17 @@ std::uint64_t ReadLittleEndian64(const std::byte* bytes) noexcept {
 bool LoadSafetensors(const std::filesystem::path& path, TensorStore* store,
                      std::vector<std::shared_ptr<void>>* mappings,
                      std::string* error, bool include_vision) {
-  auto mapping = std::make_shared<MappedFile>();
+  // RawMappedFile has no destructor; the owner closes the mapping.
+  std::shared_ptr<MappedFile> mapping(new MappedFile(), [](MappedFile* m) {
+    m->Close();
+    delete m;
+  });
   if (!mapping->Open(path) || mapping->size < 8U) {
     *error = "cannot map " + path.string();
     return false;
   }
-  const std::uint64_t header_size = ReadLittleEndian64(static_cast<const std::byte*>(mapping->data));
+  const std::uint64_t header_size =
+      ReadLittleEndian64(static_cast<const std::byte*>(mapping->data));
   if (header_size == 0 || header_size > mapping->size - 8U) {
     *error = "invalid safetensors header in " + path.string();
     return false;
@@ -57,7 +62,8 @@ bool LoadSafetensors(const std::filesystem::path& path, TensorStore* store,
   json::Value header;
   try {
     header = json::parse(
-        std::string_view(reinterpret_cast<const char*>(static_cast<const std::byte*>(mapping->data) + 8),
+        std::string_view(reinterpret_cast<const char*>(
+                             static_cast<const std::byte*>(mapping->data) + 8),
                          static_cast<std::size_t>(header_size)));
   } catch (const std::exception&) {
     *error = "unparsable safetensors header in " + path.string();
@@ -109,7 +115,8 @@ bool LoadSafetensors(const std::filesystem::path& path, TensorStore* store,
       *error = "inconsistent tensor extent for " + name;
       return false;
     }
-    tensor.data = static_cast<const std::byte*>(mapping->data) + payload_offset + begin;
+    tensor.data =
+        static_cast<const std::byte*>(mapping->data) + payload_offset + begin;
     tensor.byte_count = end - begin;
     if (!store->Add(std::move(tensor))) {
       *error = "duplicate tensor " + name;
