@@ -24,6 +24,7 @@
 #include "src/cli/serve/trace.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/net.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "tests/cli/http_server_test_support.hpp"
 
 namespace {
@@ -178,9 +179,9 @@ std::string ChunkedBody(const std::string& response) {
 void TestContentTrace() {
   namespace fs = std::filesystem;
   using gufo::server::Trace;
-  const auto path =
-      fs::temp_directory_path() /
-      ("gufo-trace-test-" + std::to_string(::getpid()) + ".jsonl");
+  const auto path = fs::temp_directory_path() /
+                    ("gufo-trace-test-" +
+                     std::to_string(gufo::platform::ProcessId()) + ".jsonl");
   fs::remove(path);
   assert(!Trace::Open(path.string()).has_value());
   std::string plain_id;
@@ -1318,11 +1319,11 @@ void TestCompatibilityRequests() {
            std::size_t{16});
   }
   for (const auto* invalid : {"2147483648", "18446744073709551616", "1e30"}) {
-    const auto rejected =
-        server.Post("/v1/messages",
-                    std::string(R"({"messages":[{"role":"user","content":"hi"}],
+    const auto rejected = server.Post(
+        "/v1/messages",
+        std::string(R"({"messages":[{"role":"user","content":"hi"}],
         "thinking":{"type":"enabled","budget_tokens":)") +
-                        invalid + "}}");
+            invalid + "}}");
     ExpectStatus(rejected, 400);
     assert(rejected.find("thinking.budget_tokens") != std::string::npos);
   }
