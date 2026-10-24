@@ -560,40 +560,17 @@ jobs:
             echo "::error::The Windows job requires Windows x86-64."
             exit 1
           }
-          # The windows-base preset resolves the toolchain from these two
-          # variables (cmake/toolchains/windows-therock.cmake).
-          missing=()
-          for variable in HIP_PATH VCPKG_ROOT; do
-            if [[ -z "${!variable:-}" || ! -d "${!variable}" ]]; then
-              missing+=("$variable")
-            else
-              printf -- '- %s: %s\n' "$variable" "${!variable}" | tee -a "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-          [[ ${#missing[@]} == 0 ]] || {
-            echo "::error::The runner must set ${missing[*]} to existing directories (see BUILD-WINDOWS.md)."
+          # Strix Halo's gfx1151 ships as the Radeon 8040S/8050S/8060S. The
+          # HIP enumeration check follows once the SDK is provisioned.
+          adapters=$(powershell -NoProfile -Command \
+            "(Get-CimInstance Win32_VideoController).Name -join ';'")
+          echo "Display adapters: $adapters"
+          adapter='Radeon(\(TM\))? 80[456]0S'
+          [[ "$adapters" =~ $adapter ]] || {
+            echo "::error::No Strix Halo (gfx1151) display adapter."
             exit 1
           }
-          hip_info="$HIP_PATH/bin/hipInfo.exe"
-          if [[ -x "$hip_info" ]]; then
-            "$hip_info" | tee "$RUNNER_TEMP/devlab-hipinfo.txt"
-            grep -Eq 'gfx1151' "$RUNNER_TEMP/devlab-hipinfo.txt" || {
-              echo "::error::HIP did not enumerate a gfx1151 device."
-              exit 1
-            }
-            verification='HIP device enumeration'
-          else
-            # Strix Halo's gfx1151 ships as the Radeon 8040S/8050S/8060S.
-            adapters=$(powershell -NoProfile -Command \
-              "(Get-CimInstance Win32_VideoController).Name -join ';'")
-            echo "Display adapters: $adapters"
-            adapter='Radeon(\(TM\))? 80[456]0S'
-            [[ "$adapters" =~ $adapter ]] || {
-              echo "::error::Cannot verify gfx1151: install hipInfo or expose a Strix Halo adapter."
-              exit 1
-            }
-            verification='display adapter name; HIP tools are not installed'
-          fi
+          verification='display adapter name'
           printf -- '- Windows x86-64: verified\n- gfx1151: verified (%s)\n' "$verification" >> "$GITHUB_STEP_SUMMARY"
           for tool in cmake ninja clang-cl python git ccache vcpkg; do
             if command -v "$tool" >/dev/null 2>&1; then
@@ -634,6 +611,51 @@ jobs:
               for group in plan['groups']:
                   summary.write(f"- **{group['profile']}**: {', '.join(group['suites'])}\n")
           PYPLAN
+
+      # The ephemeral runner carries no SDK or C++ package manager: the job
+      # provisions a pinned TheRock gfx1151 nightly (HIP_PATH) and vcpkg at
+      # the vcpkg.json baseline (VCPKG_ROOT). vcpkg's built packages persist
+      # in the Actions cache, keyed by the manifest.
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-archives
+          key: gufo-vcpkg-v1-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          restore-keys: |
+            gufo-vcpkg-v1-${{ runner.os }}-
+
+      - name: Provision the TheRock SDK and vcpkg
+        env:
+          THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
+          THEROCK_SHA256: d9dee4d585d56f0cec7703973f4ca5dbaa71f3aa603c65b4cba6521a52ff728e
+        run: |
+          set -euo pipefail
+          toolchain="$RUNNER_TEMP/gufo-toolchain"
+          rm -rf -- "$toolchain"
+          mkdir -p "$toolchain/therock" "$RUNNER_TEMP/vcpkg-archives"
+          curl -fL --retry 3 --retry-delay 10 -o "$toolchain/therock.tar.gz" \
+            "https://therock-nightly-tarball.s3.amazonaws.com/$THEROCK_TARBALL"
+          echo "$THEROCK_SHA256  $toolchain/therock.tar.gz" | sha256sum -c -
+          # --force-local: GNU tar would read "C:..." as a remote host.
+          tar --force-local -xzf "$toolchain/therock.tar.gz" -C "$toolchain/therock"
+          rm -f -- "$toolchain/therock.tar.gz"
+          baseline=$(python -c 'import json; print(json.load(open("candidate/vcpkg.json"))["builtin-baseline"])')
+          git clone --quiet https://github.com/microsoft/vcpkg.git "$toolchain/vcpkg"
+          git -C "$toolchain/vcpkg" checkout --quiet --detach "$baseline"
+          cmd.exe /d /c "$(cygpath -w "$toolchain/vcpkg/bootstrap-vcpkg.bat") -disableMetrics"
+          {
+            printf 'HIP_PATH=%s\n' "$(cygpath -w "$toolchain/therock")"
+            printf 'VCPKG_ROOT=%s\n' "$(cygpath -w "$toolchain/vcpkg")"
+            printf 'VCPKG_DEFAULT_BINARY_CACHE=%s\n' "$(cygpath -w "$RUNNER_TEMP/vcpkg-archives")"
+          } >> "$GITHUB_ENV"
+          printf -- '- TheRock: %s\n- vcpkg baseline: %s\n' "$THEROCK_TARBALL" "$baseline" >> "$GITHUB_STEP_SUMMARY"
+          "$toolchain/therock/bin/hipInfo.exe" | tee "$RUNNER_TEMP/devlab-hipinfo.txt"
+          grep -Eq 'gfx1151' "$RUNNER_TEMP/devlab-hipinfo.txt" || {
+            echo "::error::HIP did not enumerate a gfx1151 device."
+            exit 1
+          }
+          printf -- '- gfx1151: verified (HIP device enumeration)\n' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure compiler cache
         run: |
@@ -697,6 +719,15 @@ jobs:
           [[ "$weights" == 0 ]] || echo "::error::Selected-model downloads failed ($weights)."
           [[ "$build" == 0 && "$weights" == 0 ]]
 
+      # Saved even when the build fails, so the next run skips the packages
+      # that did build.
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-archives
+          key: gufo-vcpkg-v1-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+
       - name: Install functional client dependencies
         id: client
         run: |
@@ -746,7 +777,8 @@ jobs:
       - name: Report disk and compiler cache, remove temporary environments
         if: always()
         run: |
-          rm -rf -- "$RUNNER_TEMP/gufo-hf-cli" "$RUNNER_TEMP/gufo-functional-client" functional-results
+          rm -rf -- "$RUNNER_TEMP/gufo-hf-cli" "$RUNNER_TEMP/gufo-functional-client" \
+            "$RUNNER_TEMP/gufo-toolchain" functional-results
           df -h "$GITHUB_WORKSPACE" "${GUFO_CACHE_ROOT:-$GITHUB_WORKSPACE}" || true
           if [[ -n "${CCACHE_DIR:-}" ]]; then ccache --show-stats; fi
 

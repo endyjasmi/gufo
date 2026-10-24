@@ -4,8 +4,10 @@ if (NOT DEFINED ENV{HIP_PATH})
   message(FATAL_ERROR "Set HIP_PATH to the TheRock/HIP SDK root (see BUILD-WINDOWS.md)")
 endif()
 file(TO_CMAKE_PATH "$ENV{HIP_PATH}" GUFO_HIP_ROOT)
-# TheRock keeps clang under lib/llvm/bin; the HIP SDK installer under bin.
+# TheRock keeps clang under lib/llvm/bin (some builds ship it only as
+# amdclang-cl.exe); the HIP SDK installer under bin.
 foreach(candidate "${GUFO_HIP_ROOT}/lib/llvm/bin/clang-cl.exe"
+                  "${GUFO_HIP_ROOT}/lib/llvm/bin/amdclang-cl.exe"
                   "${GUFO_HIP_ROOT}/bin/clang-cl.exe")
   if (EXISTS "${candidate}")
     set(GUFO_CLANG_CL "${candidate}")
