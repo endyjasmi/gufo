@@ -593,10 +593,12 @@ jobs:
           THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
         run: |
           set -euo pipefail
-          toolchain="$RUNNER_TEMP/gufo-toolchain"
+          # POSIX paths for the shell tools: GNU tar mangles "D:\a\_temp".
+          temp=$(cygpath -u "$RUNNER_TEMP")
+          toolchain="$temp/gufo-toolchain"
           rm -rf -- "$toolchain"
-          archive="$RUNNER_TEMP/therock-archive/$THEROCK_TARBALL"
-          mkdir -p "$toolchain/therock" "$RUNNER_TEMP/vcpkg-archives" "$RUNNER_TEMP/therock-archive"
+          archive="$temp/therock-archive/$THEROCK_TARBALL"
+          mkdir -p "$toolchain/therock" "$temp/vcpkg-archives" "$temp/therock-archive"
           url="https://rocm.nightlies.amd.com/tarball/$THEROCK_TARBALL"
           if [[ ! -f "$archive" ]]; then
             total=$(curl -fsSIL "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
@@ -641,7 +643,7 @@ jobs:
           {
             printf 'HIP_PATH=%s\n' "$(cygpath -w "$toolchain/therock")"
             printf 'VCPKG_ROOT=%s\n' "$(cygpath -w "$toolchain/vcpkg")"
-            printf 'VCPKG_DEFAULT_BINARY_CACHE=%s\n' "$(cygpath -w "$RUNNER_TEMP/vcpkg-archives")"
+            printf 'VCPKG_DEFAULT_BINARY_CACHE=%s\n' "$(cygpath -w "$temp/vcpkg-archives")"
           } >> "$GITHUB_ENV"
 
       # MSVC 14.40+ clashes with clang's HIP math headers; the script is
@@ -671,7 +673,7 @@ jobs:
               cp -r "build/windows-release/$data" "$dist/"
             fi
           done
-          cp "$HIP_PATH/bin/hipInfo.exe" "$dist/"
+          cp "$(cygpath -u "$HIP_PATH")/bin/hipInfo.exe" "$dist/"
           du -sh "$dist" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the Windows build
