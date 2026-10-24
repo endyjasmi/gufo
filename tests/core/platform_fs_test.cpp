@@ -261,6 +261,14 @@ int main() {
     fs::create_symlink("inner.bin", root / "linked-target" / "file-link");
     platform::Directory through_link;
     CHECK(!through_link.Open(root / "dir-link", ec));
+    if (ec != std::errc::too_many_symbolic_link_levels) {
+      std::fprintf(stderr,
+                   "dir-link ec=%d (%s)
+                   ", ec.value(),
+                   ec.message()
+                       .c_str());
+      std::fflush(stderr);
+    }
     CHECK(ec == std::errc::too_many_symbolic_link_levels);
     platform::PlatformFile file_link =
         platform::OpenAt(target, "file-link", platform::FileMode::kRead, ec);
