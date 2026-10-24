@@ -1,6 +1,5 @@
 #include "src/cli/serve/video_jobs.hpp"
 
-
 #include <algorithm>
 #include <array>
 #include <atomic>

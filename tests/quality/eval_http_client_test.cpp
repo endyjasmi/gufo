@@ -7,9 +7,8 @@
 #include <string_view>
 #include <thread>
 
-#include "src/eval/http_client.hpp"
-
 #include "src/core/platform/net.hpp"
+#include "src/eval/http_client.hpp"
 
 namespace {
 

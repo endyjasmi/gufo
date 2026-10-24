@@ -1,8 +1,5 @@
 #include "src/cli/video/video.hpp"
 
-#include "src/core/platform/shutdown_signal.hpp"
-
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -17,6 +14,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/core/platform/shutdown_signal.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 #ifndef GUFO_H3_SOURCE_MANIFEST

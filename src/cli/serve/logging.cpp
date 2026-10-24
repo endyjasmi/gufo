@@ -1,7 +1,5 @@
 #include "src/cli/serve/logging.hpp"
 
-#include "src/core/platform/os_info.hpp"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,6 +14,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 namespace {
@@ -120,8 +120,7 @@ void Logger::Log(LogLevel level, std::string_view component,
     return;
   }
   static const bool color =
-      std::getenv("NO_COLOR") == nullptr &&
-      gufo::platform::StderrIsTerminal();
+      std::getenv("NO_COLOR") == nullptr && gufo::platform::StderrIsTerminal();
   const char* tag = level == LogLevel::kError   ? "ERROR"
                     : level == LogLevel::kWarn  ? "WARN"
                     : level == LogLevel::kDebug ? "DEBUG"
