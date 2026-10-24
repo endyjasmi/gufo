@@ -212,9 +212,9 @@ std::size_t ReadAt(PlatformFile file, std::uint64_t offset, void* output,
 bool OwnerOnly(const FileInfo& info, std::uint32_t forbidden) noexcept;
 
 /// Makes an existing directory owner-only: chmod(path, 0700) on POSIX, so
-/// entries in a shared temporary root cannot be predicted or entered by
-/// other users. Windows reports success: the user's temporary directory
-/// already carries per-user ACLs. Returns false on failure.
+/// its entries in a shared temporary root cannot be listed or entered by
+/// other users. A no-op that reports success on Windows, where access is
+/// left to the directory's inherited ACLs. Returns false on failure.
 bool RestrictToOwner(const std::filesystem::path& path) noexcept;
 
 }  // namespace gufo::platform

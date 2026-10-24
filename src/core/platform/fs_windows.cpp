@@ -467,7 +467,7 @@ bool OwnerOnly(const FileInfo&, std::uint32_t) noexcept {
 }
 
 bool RestrictToOwner(const std::filesystem::path&) noexcept {
-  // The user's temporary directory already carries per-user ACLs.
+  // No-op: access follows the directory's inherited ACLs.
   return true;
 }
 
