@@ -46,6 +46,17 @@
       }
     },
     {
+      "name": "windows-release",
+      "displayName": "Windows Release",
+      "description": "Windows gfx1151 build used by the Devlab Windows checks",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "OFF",
+        "ENGINE_ENABLE_HIP": "ON"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Release",
       "description": "Production gfx1151 build; same optimization as the Nix package",
@@ -97,6 +108,11 @@
       "name": "windows-cpu-test",
       "displayName": "Windows CPU Tests",
       "configurePreset": "windows-cpu-test"
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows Release",
+      "configurePreset": "windows-release"
     },
     {
       "name": "release",
