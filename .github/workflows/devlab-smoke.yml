@@ -593,8 +593,10 @@ jobs:
           THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
         run: |
           set -euo pipefail
-          # POSIX paths for the shell tools: GNU tar mangles "D:\a\_temp".
-          temp=$(cygpath -u "$RUNNER_TEMP")
+          # Mixed paths ("D:/a/_temp") work for MSYS tools and native ones
+          # alike: tar mangles backslashes, and with MSYS_NO_PATHCONV native
+          # git/curl would take "/d/a/..." literally.
+          temp=$(cygpath -m "$RUNNER_TEMP")
           toolchain="$temp/gufo-toolchain"
           rm -rf -- "$toolchain"
           archive="$temp/therock-archive/$THEROCK_TARBALL"
@@ -673,7 +675,7 @@ jobs:
               cp -r "build/windows-release/$data" "$dist/"
             fi
           done
-          cp "$(cygpath -u "$HIP_PATH")/bin/hipInfo.exe" "$dist/"
+          cp "$(cygpath -m "$HIP_PATH")/bin/hipInfo.exe" "$dist/"
           du -sh "$dist" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the Windows build
