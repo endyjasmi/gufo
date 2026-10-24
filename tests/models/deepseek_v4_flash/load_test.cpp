@@ -38,7 +38,7 @@ int main() {
   const auto root = std::filesystem::path(directory);
   const auto path = root / "invalid.gguf";
   const auto lock_path = root / "instance.lock";
-  assert(gufo::platform::SetEnv("DS4_LOCK_FILE", lock_path));
+  assert(gufo::platform::SetEnv("DS4_LOCK_FILE", lock_path.string()));
   const auto descriptors = OpenDescriptors();
   for (int fixture = 0; fixture < 3; ++fixture) {
     {

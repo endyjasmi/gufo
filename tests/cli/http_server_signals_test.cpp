@@ -56,7 +56,6 @@ void TestSignalShutdown() {
 
 int main() {
   TestSignalShutdown();
-  std::cout << "HTTP signal shutdown checks passed.
-               ";
-      return 0;
+  std::cout << "HTTP signal shutdown checks passed.\n";
+  return 0;
 }
