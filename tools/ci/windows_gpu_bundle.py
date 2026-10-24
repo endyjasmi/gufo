@@ -47,29 +47,44 @@ def properties(test):
 def select(build, tier):
     shown = subprocess.run(['ctest', '--show-only=json-v1', '-L', 'gpu'], cwd=build,
                            check=True, capture_output=True, text=True).stdout
+    (build / 'gpu-tests.json').write_text(shown)  # Kept for diagnosis.
     roots = [str(build.resolve()), str(Path(__file__).resolve().parents[2])]
-    selected = []
+    roots += [root.replace('\\', '/') for root in roots]
+    selected, dropped = [], {}
+
+    def drop(test, reason):
+        dropped.setdefault(reason, []).append(test['name'])
+
     for test in json.loads(shown)['tests']:
         command = test.get('command') or []
         props = properties(test)
         labels = set(props.get('LABELS', []))
-        if not command or EXTERNAL in labels or props.get('ENVIRONMENT'):
-            continue
+        if not command:
+            drop(test, 'no command')
+        elif EXTERNAL in labels:
+            drop(test, 'needs model weights')
+        elif props.get('ENVIRONMENT'):
+            drop(test, 'needs an environment')
         # A bare name is a target this platform does not define (gufo on
         # Windows); ctest resolves defined targets to absolute paths.
-        if not Path(command[0]).is_absolute():
-            continue
-        if tier == 'smoke' and test['name'] not in SMOKE:
-            continue
+        elif not Path(command[0]).is_absolute():
+            drop(test, 'target not defined here')
+        elif tier == 'smoke' and test['name'] not in SMOKE:
+            drop(test, 'not in the smoke set')
         # Arguments naming source or build files would not exist in the bundle.
-        if any(any(root.lower() in arg.lower() for root in roots) for arg in command[1:]):
-            continue
-        if Path(command[0]).suffix.lower() not in ('.exe', ''):
-            continue  # Python-driven tests need the source tree.
-        selected.append({'name': test['name'], 'exe': Path(command[0]).name,
+        elif any(any(root.lower() in arg.lower() for root in roots) for arg in command[1:]):
+            drop(test, 'reads source or build files')
+        elif Path(command[0]).suffix.lower() not in ('.exe', ''):
+            drop(test, 'not an executable')  # Python-driven tests need the source tree.
+        else:
+            selected.append({'name': test['name'], 'exe': Path(command[0]).name,
                          'args': command[1:], 'path': command[0],
                          'skip_return_code': props.get('SKIP_RETURN_CODE'),
                          'timeout': props.get('TIMEOUT') or 600})
+    print(f'{len(selected)} selected of {sum(map(len, dropped.values())) + len(selected)} gpu tests',
+          file=sys.stderr)
+    for reason, names in sorted(dropped.items()):
+        print(f'  dropped, {reason}: {len(names)} ({", ".join(sorted(names)[:8])})', file=sys.stderr)
     return selected
 
 

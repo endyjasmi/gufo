@@ -688,6 +688,8 @@ jobs:
           path: |
             candidate/build/windows-gpu-test/CMakeFiles/CMakeConfigureLog.yaml
             candidate/build/windows-gpu-test/vcpkg-manifest-install.log
+            candidate/build/windows-gpu-test/gpu-tests.json
+            windows-tests.json
           retention-days: 7
           if-no-files-found: ignore
 
