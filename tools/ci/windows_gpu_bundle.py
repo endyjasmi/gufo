@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,24 @@ def properties(test):
     return {item['name']: item['value'] for item in test.get('properties', [])}
 
 
+ADD_TEST = re.compile(r'^add_test\(\[=\[(.+?)\]=\]\s+(.*)\)\s*$')
+TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|(\S+)')
+
+
+def generated_commands(build):
+    # ctest --show-only reports a command only once its executable exists;
+    # before the build, the generated CTestTestfile.cmake files already
+    # carry the resolved paths.
+    commands = {}
+    for testfile in build.rglob('CTestTestfile.cmake'):
+        for line in testfile.read_text(errors='replace').splitlines():
+            match = ADD_TEST.match(line.strip())
+            if match:
+                commands[match.group(1)] = [quoted if quoted or plain is None else plain
+                                            for quoted, plain in TOKEN.findall(match.group(2))]
+    return commands
+
+
 def select(build, tier):
     shown = subprocess.run(['ctest', '--show-only=json-v1', '-L', 'gpu'], cwd=build,
                            check=True, capture_output=True, text=True).stdout
@@ -51,12 +70,13 @@ def select(build, tier):
     roots = [str(build.resolve()), str(Path(__file__).resolve().parents[2])]
     roots += [root.replace('\\', '/') for root in roots]
     selected, dropped = [], {}
+    generated = generated_commands(build)
 
     def drop(test, reason):
         dropped.setdefault(reason, []).append(test['name'])
 
     for test in json.loads(shown)['tests']:
-        command = test.get('command') or []
+        command = test.get('command') or generated.get(test['name'], [])
         props = properties(test)
         labels = set(props.get('LABELS', []))
         if not command:
