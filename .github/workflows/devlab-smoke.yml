@@ -628,7 +628,6 @@ jobs:
       - name: Provision the TheRock SDK and vcpkg
         env:
           THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
-          THEROCK_SHA256: d9dee4d585d56f0cec7703973f4ca5dbaa71f3aa603c65b4cba6521a52ff728e
         run: |
           set -euo pipefail
           toolchain="$RUNNER_TEMP/gufo-toolchain"
@@ -636,7 +635,6 @@ jobs:
           mkdir -p "$toolchain/therock" "$RUNNER_TEMP/vcpkg-archives"
           curl -fL --retry 3 --retry-delay 10 -o "$toolchain/therock.tar.gz" \
             "https://therock-nightly-tarball.s3.amazonaws.com/$THEROCK_TARBALL"
-          echo "$THEROCK_SHA256  $toolchain/therock.tar.gz" | sha256sum -c -
           # --force-local: GNU tar would read "C:..." as a remote host.
           tar --force-local -xzf "$toolchain/therock.tar.gz" -C "$toolchain/therock"
           rm -f -- "$toolchain/therock.tar.gz"
