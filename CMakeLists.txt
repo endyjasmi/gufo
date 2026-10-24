@@ -180,6 +180,20 @@ if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   else()
     message(WARNING "clang_rt.builtins not found under '${GUFO_CLANG_RT_DIR}'")
   endif()
+  if (ENGINE_ENABLE_HIP)
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+                    OUTPUT_VARIABLE GUFO_CLANG_RESOURCE_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    set(GUFO_HIP_CMATH "${GUFO_CLANG_RESOURCE_DIR}/include/__clang_hip_cmath.h")
+    if (EXISTS "${GUFO_HIP_CMATH}")
+      file(READ "${GUFO_HIP_CMATH}" GUFO_HIP_CMATH_CONTENT)
+      if (NOT GUFO_HIP_CMATH_CONTENT MATCHES "GUFO_MSVC_CMATH_PATCH")
+        message(FATAL_ERROR
+          "TheRock HIP math headers are not patched for MSVC 14.40+; run: "
+          "python tools/windows/patch_sdk_math.py")
+      endif()
+    endif()
+  endif()
 endif()
 
 if (WIN32)
@@ -581,39 +595,29 @@ if (BUILD_TESTING)
   set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
   endif()
 
-  # The HTTP server suite links the runtime that stays Linux-only
-  # until the runtime-correctness work lands.
+  # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
   if (NOT WIN32)
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
-  # the signal suite forks and waits on itself
-  if (NOT WIN32)
+
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
   target_link_libraries(http_server_signals_test PRIVATE gufo_http)
   add_test(NAME http_server_signals_test COMMAND http_server_signals_test)
   set_tests_properties(http_server_signals_test
     PROPERTIES LABELS "cpu;server;http" TIMEOUT 60)
-  endif()
-  # the audio suite drives WebSocket over an AF_UNIX socketpair
-  if (NOT WIN32)
+
   add_executable(audio_websocket_test tests/cli/audio_websocket_test.cpp)
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)
   set_tests_properties(audio_websocket_test PROPERTIES LABELS "cpu;server;audio" TIMEOUT 30)
   endif()
-  endif()
 
-
-  # serve_cli_test drives the gufo binary, which stays Linux-only until the
-  # HTTP runtime lands.
-  if (NOT WIN32)
   add_test(NAME serve_cli_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/serve_test.py
       $<TARGET_FILE:gufo>)
   set_tests_properties(serve_cli_test PROPERTIES LABELS "cpu;server;cli" TIMEOUT 30)
-  endif()
 
   add_test(NAME kernel_resources_parser_test
     COMMAND ${Python3_EXECUTABLE}
@@ -672,8 +676,6 @@ if (BUILD_TESTING)
   set_tests_properties(continuation_cache_test PROPERTIES
     LABELS "cpu;server;cache;state;lifecycle")
 
-  # the component disk store still locks with flock
-  if (NOT WIN32)
   add_executable(component_text_cache_test
     tests/cli/component_text_cache_test.cpp
     src/cli/serve/component_text_cache.cpp
@@ -683,10 +685,7 @@ if (BUILD_TESTING)
   target_link_libraries(component_text_cache_test PRIVATE gufo_cache_fake gufo_core gufo_logging)
   add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
   set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
-  endif()
 
-  # it compiles the component disk store above
-  if (NOT WIN32)
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
     src/cli/serve/continuation_cache.cpp
@@ -697,7 +696,6 @@ if (BUILD_TESTING)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
-  endif()
 
   # the disk-store suite exercises permission faults with chmod and lstat
   if (NOT WIN32)
@@ -720,8 +718,6 @@ if (BUILD_TESTING)
   set_tests_properties(logit_sampler_test PROPERTIES
     LABELS "cpu;server;sampling")
 
-  # it compiles the component disk store above
-  if (NOT WIN32)
   add_executable(text_generation_scheduler_test
     tests/cli/text_generation_scheduler_test.cpp
     src/cli/serve/continuation_cache.cpp
@@ -734,7 +730,6 @@ if (BUILD_TESTING)
     COMMAND text_generation_scheduler_test)
   set_tests_properties(text_generation_scheduler_test PROPERTIES
     LABELS "cpu;server;scheduler;queue;state;lifecycle;cancellation")
-  endif()
 
   add_executable(prompt_cli_test
     tests/cli/prompt_test.cpp
@@ -851,26 +846,18 @@ if (BUILD_TESTING)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
 
-  # The queue census reads the Linux KFD sysfs layout through the faked tree.
-  if (NOT WIN32)
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
   add_test(NAME gpu_queues_test COMMAND gpu_queues_test)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
-  endif()
 
-  # Not yet validated on Windows; the library itself builds there.
-  if (NOT WIN32)
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
   target_link_libraries(bandwidth_test PRIVATE gufo_diagnostics)
 
   add_test(NAME bandwidth_test COMMAND bandwidth_test)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
-  endif()
 
-  # Not yet validated on Windows; the library itself builds there.
-  if (NOT WIN32)
   add_executable(allocation_benchmark_test
     tests/diagnostics/allocation_benchmark_test.cpp)
   target_compile_definitions(allocation_benchmark_test PRIVATE
@@ -879,7 +866,6 @@ if (BUILD_TESTING)
   add_test(NAME allocation_benchmark_test COMMAND allocation_benchmark_test)
   set_tests_properties(allocation_benchmark_test PROPERTIES
     LABELS "gpu;hip;gfx1151;diagnostics;allocation;opt-c091")
-  endif()
 
   # the prefetch fixture uses mkstemp and mmap
   if (NOT WIN32)
@@ -1022,7 +1008,6 @@ if (BUILD_TESTING)
   add_test(NAME eval_regrade_test COMMAND eval_regrade_test)
   set_tests_properties(eval_regrade_test PROPERTIES LABELS "cpu;quality;eval")
 
-  if (NOT WIN32)
   add_test(NAME eval_http_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_eval_http.py
@@ -1030,18 +1015,13 @@ if (BUILD_TESTING)
       --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json)
   set_tests_properties(eval_http_test PROPERTIES
     LABELS "cpu;quality;eval;http;cli;server")
-  endif()
 
-  # dials raw sockets; returns with the HTTP runtime work
+  # The eval client fixture drives raw POSIX sockets directly.
   if (NOT WIN32)
   add_executable(eval_http_client_test
     tests/quality/eval_http_client_test.cpp src/eval/http_client.cpp)
   target_include_directories(eval_http_client_test PRIVATE ${PROJECT_SOURCE_DIR})
   target_link_libraries(eval_http_client_test PRIVATE CURL::libcurl Threads::Threads)
-  if (WIN32)
-    # WinSock startup lives in the eval HTTP client, not the platform net leaf.
-    target_link_libraries(eval_http_client_test PRIVATE ws2_32)
-  endif()
   add_test(NAME eval_http_client_test COMMAND eval_http_client_test)
   set_tests_properties(eval_http_client_test PROPERTIES LABELS "cpu;quality;eval;http")
   endif()

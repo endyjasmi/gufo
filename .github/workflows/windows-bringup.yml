@@ -106,15 +106,17 @@ jobs:
       - name: Configure
         id: configure
         run: |
-          cmake --preset windows-release "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
+          cmake --preset windows-release -DBUILD_TESTING=ON "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
           if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+          "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
+          "$PWD\build\windows-release" >> $env:GITHUB_PATH
 
       - name: Build
         run: |
-          cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS
+          cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target gufo gufo-server component_text_cache_test qwen38_flash_next_ngram_test gpu_queues_test bandwidth_test allocation_benchmark_test
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
-      - name: Run gufo --version and diagnose
+      - name: Run gufo --version, diagnose and the Windows PR contract suite
         run: |
           $gufo = 'build\windows-release\gufo.exe'
           if (-not (Test-Path $gufo)) { throw "$gufo was not built" }
@@ -122,6 +124,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
           & $gufo diagnose
           if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
+          cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target check-pr
+          if ($LASTEXITCODE -ne 0) { throw 'check-pr failed' }
+          ctest --test-dir build/windows-release --output-on-failure --no-tests=error --timeout 60 -R '^(qwen38_flash_next\.ngram|gpu_queues_test|bandwidth_test|allocation_benchmark_test)$'
+          if ($LASTEXITCODE -ne 0) { throw 'diagnostics and ngram tests failed' }
 
       - name: Upload configure logs on failure
         if: failure()
