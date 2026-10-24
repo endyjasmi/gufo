@@ -29,6 +29,8 @@
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "VCPKG_MANIFEST_INSTALL": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-release",
+        "VCPKG_HOST_TRIPLET": "x64-windows-release",
         "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/windows-therock.cmake"
       }
     },
@@ -51,6 +53,17 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "OFF",
+        "ENGINE_ENABLE_HIP": "ON"
+      }
+    },
+    {
+      "name": "windows-gpu-test",
+      "displayName": "Windows gfx1151 GPU Tests",
+      "description": "Windows build of the weight-free GPU tests for the Devlab Windows checks",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "ON"
       }
     },
@@ -111,6 +124,11 @@
       "name": "windows-release",
       "displayName": "Windows Release",
       "configurePreset": "windows-release"
+    },
+    {
+      "name": "windows-gpu-test",
+      "displayName": "Windows gfx1151 GPU Tests",
+      "configurePreset": "windows-gpu-test"
     },
     {
       "name": "release",

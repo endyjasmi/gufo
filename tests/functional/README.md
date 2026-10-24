@@ -250,13 +250,6 @@ the PR's earlier run. PRs use the `pr` tier; release-please PRs and dispatches
 PR number. Authorization pins its head and merge base; the hosted planner and
 GPU controller use the same workflow/harness revision and recreate the same plan.
 
-The Windows job (`[windows, strix-halo, devlab-dispatch]`) uses the same
-authorization and model selection. Its PRs use the `smoke` tier: one quick
-suite per selected model (`stops` for LLMs, `embedding-text`, `asr-http`,
-`tts-http`). Release-please PRs and full dispatches run the `full` correctness
-set. Windows runs correctness only (`devlab_run.py --no-timing`): no merge-base
-build and no paired timing.
-
 `devlab_plan.py` selects owners per path using reviewed priority rules in
 `devlab.json`, then uses `impact.py` for each selected LLM's affected suites.
 Selections from separate paths are combined:

@@ -18,8 +18,6 @@ def write(path, value):
 
 
 def service_args(key, binary, baseline, assets, output):
-    # Without a merge-base binary the candidate evaluates its own TTS output.
-    baseline = baseline or binary
     model = registry()['models'][key]
     args = [sys.executable, str(HERE / 'model_services.py'), model['service'], '--binary', str(binary),
             '--model', assets[model['asset']], '--output', str(output)]
@@ -28,7 +26,7 @@ def service_args(key, binary, baseline, assets, output):
     return args
 
 
-def execute(plan, binary, baseline, assets_path, output, report, logs, timing=True):
+def execute(plan, binary, baseline, assets_path, output, report, logs):
     assets = json.loads(assets_path.read_text())
     data = registry()
     output.mkdir(parents=True, exist_ok=False)
@@ -73,10 +71,6 @@ def execute(plan, binary, baseline, assets_path, output, report, logs, timing=Tr
         except Exception:
             item.update(correctness='error', error=traceback.format_exc())
         save()
-        if not timing:
-            item['timing'] = 'skipped'
-            save()
-            continue
         # Correctness failure must not hide the speed controls or other models.
         try:
             script = 'phases.py' if model['category'] == 'llm' else 'service_phases.py'
@@ -105,8 +99,7 @@ def execute(plan, binary, baseline, assets_path, output, report, logs, timing=Tr
         except Exception:
             item.update(timing='error', timing_error=traceback.format_exc())
         save()
-    failed = any(item['correctness'] != 'passed' or item['timing'] not in ('passed', 'skipped')
-                 for item in summary['models'])
+    failed = any(item['correctness'] != 'passed' or item['timing'] != 'passed' for item in summary['models'])
     summary['status'] = 'failed' if failed else 'passed'
     save()
     return int(failed)
@@ -114,19 +107,11 @@ def execute(plan, binary, baseline, assets_path, output, report, logs, timing=Tr
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('plan', 'binary', 'assets', 'output', 'report', 'logs'):
+    for name in ('plan', 'binary', 'base-binary', 'assets', 'output', 'report', 'logs'):
         parser.add_argument('--' + name, type=Path, required=True)
-    parser.add_argument('--base-binary', type=Path,
-                        help='merge-base binary for paired timing; omit with --no-timing')
-    parser.add_argument('--no-timing', action='store_true',
-                        help='correctness only, as the Windows runs do')
     args = parser.parse_args()
-    if args.base_binary is None and not args.no_timing:
-        parser.error('--base-binary is required unless --no-timing is set')
-    baseline = args.base_binary.resolve() if args.base_binary else None
-    return execute(json.loads(args.plan.read_text()), args.binary.resolve(), baseline,
-                   args.assets.resolve(), args.output.resolve(), args.report.resolve(), args.logs.resolve(),
-                   timing=not args.no_timing)
+    return execute(json.loads(args.plan.read_text()), args.binary.resolve(), args.base_binary.resolve(),
+                   args.assets.resolve(), args.output.resolve(), args.report.resolve(), args.logs.resolve())
 
 
 if __name__ == '__main__':
