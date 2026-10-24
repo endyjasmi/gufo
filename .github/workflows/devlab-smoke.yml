@@ -524,137 +524,168 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.has_work == 'true'
     # A hosted runner: fast network and the Actions cache. The GPU runner
-    # downloads only the result.
+    # downloads only the result. The recipe follows the Windows port's own
+    # release workflow (endyjasmi/gufo windows-release.yml).
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
       contents: read
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     env:
-      MSYS_NO_PATHCONV: 1
+      # The validated stable SDK: nightly 10.2.0a builds produced binaries
+      # that ran ~100x slower on gfx1151, and AMD's nightly index purges
+      # tarballs after about six weeks, so the archive is also cached below.
+      SDK_TARBALL: therock-dist-windows-gfx1151-10.0.0.tar.gz
+      # Forward slashes: CMake reads backslashes in -D values as escapes.
+      SDK_ROOT: C:/TheRock/build
     steps:
       - name: Fetch the candidate head
         timeout-minutes: 15
         env:
           APPROVED_HEAD: ${{ needs.authorize.outputs.head }}
         run: |
-          set -euo pipefail
           git init --quiet --initial-branch=ci candidate
-          git -C candidate fetch --quiet --depth 1 https://github.com/gufo-org/gufo.git "$APPROVED_HEAD"
-          git -C candidate checkout --quiet --detach "$APPROVED_HEAD"
-          printf 'Candidate: %s\n' "$APPROVED_HEAD" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Restore vcpkg binary cache
-        id: vcpkg-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/vcpkg-archives
-          key: gufo-vcpkg-v3-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
-          restore-keys: |
-            gufo-vcpkg-v3-${{ runner.os }}-
+          git -C candidate fetch --quiet --depth 1 https://github.com/gufo-org/gufo.git $env:APPROVED_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "cannot fetch $env:APPROVED_HEAD" }
+          git -C candidate checkout --quiet --detach $env:APPROVED_HEAD
+          "Candidate: $env:APPROVED_HEAD" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Restore TheRock SDK archive
         id: therock-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/therock-archive
-          key: gufo-therock-v1-therock-dist-windows-gfx1151-7.14.0a20260612
+          path: ${{ runner.temp }}\therock-archive
+          key: gufo-therock-v2-${{ env.SDK_TARBALL }}
 
-      # TheRock nightly from AMD's CloudFront mirror (cached above after the
-      # first run) and vcpkg at the manifest baseline.
-      - name: Provision the TheRock SDK and vcpkg
-        id: provision
-        env:
-          THEROCK_TARBALL: therock-dist-windows-gfx1151-7.14.0a20260612.tar.gz
+      - name: Install the TheRock SDK
+        id: sdk
         run: |
-          set -euo pipefail
-          # Mixed paths ("D:/a/_temp") work for MSYS tools and native ones
-          # alike: tar mangles backslashes, and with MSYS_NO_PATHCONV native
-          # git/curl would take "/d/a/..." literally.
-          temp=$(cygpath -m "$RUNNER_TEMP")
-          toolchain="$temp/gufo-toolchain"
-          rm -rf -- "$toolchain"
-          archive="$temp/therock-archive/$THEROCK_TARBALL"
-          mkdir -p "$toolchain/therock" "$temp/vcpkg-archives" "$temp/therock-archive"
-          url="https://rocm.nightlies.amd.com/tarball/$THEROCK_TARBALL"
-          if [[ ! -f "$archive" ]]; then
-            total=$(curl -fsSIL "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
-            started=$SECONDS
-            # Stalls below 64 KB/s for five minutes fail fast instead of
-            # running into the job timeout.
-            curl -fL --retry 3 --retry-delay 10 --speed-limit 65536 --speed-time 300 \
-              --no-progress-meter -o "$archive.part" "$url" &
-            download=$!
-            # One progress line every 30 s: received, total, average rate, ETA.
-            while kill -0 "$download" 2>/dev/null; do
-              sleep 30
-              size=$(stat -c %s "$archive.part" 2>/dev/null || echo 0)
-              awk -v s="$size" -v t="$total" -v e=$((SECONDS - started)) 'BEGIN {
-                r = e > 0 ? s / e : 0
-                printf "TheRock: %.0f / %.0f MiB, %.2f MB/s, ETA %s\n", s / 1048576, t / 1048576,
-                  r / 1e6, (r > 0 && t > s) ? sprintf("%.0f min", (t - s) / r / 60) : "?"
-              }'
-            done
-            wait "$download"
-            elapsed=$((SECONDS - started))
-            awk -v t="$total" -v e="$elapsed" 'BEGIN {
-              printf "TheRock: %.0f MiB in %d s (%.2f MB/s)\n", t / 1048576, e, (e > 0 ? t / e / 1e6 : 0)
-            }' | tee -a "$GITHUB_STEP_SUMMARY"
-            mv -- "$archive.part" "$archive"
-          fi
-          echo "archive=ready" >> "$GITHUB_OUTPUT"
-          started=$SECONDS
-          # --force-local: GNU tar would read "C:..." as a remote host.
-          tar --force-local -xzf "$archive" -C "$toolchain/therock"
-          echo "TheRock: unpacked in $((SECONDS - started)) s"
-          started=$SECONDS
-          # vcpkg resolves the baseline's own port versions from the checked
-          # out commit, so one commit is enough.
-          baseline=$(python -c 'import json; print(json.load(open("candidate/vcpkg.json"))["builtin-baseline"])')
-          git init --quiet "$toolchain/vcpkg"
-          git -C "$toolchain/vcpkg" -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=120 \
-            fetch --quiet --depth 1 https://github.com/microsoft/vcpkg.git "$baseline"
-          git -C "$toolchain/vcpkg" checkout --quiet --detach FETCH_HEAD
-          cmd.exe /d /c "$(cygpath -w "$toolchain/vcpkg/bootstrap-vcpkg.bat") -disableMetrics"
-          echo "vcpkg $baseline: ready in $((SECONDS - started)) s"
-          {
-            printf 'HIP_PATH=%s\n' "$(cygpath -w "$toolchain/therock")"
-            printf 'VCPKG_ROOT=%s\n' "$(cygpath -w "$toolchain/vcpkg")"
-            printf 'VCPKG_DEFAULT_BINARY_CACHE=%s\n' "$(cygpath -w "$temp/vcpkg-archives")"
-          } >> "$GITHUB_ENV"
+          $archive = "$env:RUNNER_TEMP\therock-archive\$env:SDK_TARBALL"
+          New-Item -ItemType Directory -Force -Path (Split-Path $archive), $env:SDK_ROOT | Out-Null
+          if (-not (Test-Path $archive)) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" `
+              "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+            if ($LASTEXITCODE -ne 0) { throw "cannot download $env:SDK_TARBALL" }
+            Move-Item "$archive.part" $archive
+            $mib = (Get-Item $archive).Length / 1MB
+            "TheRock: {0:N0} MiB in {1:N0} s" -f $mib, $watch.Elapsed.TotalSeconds | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+          "archive=ready" >> $env:GITHUB_OUTPUT
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          tar -xzf $archive -C $env:SDK_ROOT
+          if ($LASTEXITCODE -ne 0) { throw "cannot unpack $env:SDK_TARBALL" }
+          "TheRock: unpacked in {0:N0} s" -f $watch.Elapsed.TotalSeconds
+          foreach ($path in @("lib\llvm\bin\clang-cl.exe", "bin\hipcc.exe", "bin\hipInfo.exe",
+                              "bin\rocblas\library", "bin\hipblaslt\library")) {
+            if (-not (Test-Path "$env:SDK_ROOT\$path")) { throw "TheRock SDK is missing $path" }
+          }
+          # CMake cannot find HIP by itself in TheRock's layout: the SDK bin
+          # goes on PATH and the root into HIP_PATH (the toolchain file).
+          "HIP_PATH=$env:SDK_ROOT" >> $env:GITHUB_ENV
+          ($env:SDK_ROOT -replace '/', '\') + '\bin' >> $env:GITHUB_PATH
+          "- TheRock: $env:SDK_TARBALL" >> $env:GITHUB_STEP_SUMMARY
 
-      # MSVC 14.40+ clashes with clang's HIP math headers; the script is
-      # idempotent.
+      # MSVC 14.40+ clashes with clang's HIP math headers; idempotent.
       - name: Patch the HIP SDK math headers
-        run: python candidate/tools/windows/patch_sdk_math.py "$HIP_PATH"
+        run: python candidate/tools/windows/patch_sdk_math.py $env:SDK_ROOT
+
+      # vcvars64 once, exported to later steps, instead of a wrapper per command.
+      - name: Set up the MSVC x64 environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio installation with the x64 VC toolset was found' }
+          $bat = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $before = @{}
+          foreach ($line in (cmd /s /c 'set')) {
+            if ($line -match '^([^=]+)=(.*)$') { $before[$Matches[1]] = $Matches[2] }
+          }
+          foreach ($line in (cmd /s /c "call `"$bat`" >NUL 2>&1 && set")) {
+            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+            if ($before.ContainsKey($Matches[1]) -and $before[$Matches[1]] -eq $Matches[2]) { continue }
+            "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+          }
+
+      - name: Install Ninja
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja' }
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: gufo-vcpkg-v3-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
+          restore-keys: |
+            gufo-vcpkg-v3-${{ runner.os }}-
+
+      # A full clone: the manifest baseline resolves through vcpkg's history.
+      # vcvars points VCPKG_ROOT at the VS-bundled copy, which is not one.
+      - name: Prepare vcpkg
+        run: |
+          if (Test-Path C:\vcpkg) { Remove-Item -Recurse -Force C:\vcpkg }
+          git clone --quiet https://github.com/microsoft/vcpkg.git C:\vcpkg
+          if ($LASTEXITCODE -ne 0) { throw 'cannot clone vcpkg' }
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'cannot bootstrap vcpkg' }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\vcpkg-archives" | Out-Null
+          "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+          "VCPKG_DEFAULT_BINARY_CACHE=$env:RUNNER_TEMP\vcpkg-archives" >> $env:GITHUB_ENV
+
+      - name: Configure
+        id: configure
+        working-directory: candidate
+        run: |
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          cmake --preset windows-gpu-test "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+          "Configure (vcpkg included): {0:N0} s" -f $watch.Elapsed.TotalSeconds | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
 
       # The weight-free GPU tests (gufo too, once it builds on Windows) and
-      # everything they load, packed for the Devlab runner. Pull requests take
-      # one fast test per class; release PRs every weight-free GPU test.
+      # everything they load. Pull requests take one fast test per class;
+      # release PRs every weight-free GPU test.
       - name: Build and pack the GPU tests
         id: build
         working-directory: candidate
         env:
           APPROVED_TIER: ${{ needs.authorize.outputs.tier }}
         run: |
-          set -euo pipefail
-          tier=smoke
-          [[ "$APPROVED_TIER" == full ]] && tier=full
-          started=$SECONDS
-          cmd.exe /d /c "call tools\\windows\\vs-env.cmd cmake --preset windows-gpu-test"
-          targets=$(cmd.exe /d /c "call tools\\windows\\vs-env.cmd python tools\\ci\\windows_gpu_bundle.py select --build build\\windows-gpu-test --tier $tier --output ..\\windows-tests.json")
-          targets=$(printf '%s\n' "$targets" | tail -n 1 | tr -d '\r')
-          [[ -n "$targets" ]] || { echo "::error::No weight-free GPU tests are defined on Windows."; exit 1; }
-          echo "Targets ($tier): $targets"
-          cmd.exe /d /c "call tools\\windows\\vs-env.cmd cmake --build --preset windows-gpu-test --parallel 4 --target $targets"
-          echo "Build: $((SECONDS - started)) s" | tee -a "$GITHUB_STEP_SUMMARY"
-          extra=()
-          [[ -f build/windows-gpu-test/gufo.exe ]] && extra=(--extra build/windows-gpu-test/gufo.exe)
-          python tools/ci/windows_gpu_bundle.py collect --tests ../windows-tests.json \
-            --hip-path "$HIP_PATH" "${extra[@]}" --output ../windows-dist
-          du -sh ../windows-dist | tee -a "$GITHUB_STEP_SUMMARY"
+          $tier = if ($env:APPROVED_TIER -eq 'full') { 'full' } else { 'smoke' }
+          $selected = python tools/ci/windows_gpu_bundle.py select --build build/windows-gpu-test --tier $tier --output ../windows-tests.json
+          if ($LASTEXITCODE -ne 0) { throw 'cannot select the GPU tests' }
+          $targets = ($selected | Select-Object -Last 1).Trim() -split ' ' | Where-Object { $_ }
+          if (-not $targets) { throw 'No weight-free GPU tests are defined on Windows.' }
+          "Targets ($tier): $targets"
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          cmake --build --preset windows-gpu-test --parallel $env:NUMBER_OF_PROCESSORS --target @targets
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+          "Build: {0:N0} s" -f $watch.Elapsed.TotalSeconds | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          $extra = @()
+          if (Test-Path build/windows-gpu-test/gufo.exe) { $extra = @('--extra', 'build/windows-gpu-test/gufo.exe') }
+          python tools/ci/windows_gpu_bundle.py collect --tests ../windows-tests.json --hip-path $env:SDK_ROOT @extra --output ../windows-dist
+          if ($LASTEXITCODE -ne 0) { throw 'cannot pack the bundle' }
+          # The MSVC CRT and the LLVM OpenMP runtime ship app-local: the GPU
+          # runner need not have Visual Studio installed.
+          $redist = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory |
+            Where-Object { $_.Name -like 'Microsoft.VC*.CRT' -or $_.Name -like 'Microsoft.VC*.OpenMP.LLVM' }
+          foreach ($dir in $redist) { Copy-Item "$($dir.FullName)\*.dll" ../windows-dist }
+          $mib = (Get-ChildItem ../windows-dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+          "Bundle: {0:N0} MiB" -f $mib | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload configure and build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-cmake-logs-${{ github.run_attempt }}
+          path: |
+            candidate/build/windows-gpu-test/CMakeFiles/CMakeConfigureLog.yaml
+            candidate/build/windows-gpu-test/vcpkg-manifest-install.log
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload the Windows build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -665,21 +696,19 @@ jobs:
           retention-days: 3
 
       - name: Save TheRock SDK archive
-        if: always() && steps.therock-cache.outputs.cache-hit != 'true' && steps.provision.outputs.archive == 'ready'
+        if: always() && steps.therock-cache.outputs.cache-hit != 'true' && steps.sdk.outputs.archive == 'ready'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/therock-archive
-          key: gufo-therock-v1-therock-dist-windows-gfx1151-7.14.0a20260612
+          path: ${{ runner.temp }}\therock-archive
+          key: gufo-therock-v2-${{ env.SDK_TARBALL }}
 
-      # Saved even when the build fails, so the next run skips the packages
-      # that did build.
-      # Only once the build ran: an earlier failure would save an empty cache
-      # under the manifest's key and block later saves.
+      # Once configure ran, even if the build failed: the next run skips the
+      # packages that did build. Earlier failures would cache nothing useful.
       - name: Save vcpkg binary cache
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.build.outcome != 'skipped'
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.configure.outcome != 'skipped'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/vcpkg-archives
+          path: ${{ runner.temp }}\vcpkg-archives
           key: gufo-vcpkg-v3-${{ runner.os }}-${{ hashFiles('candidate/vcpkg.json') }}
 
   windows:
