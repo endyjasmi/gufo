@@ -1,9 +1,12 @@
 name: PR title
 
 on:
-  pull_request:
-    branches: [ main ]
-    types: [ opened, edited, reopened, synchronize ]
+  # TEMP(#775): PR runs paused while the Windows build is brought up step
+  # by step in windows-bringup.yml; revert this commit to restore them.
+  # pull_request:
+  #   branches: [ main ]
+  #   types: [ opened, edited, reopened, synchronize ]
+  workflow_dispatch:
 
 permissions:
   contents: read

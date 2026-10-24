@@ -3,8 +3,10 @@ name: Devlab functional checks
 on:
   # Same trigger and fork approval policy as CI. The check is advisory: it is
   # not required for merging.
-  pull_request:
-    types: [ opened, synchronize, reopened, ready_for_review ]
+  # TEMP(#775): PR runs paused while the Windows build is brought up step
+  # by step in windows-bringup.yml; revert this commit to restore them.
+  # pull_request:
+  #   types: [ opened, synchronize, reopened, ready_for_review ]
   workflow_dispatch:
     inputs:
       pr_number:
