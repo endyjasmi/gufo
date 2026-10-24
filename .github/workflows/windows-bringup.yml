@@ -1,0 +1,149 @@
+name: Windows bring-up
+
+# TEMP(#775): the one job this PR runs while the Windows build is brought up
+# step by step. Step 1: build gufo on a hosted runner and run --version and
+# --help. The paused workflows return once this is where we want it.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-bringup-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows build (step 1)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # From AMD's official index (about six weeks of nightlies).
+      SDK_TARBALL: therock-dist-windows-gfx1151-10.2.0a20261022.tar.gz
+      # Forward slashes: CMake reads backslashes in -D values as escapes.
+      SDK_ROOT: C:/TheRock/build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore TheRock SDK archive
+        id: therock-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\therock-archive
+          key: gufo-therock-v2-${{ env.SDK_TARBALL }}
+
+      - name: Install the TheRock SDK
+        id: sdk
+        run: |
+          $archive = "$env:RUNNER_TEMP\therock-archive\$env:SDK_TARBALL"
+          New-Item -ItemType Directory -Force -Path (Split-Path $archive), $env:SDK_ROOT | Out-Null
+          if (-not (Test-Path $archive)) {
+            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" `
+              "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+            if ($LASTEXITCODE -ne 0) { throw "cannot download $env:SDK_TARBALL" }
+            Move-Item "$archive.part" $archive
+          }
+          "archive=ready" >> $env:GITHUB_OUTPUT
+          tar -xzf $archive -C $env:SDK_ROOT
+          if ($LASTEXITCODE -ne 0) { throw "cannot unpack $env:SDK_TARBALL" }
+          # CMake cannot find HIP by itself in TheRock's layout.
+          "HIP_PATH=$env:SDK_ROOT" >> $env:GITHUB_ENV
+          ($env:SDK_ROOT -replace '/', '\') + '\bin' >> $env:GITHUB_PATH
+
+      - name: Patch the HIP SDK math headers
+        run: python tools/windows/patch_sdk_math.py $env:SDK_ROOT
+
+      - name: Set up the MSVC x64 environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio installation with the x64 VC toolset was found' }
+          $bat = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $before = @{}
+          foreach ($line in (cmd /s /c 'set')) {
+            if ($line -match '^([^=]+)=(.*)$') { $before[$Matches[1]] = $Matches[2] }
+          }
+          foreach ($line in (cmd /s /c "call `"$bat`" >NUL 2>&1 && set")) {
+            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+            if ($before.ContainsKey($Matches[1]) -and $before[$Matches[1]] -eq $Matches[2]) { continue }
+            "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+          }
+
+      - name: Install Ninja
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja' }
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-
+            gufo-vcpkg-v4-${{ runner.os }}-
+
+      - name: Prepare vcpkg
+        run: |
+          git clone --quiet https://github.com/microsoft/vcpkg.git C:\vcpkg-gufo
+          if ($LASTEXITCODE -ne 0) { throw 'cannot clone vcpkg' }
+          & C:\vcpkg-gufo\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'cannot bootstrap vcpkg' }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\vcpkg-archives" | Out-Null
+          "VCPKG_ROOT=C:\vcpkg-gufo" >> $env:GITHUB_ENV
+          "VCPKG_DEFAULT_BINARY_CACHE=$env:RUNNER_TEMP\vcpkg-archives" >> $env:GITHUB_ENV
+
+      - name: Configure
+        id: configure
+        run: |
+          cmake --preset windows-release "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+
+      - name: Build
+        run: |
+          cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+
+      - name: Run gufo --version and --help
+        run: |
+          $gufo = 'build\windows-release\gufo.exe'
+          if (-not (Test-Path $gufo)) { throw "$gufo was not built" }
+          & $gufo --version
+          if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
+          & $gufo --help
+          if ($LASTEXITCODE -ne 0) { throw 'gufo --help failed' }
+
+      - name: Upload configure logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-bringup-logs-${{ github.run_attempt }}
+          path: |
+            build/windows-release/CMakeFiles/CMakeConfigureLog.yaml
+            build/windows-release/vcpkg-manifest-install.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Save TheRock SDK archive
+        if: always() && steps.therock-cache.outputs.cache-hit != 'true' && steps.sdk.outputs.archive == 'ready'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\therock-archive
+          key: gufo-therock-v2-${{ env.SDK_TARBALL }}
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.configure.outcome != 'skipped'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
