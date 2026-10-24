@@ -99,12 +99,18 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->base_offset_ = file_offset;
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
-  // When the platform cannot provide it, rows read through the borrowed
-  // descriptor's buffered handle.
+  // When the platform cannot provide it, rows read buffered through a
+  // duplicate: the table always owns the handle it closes.
   t->file_ = platform::ReopenUnbuffered(file);
   t->direct_ = t->file_ != platform::kInvalidFile;
   if (!t->direct_) {
-    t->file_ = file;
+    t->file_ = platform::DuplicateFile(file);
+  }
+  if (t->file_ == platform::kInvalidFile) {
+    if (error_msg != nullptr) {
+      *error_msg = "cannot open bound n-gram table";
+    }
+    return nullptr;
   }
   for (std::size_t i = 0; i < kWorkers; ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });

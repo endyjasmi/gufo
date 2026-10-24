@@ -81,8 +81,8 @@ public:
   NgramTable& operator=(const NgramTable&) = delete;
 
   /// Borrows the bound GGUF descriptor during Open; retains its own handle,
-  /// unbuffered where the platform allows it and through the borrowed
-  /// descriptor otherwise.
+  /// unbuffered where the platform allows it and a buffered duplicate
+  /// otherwise.
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
       platform::PlatformFile file, std::uint64_t file_offset,
       std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
