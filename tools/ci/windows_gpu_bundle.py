@@ -55,6 +55,10 @@ def select(build, tier):
         labels = set(props.get('LABELS', []))
         if not command or EXTERNAL in labels or props.get('ENVIRONMENT'):
             continue
+        # A bare name is a target this platform does not define (gufo on
+        # Windows); ctest resolves defined targets to absolute paths.
+        if not Path(command[0]).is_absolute():
+            continue
         if tier == 'smoke' and test['name'] not in SMOKE:
             continue
         # Arguments naming source or build files would not exist in the bundle.

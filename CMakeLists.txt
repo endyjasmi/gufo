@@ -634,7 +634,8 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/check_pr_title_test.py)
   set_tests_properties(check_pr_title_test PROPERTIES LABELS "cpu;docs" TIMEOUT 30)
 
-  if(ENGINE_ENABLE_HIP)
+  # It reads the gufo binary, which Windows does not build yet.
+  if(ENGINE_ENABLE_HIP AND TARGET gufo)
     # A compiler update can make a kernel spill with no source change. Clang 23
     # increased the scratch of the Q8 prefill GEMM from 0 to 480 bytes. This
     # test fails if a kernel uses more scratch than the baseline allows. It
