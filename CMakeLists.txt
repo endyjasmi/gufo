@@ -486,7 +486,7 @@ if (BUILD_TESTING)
   set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
 
   add_executable(trace_test tests/cli/trace_test.cpp)
-  target_link_libraries(trace_test PRIVATE gufo_logging)
+  target_link_libraries(trace_test PRIVATE gufo_logging gufo_platform)
   add_test(NAME trace_test COMMAND trace_test)
   set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
 

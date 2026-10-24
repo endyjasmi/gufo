@@ -29,6 +29,7 @@
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/platform/env.hpp"
 #include "src/core/platform/net.hpp"
 
 namespace {
@@ -3342,7 +3343,7 @@ int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
   // tint around the level tag.
-  ::setenv("NO_COLOR", "1", 1);
+  gufo::platform::SetEnv("NO_COLOR", "1");
   TestRequestLogging();
   TestContentTrace();
   TestQuietTiersSuppressLifecycle();

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/env.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 
@@ -2524,7 +2525,7 @@ int main() {
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
-  ::setenv("NO_COLOR", "1", 1);
+  gufo::platform::SetEnv("NO_COLOR", "1");
   TestInPassStableCheckpoint();
   TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();
