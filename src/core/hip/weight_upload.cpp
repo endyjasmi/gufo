@@ -49,12 +49,16 @@ bool ReadFully(platform::PlatformFile fd, void* buffer, std::uint64_t offset,
 struct WeightUpload::State {
   struct Shard {
     platform::PlatformFile fd{platform::kInvalidFile};
-    platform::PlatformFile direct_fd{platform::kInvalidFile};
     std::uint64_t size{0};
   };
   struct Slot {
     void* buffer{nullptr};
     hipStream_t stream{nullptr};
+    // One unbuffered description per reader, reopened when the reader moves
+    // to another shard: independent file objects keep concurrent readers off
+    // one synchronous handle.
+    platform::PlatformFile direct{platform::kInvalidFile};
+    std::uint32_t direct_shard{0xffffffffu};
   };
   struct Task {
     std::uint32_t shard;
@@ -84,13 +88,13 @@ struct WeightUpload::State {
     // caller's destinations can be freed, even on a failed upload.
     readers.clear();
     for (auto& slot : slots) {
+      platform::CloseFile(slot.direct);
       if (slot.stream != nullptr) {
         (void)hipStreamDestroy(slot.stream);
       }
     }
     for (const auto& shard : shards) {
       platform::CloseFile(shard.fd);
-      platform::CloseFile(shard.direct_fd);
     }
   }
 
@@ -116,12 +120,23 @@ struct WeightUpload::State {
     const void* payload = slot.buffer;
     std::error_code ec;
     bool read = false;
-    if (platform::FileValid(shard.direct_fd)) {
+    // Each reader keeps an unbuffered description of the shard it reads, so
+    // concurrent readers never queue on one synchronous handle: Windows
+    // serializes synchronous I/O per file object, not per process.
+    if (slot.direct_shard != task.shard) {
+      platform::CloseFile(slot.direct);
+      slot.direct = platform::kInvalidFile;
+      slot.direct_shard = task.shard;
+    }
+    if (!platform::FileValid(slot.direct)) {
+      slot.direct = platform::ReopenUnbuffered(shard.fd);
+    }
+    if (platform::FileValid(slot.direct)) {
       const auto begin = task.offset & ~(kAlignment - 1);
       const auto skip = static_cast<std::size_t>(task.offset - begin);
       const auto length =
           (skip + task.size + kAlignment - 1) & ~(kAlignment - 1);
-      read = ReadFully(shard.direct_fd, slot.buffer, begin, length,
+      read = ReadFully(slot.direct, slot.buffer, begin, length,
                        skip + task.size, ec);
       payload = static_cast<const char*>(slot.buffer) + skip;
       if (!read && ec != std::errc::invalid_argument &&
@@ -130,7 +145,7 @@ struct WeightUpload::State {
       }
     }
     if (!read) {
-      // Some filesystems accept O_DIRECT at open but reject aligned reads.
+      // Some filesystems accept unbuffered opens but reject aligned reads.
       ec = {};
       if (!ReadFully(shard.fd, slot.buffer, task.offset, task.size, task.size,
                      ec)) {
@@ -197,9 +212,6 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
       return nullptr;
     }
     shard.size = info.size;
-    // Reopening the retained handle creates an independent unbuffered file
-    // description without resolving the original, replaceable pathname.
-    shard.direct_fd = platform::ReopenUnbuffered(shard.fd);
   }
   for (auto& slot : s.slots) {
     if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=

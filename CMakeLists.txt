@@ -158,10 +158,16 @@ add_library(gufo_platform STATIC
   src/core/platform/shutdown_signal.cpp
   src/core/platform/publish.cpp
   src/core/platform/os_info.cpp
-  src/core/platform/fs_posix.cpp
-  src/core/platform/pages_posix.cpp
-  src/core/platform/page_pin_linux.cpp)
+  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/fs_posix.cpp>"
+  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/pages_posix.cpp>"
+  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/page_pin_linux.cpp>"
+  "$<$<PLATFORM_ID:Windows>:src/core/platform/fs_windows.cpp>"
+  "$<$<PLATFORM_ID:Windows>:src/core/platform/pages_windows.cpp>"
+  "$<$<PLATFORM_ID:Windows>:src/core/platform/page_pin_windows.cpp>")
 target_link_libraries(gufo_platform PUBLIC Threads::Threads)
+if (WIN32)
+  target_link_libraries(gufo_platform PUBLIC ${GUFO_PLATFORM_LIBS})
+endif()
 
 add_library(gufo_core STATIC
   src/core/image.cpp
@@ -911,7 +917,8 @@ if (BUILD_TESTING)
     LABELS "cpu;platform")
   add_executable(platform_fs_test
     tests/core/platform_fs_test.cpp
-    src/core/platform/fs_posix.cpp
+    "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/fs_posix.cpp>"
+    "$<$<PLATFORM_ID:Windows>:src/core/platform/fs_windows.cpp>"
     src/core/platform/mapped_file.cpp)
   add_test(NAME platform_fs_test COMMAND platform_fs_test)
   set_tests_properties(platform_fs_test PROPERTIES LABELS "cpu;platform")
