@@ -14,10 +14,10 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace {
 
@@ -37,29 +37,6 @@ void Expect(bool condition, const std::string& message) {
     std::exit(1);
   }
 }
-
-struct TemporaryDirectory {
-  TemporaryDirectory() {
-    const auto base = std::filesystem::temp_directory_path();
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      std::error_code error;
-      const auto candidate =
-          base /
-          ("gufo-h3-runtime-" + std::to_string(gufo::platform::ProcessId()) +
-           "-" + std::to_string(attempt));
-      if (std::filesystem::create_directory(candidate, error)) {
-        path = candidate;
-        return;
-      }
-    }
-    throw std::runtime_error("failed to create temporary directory");
-  }
-  ~TemporaryDirectory() {
-    std::error_code error;
-    std::filesystem::remove_all(path, error);
-  }
-  std::filesystem::path path;
-};
 
 struct TensorSpec {
   std::string name;
@@ -322,8 +299,8 @@ void TestStrictJson() {
 }
 
 void TestInspectionAndInventory() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   Expect(inventory.tensors().size() == 5, "all fixture tensors inspected");
   Expect(inventory.shards().size() == 4, "all fixture shards inspected");
@@ -340,8 +317,8 @@ void TestInspectionAndInventory() {
 }
 
 void TestUnknownArchitectureRejected() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   fixture.WriteIndexes(true);
   std::string error;
   const auto inventory = ModelInventory::Inspect(
@@ -353,8 +330,8 @@ void TestUnknownArchitectureRejected() {
 }
 
 void TestPinnedManifestRequiredByDefault() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   std::string error;
   const auto inventory = ModelInventory::Inspect(
       fixture.root, fixture.root / "source-manifest.json", &error);
@@ -366,8 +343,8 @@ void TestPinnedManifestRequiredByDefault() {
 }
 
 void TestDeviceCopyAndMappedResidency() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   FakeBackend backend;
   {
@@ -409,8 +386,8 @@ void TestDeviceCopyAndMappedResidency() {
 }
 
 void TestFailureInjectionIsTransactional() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   for (const ResidencyMode mode :
        {ResidencyMode::kMappedReadOnly, ResidencyMode::kDeviceCopy}) {
@@ -451,8 +428,8 @@ void TestFailureInjectionIsTransactional() {
 }
 
 void TestCancellationAndPhasePeaks() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   FakeBackend backend;
   CancellationToken cancelled;

@@ -1,5 +1,8 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -22,7 +25,7 @@
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
-#include "src/core/platform/os_info.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace {
 
@@ -54,40 +57,6 @@ void Expect(bool condition, std::string_view message) {
     std::exit(1);
   }
 }
-
-class TemporaryDirectory {
-public:
-  TemporaryDirectory() {
-    const auto base = std::filesystem::temp_directory_path();
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      std::error_code error;
-      const auto candidate =
-          base / ("gufo-continuation-disk-" +
-                  std::to_string(gufo::platform::ProcessId()) + "-" +
-                  std::to_string(attempt));
-      if (std::filesystem::create_directory(candidate, error)) {
-        path_ = candidate;
-        return;
-      }
-    }
-    throw std::runtime_error("failed to create temporary directory");
-  }
-
-  ~TemporaryDirectory() {
-    std::error_code error;
-    std::filesystem::remove_all(path_, error);
-  }
-
-  TemporaryDirectory(const TemporaryDirectory&) = delete;
-  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-  [[nodiscard]] const std::filesystem::path& path() const noexcept {
-    return path_;
-  }
-
-private:
-  std::filesystem::path path_;
-};
 
 template<typename Integer>
 void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
@@ -370,7 +339,7 @@ void TestSha256KnownVector() {
   Expect(complete == incremental.Finish(),
          "reading a prefix digest does not consume incremental state");
 
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const auto path = directory.path() / "artifact.gguf";
   {
     std::ofstream output(path, std::ios::binary);
@@ -382,7 +351,7 @@ void TestSha256KnownVector() {
 }
 
 void TestRestartRestoreAndCompatibilityIdentity() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner writer("artifact-A", "fake-old-executable");
   auto snapshot = MakeSnapshot(writer, 0x123456789ABCDEF0ULL, 3);
   {
@@ -415,7 +384,7 @@ void TestRestartRestoreAndCompatibilityIdentity() {
 }
 
 void TestLongestPrefixAndForcedHashCollision() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("collision-model");
   const auto forced_collision = [](std::span<const std::uint8_t>) {
     return std::string(64, '0');
@@ -451,7 +420,7 @@ void TestLongestPrefixAndForcedHashCollision() {
 }
 
 void TestCorruptionBecomesDeterministicMissAndRemoval() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("corruption-model");
   std::vector<ContinuationDiskEvent> events;
   ContinuationDiskStore store(
@@ -504,7 +473,7 @@ void TestCorruptionBecomesDeterministicMissAndRemoval() {
 }
 
 void TestByteAndStagingLimits() {
-  TemporaryDirectory staging_directory;
+  TemporaryDirectory staging_directory("gufo-continuation-disk");
   const FakeRunner runner("limits");
   const std::size_t file_bytes = ExpectedFileBytes(6, 2);
   auto snapshot = MakeSnapshot(runner, 1, 2);
@@ -515,7 +484,7 @@ void TestByteAndStagingLimits() {
              staging_limited.entry_count() == 0,
          "full file image must fit the bounded staging allocation");
 
-  TemporaryDirectory byte_directory;
+  TemporaryDirectory byte_directory("gufo-continuation-disk");
   ContinuationDiskStore byte_limited(
       StoreOptions(byte_directory.path(), file_bytes - 1, 4096));
   Expect(!SaveTokens(byte_limited, runner, {1, 2}, *snapshot).stored &&
@@ -524,14 +493,14 @@ void TestByteAndStagingLimits() {
 }
 
 void TestAutomaticStagingAndAdmissionDiagnostics() {
-  TemporaryDirectory default_directory;
+  TemporaryDirectory default_directory("gufo-continuation-disk");
   ContinuationDiskStore defaults({.directory = default_directory.path()});
   Expect(defaults.capacity_bytes() == std::size_t{8} * 1024U * 1024U * 1024U &&
              defaults.staging_capacity_bytes() > kDiskHeaderBytes &&
              defaults.staging_capacity_bytes() <= defaults.capacity_bytes(),
          "defaults bound RAM staging by available RAM and disk retention");
 
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   std::vector<ContinuationDiskEvent> events;
   const FakeRunner runner("automatic");
   ContinuationDiskStore store(
@@ -561,7 +530,7 @@ void TestAutomaticStagingAndAdmissionDiagnostics() {
              events.back().reason == ContinuationDiskEventReason::kByteCapacity,
          "disk retention rejection is distinguished from staging pressure");
 
-  TemporaryDirectory explicit_directory;
+  TemporaryDirectory explicit_directory("gufo-continuation-disk");
   ContinuationDiskStore explicit_limit(
       StoreOptions(explicit_directory.path(), 4096, 256),
       [&](const auto& event) { events.push_back(event); });
@@ -574,7 +543,7 @@ void TestAutomaticStagingAndAdmissionDiagnostics() {
 }
 
 void TestSmallerStagingPreservesExistingFiles() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("staging-restart");
   const auto file_bytes = ExpectedFileBytes(15, 2);
   {
@@ -621,7 +590,7 @@ void TestSmallerStagingPreservesExistingFiles() {
 }
 
 void TestLruEvictionUsesActualFileBytes() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("12345678");
   const std::size_t entry_bytes = ExpectedFileBytes(8, 2);
   ContinuationDiskStore store(
@@ -655,7 +624,7 @@ void TestLruEvictionUsesActualFileBytes() {
 }
 
 void TestAtomicPublicationAndPrivatePermissions() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const auto orphan = directory.path() / ".tmp-orphan";
   {
     std::ofstream output(orphan, std::ios::binary);
@@ -686,7 +655,7 @@ void TestAtomicPublicationAndPrivatePermissions() {
 }
 
 void TestStartupRejectsUnsafeAndInvalidFiles() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("startup-valid");
   const FakeRunner incompatible("startup-incompatible");
   std::filesystem::path truncated_file;
@@ -789,7 +758,7 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
 }
 
 void TestRootSymlinkIsRejected() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const auto target = directory.path() / "target";
   const auto link = directory.path() / "cache-link";
   std::filesystem::create_directory(target);
@@ -804,7 +773,7 @@ void TestRootSymlinkIsRejected() {
 }
 
 void TestConcurrentCallersRemainBoundedAndExact() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("concurrent");
   constexpr std::size_t kThreadCount = 8;
   ContinuationDiskStore store(
@@ -838,7 +807,7 @@ void TestConcurrentCallersRemainBoundedAndExact() {
 }
 
 void TestConcurrentStoreInstancesPublishSafely() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("multi-process");
   {
     ContinuationDiskStore first(StoreOptions(directory.path()));
@@ -871,7 +840,7 @@ void TestConcurrentStoreInstancesPublishSafely() {
 }
 
 void TestStartupPreservesActivePublisher() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   auto runner = std::make_shared<FakeRunner>("startup-publisher");
   std::binary_semaphore entered(0), release(0);
   const auto orphan = directory.path() / ".tmp-orphan";
@@ -916,7 +885,7 @@ void TestStartupPreservesActivePublisher() {
 }
 
 void TestSharedPrefixBoundariesAndExactDedup() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   const FakeRunner runner("shared-prefix-model");
   ContinuationDiskStore store(StoreOptions(directory.path()), {});
 
@@ -976,7 +945,7 @@ void TestSharedPrefixBoundariesAndExactDedup() {
 }
 
 void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   auto runner = std::make_shared<FakeRunner>("async-store");
   std::binary_semaphore entered(0), release(0);
   const auto bytes = ExpectedFileBytes(
@@ -1046,7 +1015,7 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
 }
 
 void TestIndexedPrefixLookup() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   FakeRunner runner("prefix-index");
   ContinuationDiskStore store(StoreOptions(directory.path()));
   // Many independent branches, with terminal prefixes inside compressed edges.
@@ -1076,7 +1045,7 @@ void TestIndexedPrefixLookup() {
 }  // namespace
 
 void TestImageIdentitySurvivesRestart() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   FakeRunner runner("image-cache-test");
   const std::vector<TextRunnerToken> prompt{1, 248056, 3};
   const std::vector<std::uint8_t> image_a{1, 2}, image_b{1, 3};
@@ -1108,7 +1077,7 @@ void TestImageIdentitySurvivesRestart() {
 
 void TestAppendedImagePrefixesSurviveRestart() {
   using gufo::server::ContinuationInputPrefix;
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   FakeRunner runner("image-prefix-cache");
   const std::vector<TextRunnerToken> prompt{1, 2, 3, 248056, 4, 5, 248056, 6};
   const auto tokens = std::span<const TextRunnerToken>(prompt);
@@ -1152,7 +1121,7 @@ void TestAppendedImagePrefixesSurviveRestart() {
 }
 
 void TestMinimumCheckpointStep() {
-  TemporaryDirectory directory;
+  TemporaryDirectory directory("gufo-continuation-disk");
   auto runner = std::make_shared<FakeRunner>("min-step-model");
   std::vector<ContinuationDiskEvent> events;
   auto options = StoreOptions(directory.path());
@@ -1194,7 +1163,7 @@ void TestMinimumCheckpointStep() {
       "shared prefixes are exempt from the step");
 
   options.min_checkpoint_step_tokens = 0;
-  TemporaryDirectory ungated_directory;
+  TemporaryDirectory ungated_directory("gufo-continuation-disk");
   options.directory = ungated_directory.path();
   ContinuationDiskStore ungated(options);
   Expect(

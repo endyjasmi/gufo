@@ -466,4 +466,9 @@ bool OwnerOnly(const FileInfo&, std::uint32_t) noexcept {
   return true;
 }
 
+bool RestrictToOwner(const std::filesystem::path&) noexcept {
+  // The user's temporary directory already carries per-user ACLs.
+  return true;
+}
+
 }  // namespace gufo::platform

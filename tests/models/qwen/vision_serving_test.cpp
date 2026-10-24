@@ -10,9 +10,9 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/image.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace {
 using namespace gufo;
@@ -545,29 +545,9 @@ int main(int argc, char** argv) {
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
-    const auto cache_base = std::filesystem::temp_directory_path();
-    std::filesystem::path cache_directory;
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      std::error_code error;
-      const auto candidate =
-          cache_base /
-          ("gufo-vision-cache-" + std::to_string(gufo::platform::ProcessId()) +
-           "-" + std::to_string(attempt));
-      if (std::filesystem::create_directory(candidate, error)) {
-        cache_directory = candidate;
-        break;
-      }
-    }
-    Require(!cache_directory.empty(), "cannot create test cache");
-    struct Cleanup {
-      std::filesystem::path path;
-      ~Cleanup() {
-        std::error_code ignored;
-        std::filesystem::remove_all(path, ignored);
-      }
-    } cleanup{cache_directory};
+    TemporaryDirectory cache("gufo-vision-cache");
     server::TextDiskCacheConfig cache{
-        .directory = cleanup.path,
+        .directory = cache.path(),
         .capacity_bytes = std::size_t{2} << 30,
         .staging_capacity_bytes = std::size_t{512} << 20,
         .model_artifact_fingerprint = core::GgufIdentityHex(*reader)};

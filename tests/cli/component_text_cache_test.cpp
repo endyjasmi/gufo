@@ -18,48 +18,13 @@
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "tests/cache/fake_adapter.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 using namespace gufo;
 using namespace gufo::server;
 using namespace gufo::cache::testing;
 namespace {
-
-// A unique directory under the temporary path, removed when the test ends.
-class TemporaryDirectory {
-public:
-  explicit TemporaryDirectory(std::string name) {
-    const auto base = std::filesystem::temp_directory_path();
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      std::error_code error;
-      const auto candidate =
-          base /
-          (std::move(name) + "-" + std::to_string(gufo::platform::ProcessId()) +
-           "-" + std::to_string(attempt));
-      if (std::filesystem::create_directory(candidate, error)) {
-        path_ = candidate;
-        return;
-      }
-    }
-    throw std::runtime_error("failed to create component cache directory");
-  }
-
-  ~TemporaryDirectory() {
-    std::error_code error;
-    std::filesystem::remove_all(path_, error);
-  }
-
-  TemporaryDirectory(const TemporaryDirectory&) = delete;
-  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-  [[nodiscard]] const std::filesystem::path& path() const noexcept {
-    return path_;
-  }
-
-private:
-  std::filesystem::path path_;
-};
 
 struct State final : TextRunnerState {
   FakeAdapter& adapter;
