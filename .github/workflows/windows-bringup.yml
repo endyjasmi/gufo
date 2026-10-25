@@ -203,6 +203,12 @@ jobs:
           $build = 'build\windows-release'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item "$build\gufo.exe", "$build\*.dll", "$env:SDK_ROOT\bin\hipInfo.exe" $dist
+          # The weight-free GPU tests the build step compiled.
+          foreach ($test in 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test') {
+            $exe = Get-ChildItem $build -Recurse -Filter "$test.exe" | Select-Object -First 1
+            if (-not $exe) { throw "$test.exe was not built" }
+            Copy-Item $exe.FullName $dist
+          }
           foreach ($dir in 'rocblas', 'hipblaslt') {
             if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
           }
@@ -282,6 +288,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
           .\windows-gufo\gufo.exe diagnose
           if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
+
+      # Weight-free device probes: real HIP kernels and allocations, so a
+      # correct-but-stalled SDK or a missing runtime piece shows here.
+      - name: Probe the device without weights
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gufo = '.\windows-gufo\gufo.exe'
+          & $gufo diagnose --json --output diagnose.json
+          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose --json failed' }
+          $report = Get-Content diagnose.json -Raw | ConvertFrom-Json
+          "JSON report parsed: $($report.PSObject.Properties.Name -join ', ')"
+          foreach ($benchmark in 'bandwidth', 'allocation') {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            & $gufo diagnose --benchmark $benchmark
+            if ($LASTEXITCODE -ne 0) { throw "gufo diagnose --benchmark $benchmark failed" }
+            "{0}: {1:N1} s" -f $benchmark, $watch.Elapsed.TotalSeconds
+          }
+          foreach ($test in 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test') {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            & ".\windows-gufo\$test.exe"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed with exit code $LASTEXITCODE" }
+            "{0}: {1:N1} s" -f $test, $watch.Elapsed.TotalSeconds
+          }
 
       - name: Remove the bundle
         if: always()
