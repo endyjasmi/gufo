@@ -219,6 +219,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$dist\tests\functional" | Out-Null
           Copy-Item tests\functional\family_smoke.py, tests\functional\devlab.json "$dist\tests\functional"
           Copy-Item tests\fixtures\embedding_gemma2 "$dist\tests\fixtures" -Recurse
+          New-Item -ItemType Directory -Force -Path "$dist\tests\functional\fixtures" | Out-Null
+          Copy-Item tests\functional\fixtures\audio "$dist\tests\functional\fixtures" -Recurse
           foreach ($dir in 'rocblas', 'hipblaslt') {
             if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
           }
@@ -329,7 +331,8 @@ jobs:
       # this runner's link decides which families fit.
       - name: Download the model weights
         env:
-          GUFO_ASSETS: embedding
+          # Flash-Next (107 GiB) and DeepSeek V4 (81 GiB) are deferred.
+          GUFO_ASSETS: embedding,asr,tts-base,qwen27
           HF_HUB_DISABLE_XET: '0'
           HF_XET_HIGH_PERFORMANCE: '1'
           HF_HUB_DOWNLOAD_TIMEOUT: '120'
@@ -369,12 +372,24 @@ jobs:
       - name: Run the per-family model smoke checks
         run: |
           $ErrorActionPreference = 'Stop'
-          python windows-gufo\tests\functional\family_smoke.py embedding `
-            --binary windows-gufo\gufo.exe --model "$env:RUNNER_TEMP\models\embedding" `
-            --log "$env:RUNNER_TEMP\embedding-server.log"
-          if ($LASTEXITCODE -ne 0) { throw 'embedding smoke check failed' }
+          $models = "$env:RUNNER_TEMP\models"
+          $smoke = 'windows-gufo\tests\functional\family_smoke.py'
+          $common = @('--binary', 'windows-gufo\gufo.exe', '--log-dir', "$env:RUNNER_TEMP\smoke-logs")
+          $checks = [ordered]@{
+            embedding = @('embedding', '--model', "$models\embedding")
+            asr       = @('asr', '--model', "$models\asr")
+            tts       = @('tts', '--model', "$models\tts-base", '--asr-model', "$models\asr")
+            qwen27    = @('llm', '--model', "$models\qwen27\Qwen3.8-27B-UD-Q4_K_XL.gguf")
+          }
+          $failed = @()
+          foreach ($name in $checks.Keys) {
+            "=== $name"
+            python $smoke @($checks[$name]) @common
+            if ($LASTEXITCODE -ne 0) { $failed += $name }
+          }
+          if ($failed) { throw "smoke checks failed: $($failed -join ', ')" }
 
       - name: Remove the bundle and the weights
         if: always()
         run: |
-          Remove-Item -Recurse -Force windows-gufo, "$env:RUNNER_TEMP\models", "$env:RUNNER_TEMP\huggingface", "$env:RUNNER_TEMP\hf-cli" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force windows-gufo, "$env:RUNNER_TEMP\models", "$env:RUNNER_TEMP\huggingface", "$env:RUNNER_TEMP\hf-cli", "$env:RUNNER_TEMP\smoke-logs" -ErrorAction SilentlyContinue
