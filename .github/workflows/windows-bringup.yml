@@ -139,6 +139,17 @@ jobs:
           "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
           "$PWD\build\windows-release" >> $env:GITHUB_PATH
 
+      # Experiment: compile one object first, so ccache's verdict shows early.
+      - name: Probe ccache on one object
+        run: |
+          $db = Get-Content build\windows-release\compile_commands.json -Raw | ConvertFrom-Json
+          $entry = $db | Where-Object { $_.file -match 'src[\\/]core[\\/]platform[\\/].*\.cpp$' } | Select-Object -First 1
+          "Probe: $($entry.file) -> $($entry.output)"
+          "Command: $($entry.command)"
+          ninja -C build\windows-release $entry.output
+          Get-Content "$env:RUNNER_TEMP\ccache.log" | Select-String -Pattern 'unsupported|Command line|Result:|Compiler type' | ForEach-Object Line
+          ccache --show-stats
+
       - name: Build
         run: |
           cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target gufo gufo-server component_text_cache_test qwen38_flash_next_ngram_test gpu_queues_test bandwidth_test allocation_benchmark_test
