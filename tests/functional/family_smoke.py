@@ -59,7 +59,8 @@ def cosine(a, b):
 
 
 def check_embedding(url, model):
-    golden = json.loads((FIXTURES / "embedding_gemma2" / "embedding_golden.json").read_text())
+    golden = json.loads((FIXTURES / "embedding_gemma2" / "embedding_golden.json")
+                        .read_text(encoding="utf-8"))
     cases = golden["cases"]
     result = request(url + "/v1/embeddings", {
         "model": model, "input": [case["text"] for case in cases], "encoding_format": "float"})
@@ -97,7 +98,7 @@ def main():
                "--served-model-name", public_model, "--host", "127.0.0.1", "--port", str(port)]
     log_path = args.log or Path(f"{args.family}-server.log")
     print("Starting:", " ".join(command), flush=True)
-    with log_path.open("w") as log:
+    with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
             started = time.monotonic()
@@ -109,7 +110,7 @@ def main():
         except Exception as error:
             print(f"FAIL {args.family}: {error}", file=sys.stderr)
             log.flush()
-            print(log_path.read_text(errors="replace")[-4000:], file=sys.stderr)
+            print(log_path.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
             return 1
         finally:
             process.terminate()
