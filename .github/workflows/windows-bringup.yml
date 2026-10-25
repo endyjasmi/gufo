@@ -194,6 +194,34 @@ jobs:
           ctest --test-dir build/windows-release --output-on-failure --no-tests=error --timeout 60 -R '^(qwen38_flash_next\.ngram|gpu_queues_test|bandwidth_test|allocation_benchmark_test)$'
           if ($LASTEXITCODE -ne 0) { throw 'diagnostics and ngram tests failed' }
 
+      # Everything gufo.exe loads, so the Devlab runner downloads one artifact
+      # and nothing else: the staged HIP runtime with its rocBLAS/hipBLASLt
+      # kernel directories, the vcpkg DLLs, the MSVC CRT and LLVM OpenMP.
+      - name: Pack gufo for the Devlab runner
+        run: |
+          $dist = "$env:RUNNER_TEMP\windows-gufo"
+          $build = 'build\windows-release'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "$build\gufo.exe", "$build\*.dll", "$env:SDK_ROOT\bin\hipInfo.exe" $dist
+          foreach ($dir in 'rocblas', 'hipblaslt') {
+            if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
+          }
+          Copy-Item "$build\vcpkg_installed\x64-windows-release\bin\*.dll" $dist -Force
+          $redist = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory |
+            Where-Object { $_.Name -like 'Microsoft.VC*.CRT' -or $_.Name -like 'Microsoft.VC*.OpenMP.LLVM' }
+          foreach ($dir in $redist) { Copy-Item "$($dir.FullName)\*.dll" $dist -Force }
+          $files = Get-ChildItem $dist -Recurse -File
+          "Bundle: {0} files, {1:N0} MiB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB) |
+            Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload gufo for the Devlab runner
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-gufo-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\windows-gufo
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Upload configure logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -225,3 +253,36 @@ jobs:
         with:
           path: ${{ runner.temp }}\vcpkg-archives
           key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  devlab:
+    name: Windows Devlab diagnose (step 2)
+    needs: build
+    if: github.repository == 'gufo-org/gufo'
+    runs-on: [ windows, strix-halo, devlab-dispatch ]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    # Ephemeral runner behind a slow link with no SDK: it downloads the build
+    # job's bundle only, no checkout, and runs gufo from it.
+    steps:
+      - name: Download gufo
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-gufo-${{ github.run_attempt }}
+          path: windows-gufo
+
+      - name: Run hipInfo, gufo --version and gufo diagnose
+        run: |
+          $ErrorActionPreference = 'Stop'
+          (Get-CimInstance Win32_VideoController).Name
+          .\windows-gufo\hipInfo.exe
+          if ($LASTEXITCODE -ne 0) { throw 'hipInfo failed' }
+          .\windows-gufo\gufo.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
+          .\windows-gufo\gufo.exe diagnose
+          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
+
+      - name: Remove the bundle
+        if: always()
+        run: Remove-Item -Recurse -Force windows-gufo -ErrorAction SilentlyContinue
