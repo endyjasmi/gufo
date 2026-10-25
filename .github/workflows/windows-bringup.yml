@@ -106,6 +106,7 @@ jobs:
           "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
           "CCACHE_COMPILERCHECK=string:$env:SDK_TARBALL" >> $env:GITHUB_ENV
           "CCACHE_MAXSIZE=2G" >> $env:GITHUB_ENV
+          "CCACHE_LOGFILE=$env:RUNNER_TEMP\ccache.log" >> $env:GITHUB_ENV
           ccache --zero-stats
 
       - name: Restore vcpkg binary cache
@@ -149,6 +150,10 @@ jobs:
         if: always() && steps.configure.outcome == 'success'
         run: |
           ccache --show-stats --verbose
+          Select-String -Path "$env:RUNNER_TEMP\ccache.log" -Pattern 'unsupported' |
+            ForEach-Object { $_.Line -replace '^\[[^\]]*\]\s*', '' } | Group-Object | Sort-Object Count -Descending |
+            Select-Object -First 10 | ForEach-Object { "{0} x {1}" -f $_.Count, $_.Name }
+          Select-String -Path "$env:RUNNER_TEMP\ccache.log" -Pattern 'Command line:' | Select-Object -First 1 | ForEach-Object Line
           $rows = Get-Content build\windows-release\.ninja_log | Select-Object -Skip 1 | ForEach-Object {
             $f = $_ -split "`t"
             $kind = if ($f[3] -match '\.hip\.obj$') { 'hip' } elseif ($f[3] -match '\.(c|cc|cpp)\.obj$') { 'c/cxx' } else { 'other' }
