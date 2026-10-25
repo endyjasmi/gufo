@@ -26,6 +26,9 @@ jobs:
     name: Windows build
     runs-on: windows-latest
     timeout-minutes: 120
+    outputs:
+      bundle-id: ${{ steps.bundle.outputs.artifact-id }}
+      bundle-digest: ${{ steps.bundle.outputs.artifact-digest }}
     defaults:
       run:
         shell: pwsh
@@ -204,6 +207,7 @@ jobs:
             Tee-Object -Append $env:GITHUB_STEP_SUMMARY
 
       - name: Upload gufo for the Devlab runner
+        id: bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-gufo-${{ github.run_attempt }}
@@ -252,48 +256,50 @@ jobs:
     if: github.repository == 'gufo-org/gufo' && !github.event.pull_request.draft
     runs-on: [ windows, strix-halo, devlab-dispatch ]
     timeout-minutes: 60
+    permissions:
+      actions: read # the bundle artifact
+      contents: read
     defaults:
       run:
         shell: powershell
     # Ephemeral runner with no SDK or package manager: it downloads the build
     # job's bundle, no checkout, and the pinned model snapshots.
     steps:
-      # On this runner's link a download can end early while the action still
-      # reports success: the bundle is checked against the build job's
-      # manifest and downloaded once more when anything is missing.
+      # The artifact action fetches the zip as one stream and, on this
+      # runner's link, can stop early while reporting success. curl resumes
+      # each dropped or stalled transfer instead, and the zip is checked
+      # against the digest the upload reported.
       - name: Download gufo
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        # A healthy download takes under 3 minutes; a stalled one is cut off.
-        timeout-minutes: 10
-        continue-on-error: true
-        with:
-          name: windows-gufo-${{ github.run_attempt }}
-          path: windows-gufo
-
-      - name: Check the downloaded bundle
-        id: bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_URL: ${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts/${{ needs.build.outputs.bundle-id }}/zip
+          BUNDLE_DIGEST: ${{ needs.build.outputs.bundle-digest }}
         run: |
-          $missing = @()
-          if (Test-Path windows-gufo\bundle-manifest.txt) {
-            foreach ($line in Get-Content windows-gufo\bundle-manifest.txt) {
-              $size, $path = $line -split "`t", 2
-              $file = Get-Item -LiteralPath "windows-gufo\$path" -ErrorAction SilentlyContinue
-              if (-not $file -or $file.Length -ne [int64]$size) { $missing += $path }
-            }
-          } else {
-            $missing += 'bundle-manifest.txt'
+          $ErrorActionPreference = 'Stop'
+          $zip = "$env:RUNNER_TEMP\windows-gufo.zip"
+          Remove-Item -Force $zip -ErrorAction SilentlyContinue
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          for ($attempt = 1; $attempt -le 8; $attempt++) {
+            # A transfer below 1 MiB/s for a minute counts as stalled.
+            curl.exe --fail --location --silent --show-error --connect-timeout 30 `
+              --speed-limit 1048576 --speed-time 60 --continue-at - `
+              --header "Authorization: Bearer $env:GH_TOKEN" --output $zip $env:BUNDLE_URL
+            if ($LASTEXITCODE -eq 0) { break }
+            $have = if (Test-Path $zip) { (Get-Item $zip).Length } else { 0 }
+            "attempt {0}: curl exit {1} with {2:N0} MiB so far; resuming" -f $attempt, $LASTEXITCODE, ($have / 1MB)
+            if ($attempt -eq 8) { throw 'cannot download the gufo bundle' }
+            Start-Sleep -Seconds 5
           }
-          "Incomplete files: $($missing.Count)"
-          $missing | Select-Object -First 10
-          "complete=$(-not $missing)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
-
-      - name: Download gufo again
-        if: steps.bundle.outputs.complete != 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        timeout-minutes: 10
-        with:
-          name: windows-gufo-${{ github.run_attempt }}
-          path: windows-gufo
+          $mib = (Get-Item $zip).Length / 1MB
+          "Bundle: {0:N0} MiB in {1:N0} s" -f $mib, $watch.Elapsed.TotalSeconds
+          $expected = $env:BUNDLE_DIGEST -replace '^sha256:', ''
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($expected -and $sha -ne $expected.ToLowerInvariant()) { throw "bundle sha256 $sha, expected $expected" }
+          if (-not $expected) { '::warning::the upload reported no digest; relying on the bundle manifest' }
+          New-Item -ItemType Directory -Force -Path windows-gufo | Out-Null
+          tar -xf $zip -C windows-gufo
+          if ($LASTEXITCODE -ne 0) { throw 'cannot unpack the gufo bundle' }
+          Remove-Item -Force $zip
 
       - name: Run hipInfo, gufo --version and gufo diagnose
         run: |
