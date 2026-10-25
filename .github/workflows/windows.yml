@@ -1,10 +1,15 @@
-name: Windows bring-up
+name: Windows
 
-# TEMP(#775): the one job this PR runs while the Windows build is brought up
-# step by step. Step 1: build gufo on a hosted runner and run --version and
-# --help. The paused workflows return once this is where we want it.
+# Windows x86-64 is a development build target (AGENTS.md). A hosted runner
+# builds gufo.exe with its runtime and runs the host contract suite; the
+# Windows Strix Halo Devlab runner then checks the device and one small model
+# per family from that bundle.
 
 on:
+  push:
+    # Main runs save the SDK, vcpkg and compiler caches every pull request
+    # restores; a pull request's own caches stay private to it.
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -13,12 +18,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-bringup-${{ github.ref }}
+  group: windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Windows build (step 1)
+    name: Windows build
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -26,8 +31,8 @@ jobs:
         shell: pwsh
     env:
       # TheRock 10.0.0, the SDK validated at full speed on gfx1151. AMD's
-      # index no longer serves it, so the job downloads the Windows port's
-      # mirror once and then restores it from the Actions cache.
+      # index no longer serves it: the job restores it from the Actions cache
+      # and downloads the Windows port's mirror only on a miss.
       SDK_TARBALL: therock-dist-windows-gfx1151-10.0.0.tar.gz
       SDK_URL: https://github.com/endyjasmi/gufo/releases/download/toolchain/therock-10.0.0/therock-dist-windows-gfx1151-10.0.0.tar.gz
       SDK_SHA256: 1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38
@@ -65,9 +70,11 @@ jobs:
           "HIP_PATH=$env:SDK_ROOT" >> $env:GITHUB_ENV
           ($env:SDK_ROOT -replace '/', '\') + '\bin' >> $env:GITHUB_PATH
 
+      # MSVC 14.40+ clashes with clang's HIP math headers; idempotent.
       - name: Patch the HIP SDK math headers
         run: python tools/windows/patch_sdk_math.py $env:SDK_ROOT
 
+      # vcvars64 once, exported to later steps, instead of a wrapper per command.
       - name: Set up the MSVC x64 environment
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -89,9 +96,9 @@ jobs:
           choco install ninja ccache -y --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja and ccache' }
 
-      # CMakeLists.txt compiles C and CXX through ccache when it is on PATH.
-      # The SDK is unpacked fresh each run, so the compiler is identified by
-      # its pinned tarball rather than by mtime.
+      # CMakeLists.txt compiles C, CXX and (with clang-cl) HIP through ccache
+      # when it is on PATH. The SDK is unpacked fresh each run, so the
+      # compiler is identified by its pinned tarball rather than by mtime.
       - name: Restore compiler cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -106,7 +113,6 @@ jobs:
           "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
           "CCACHE_COMPILERCHECK=string:$env:SDK_TARBALL" >> $env:GITHUB_ENV
           "CCACHE_MAXSIZE=2G" >> $env:GITHUB_ENV
-          "CCACHE_LOGFILE=$env:RUNNER_TEMP\ccache.log" >> $env:GITHUB_ENV
           # GITHUB_ENV applies from the next step on.
           ccache --dir "$env:RUNNER_TEMP\ccache" --zero-stats
 
@@ -119,6 +125,8 @@ jobs:
             gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-
             gufo-vcpkg-v4-${{ runner.os }}-
 
+      # A full clone: the manifest baseline resolves through vcpkg's history.
+      # vcvars points VCPKG_ROOT at the VS-bundled copy, which is not one.
       - name: Prepare vcpkg
         run: |
           git clone --quiet https://github.com/microsoft/vcpkg.git C:\vcpkg-gufo
@@ -140,46 +148,11 @@ jobs:
           "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
           "$PWD\build\windows-release" >> $env:GITHUB_PATH
 
-      # Experiment: compile one C++ and one HIP object first, so ccache's
-      # verdict shows early.
-      - name: Probe ccache on one object per language
-        run: |
-          $db = Get-Content build\windows-release\compile_commands.json -Raw | ConvertFrom-Json
-          foreach ($pattern in @('src[\\/]core[\\/]platform[\\/].*\.cpp$', '\.hip$')) {
-            $entry = $db | Where-Object { $_.file -match $pattern } | Select-Object -First 1
-            "Probe: $($entry.file) -> $($entry.output)"
-            "Command: $($entry.command)"
-            $target = [IO.Path]::GetRelativePath("$PWD\build\windows-release", $entry.output) -replace '\\', '/'
-            ninja -C build\windows-release $target
-            if ($LASTEXITCODE -ne 0) { throw "cannot build $target" }
-            Get-Content "$env:RUNNER_TEMP\ccache.log" | Select-String -Pattern 'unsupported|Command line|Result:|Compiler type' | ForEach-Object Line
-            Clear-Content "$env:RUNNER_TEMP\ccache.log"
-          }
-          ccache --show-stats
-
       - name: Build
         run: |
           cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target gufo gufo-server component_text_cache_test qwen38_flash_next_ngram_test gpu_queues_test bandwidth_test allocation_benchmark_test
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-
-      # Experiment: how much of the build ccache saves, and how much is the
-      # uncached HIP compiles.
-      - name: Report compiler cache and compile time by source type
-        if: always() && steps.configure.outcome == 'success'
-        run: |
-          ccache --show-stats --verbose
-          Select-String -Path "$env:RUNNER_TEMP\ccache.log" -Pattern 'unsupported' |
-            ForEach-Object { $_.Line -replace '^\[[^\]]*\]\s*', '' } | Group-Object | Sort-Object Count -Descending |
-            Select-Object -First 10 | ForEach-Object { "{0} x {1}" -f $_.Count, $_.Name }
-          Select-String -Path "$env:RUNNER_TEMP\ccache.log" -Pattern 'Command line:' | Select-Object -First 1 | ForEach-Object Line
-          $rows = Get-Content build\windows-release\.ninja_log | Select-Object -Skip 1 | ForEach-Object {
-            $f = $_ -split "`t"
-            $kind = if ($f[3] -match '\.hip\.obj$') { 'hip' } elseif ($f[3] -match '\.(c|cc|cpp)\.obj$') { 'c/cxx' } else { 'other' }
-            [pscustomobject]@{ Kind = $kind; Seconds = ([int]$f[1] - [int]$f[0]) / 1000 }
-          }
-          $rows | Group-Object Kind | ForEach-Object {
-            "{0}: {1} steps, {2:N0} s summed" -f $_.Name, $_.Count, ($_.Group | Measure-Object Seconds -Sum).Sum
-          } | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          ccache --show-stats
 
       - name: Run gufo --version, diagnose and the Windows PR contract suite
         run: |
@@ -198,29 +171,15 @@ jobs:
 
       # Everything gufo.exe loads, so the Devlab runner downloads one artifact
       # and nothing else: the staged HIP runtime with its rocBLAS/hipBLASLt
-      # kernel directories, the vcpkg DLLs, the MSVC CRT and LLVM OpenMP.
+      # kernel directories, the vcpkg DLLs, the MSVC CRT and LLVM OpenMP, plus
+      # the weight-free GPU tests and the model smoke checks with their
+      # references (the Devlab job has no checkout).
       - name: Pack gufo for the Devlab runner
         run: |
           $dist = "$env:RUNNER_TEMP\windows-gufo"
           $build = 'build\windows-release'
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          New-Item -ItemType Directory -Force -Path $dist, "$dist\tests\fixtures", "$dist\tests\functional\fixtures" | Out-Null
           Copy-Item "$build\gufo.exe", "$build\*.dll", "$env:SDK_ROOT\bin\hipInfo.exe" $dist
-          # The weight-free GPU tests the build step compiled.
-          foreach ($test in 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test') {
-            $exe = Get-ChildItem $build -Recurse -Filter "$test.exe" | Select-Object -First 1
-            if (-not $exe) { throw "$test.exe was not built" }
-            Copy-Item $exe.FullName $dist
-          }
-          # bandwidth_test reads its schema fixture relative to the working directory.
-          New-Item -ItemType Directory -Force -Path "$dist\tests\fixtures" | Out-Null
-          Copy-Item tests\fixtures\diagnostics "$dist\tests\fixtures" -Recurse
-          # The per-family model smoke checks, their references and the pinned
-          # model registry: the Devlab job has no checkout.
-          New-Item -ItemType Directory -Force -Path "$dist\tests\functional" | Out-Null
-          Copy-Item tests\functional\family_smoke.py, tests\functional\devlab.json "$dist\tests\functional"
-          Copy-Item tests\fixtures\embedding_gemma2 "$dist\tests\fixtures" -Recurse
-          New-Item -ItemType Directory -Force -Path "$dist\tests\functional\fixtures" | Out-Null
-          Copy-Item tests\functional\fixtures\audio "$dist\tests\functional\fixtures" -Recurse
           foreach ($dir in 'rocblas', 'hipblaslt') {
             if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
           }
@@ -228,6 +187,15 @@ jobs:
           $redist = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory |
             Where-Object { $_.Name -like 'Microsoft.VC*.CRT' -or $_.Name -like 'Microsoft.VC*.OpenMP.LLVM' }
           foreach ($dir in $redist) { Copy-Item "$($dir.FullName)\*.dll" $dist -Force }
+          foreach ($test in 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test') {
+            $exe = Get-ChildItem $build -Recurse -Filter "$test.exe" | Select-Object -First 1
+            if (-not $exe) { throw "$test.exe was not built" }
+            Copy-Item $exe.FullName $dist
+          }
+          # bandwidth_test reads its schema fixture relative to the working directory.
+          Copy-Item tests\fixtures\diagnostics, tests\fixtures\embedding_gemma2 "$dist\tests\fixtures" -Recurse
+          Copy-Item tests\functional\family_smoke.py, tests\functional\devlab.json "$dist\tests\functional"
+          Copy-Item tests\functional\fixtures\audio "$dist\tests\functional\fixtures" -Recurse
           $files = Get-ChildItem $dist -Recurse -File
           "Bundle: {0} files, {1:N0} MiB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB) |
             Tee-Object -Append $env:GITHUB_STEP_SUMMARY
@@ -244,7 +212,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows-bringup-logs-${{ github.run_attempt }}
+          name: windows-build-logs-${{ github.run_attempt }}
           path: |
             build/windows-release/CMakeFiles/CMakeConfigureLog.yaml
             build/windows-release/vcpkg-manifest-install.log
@@ -258,6 +226,8 @@ jobs:
           path: ${{ runner.temp }}\therock-archive
           key: gufo-therock-v2-${{ env.SDK_TARBALL }}
 
+      # Under a fresh key per run, as soon as configure ran: a restored set
+      # plus this run's new entries is saved whole.
       - name: Save compiler cache
         if: always() && steps.configure.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -273,16 +243,17 @@ jobs:
           key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   devlab:
-    name: Windows Devlab diagnose (step 2)
+    name: Windows Devlab checks
     needs: build
-    if: github.repository == 'gufo-org/gufo'
+    # Same fork approval policy as the Linux Devlab checks; drafts wait.
+    if: github.repository == 'gufo-org/gufo' && !github.event.pull_request.draft
     runs-on: [ windows, strix-halo, devlab-dispatch ]
     timeout-minutes: 60
     defaults:
       run:
         shell: powershell
-    # Ephemeral runner behind a slow link with no SDK: it downloads the build
-    # job's bundle only, no checkout, and runs gufo from it.
+    # Ephemeral runner with no SDK or package manager: it downloads the build
+    # job's bundle, no checkout, and the pinned model snapshots.
     steps:
       - name: Download gufo
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -301,16 +272,12 @@ jobs:
           .\windows-gufo\gufo.exe diagnose
           if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
 
-      # Weight-free device probes: real HIP kernels and allocations, so a
-      # correct-but-stalled SDK or a missing runtime piece shows here.
-      - name: Probe the device without weights
+      # Real HIP kernels and allocations without weights, so a stalled SDK or
+      # a missing runtime piece shows before any model download.
+      - name: Check the device without weights
         run: |
           $ErrorActionPreference = 'Stop'
           $gufo = '.\windows-gufo\gufo.exe'
-          & $gufo diagnose --json --output diagnose.json
-          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose --json failed' }
-          $report = Get-Content diagnose.json -Raw | ConvertFrom-Json
-          "JSON report parsed: $($report.PSObject.Properties.Name -join ', ')"
           foreach ($benchmark in 'bandwidth', 'allocation') {
             $watch = [Diagnostics.Stopwatch]::StartNew()
             & $gufo diagnose --benchmark $benchmark
@@ -326,12 +293,12 @@ jobs:
           }
           Pop-Location
 
-      # The pinned snapshots of tests/functional/devlab.json, downloaded the
-      # way the Linux Devlab job does; speed and disk are reported because
-      # this runner's link decides which families fit.
+      # The pinned snapshots of tests/functional/devlab.json, as the Linux
+      # Devlab job downloads them.
       - name: Download the model weights
         env:
-          # Flash-Next (107 GiB) and DeepSeek V4 (81 GiB) are deferred.
+          # One small model per family. Flash-Next (107 GiB) and DeepSeek V4
+          # (81 GiB) are deferred.
           GUFO_ASSETS: embedding,asr,tts-base,qwen27
           HF_HUB_DISABLE_XET: '0'
           HF_XET_HIGH_PERFORMANCE: '1'
@@ -340,8 +307,6 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:HF_HOME = "$env:RUNNER_TEMP\huggingface"
-          $drive = (Get-Item $env:RUNNER_TEMP).PSDrive
-          "Free disk on {0}: before {1:N1} GiB" -f $drive.Name, ($drive.Free / 1GB)
           python -m venv "$env:RUNNER_TEMP\hf-cli"
           if ($LASTEXITCODE -ne 0) { throw 'cannot create the Hugging Face venv' }
           & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -m pip install --quiet 'huggingface_hub[hf_xet]==1.26.0'
@@ -376,8 +341,6 @@ jobs:
           '@
           $script | & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -
           if ($LASTEXITCODE -ne 0) { throw 'model download failed' }
-          $drive = (Get-Item $env:RUNNER_TEMP).PSDrive
-          "Free disk on {0}: after {1:N1} GiB" -f $drive.Name, ($drive.Free / 1GB)
 
       - name: Run the per-family model smoke checks
         run: |
