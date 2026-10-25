@@ -214,6 +214,11 @@ jobs:
           # bandwidth_test reads its schema fixture relative to the working directory.
           New-Item -ItemType Directory -Force -Path "$dist\tests\fixtures" | Out-Null
           Copy-Item tests\fixtures\diagnostics "$dist\tests\fixtures" -Recurse
+          # The per-family model smoke checks, their references and the pinned
+          # model registry: the Devlab job has no checkout.
+          New-Item -ItemType Directory -Force -Path "$dist\tests\functional" | Out-Null
+          Copy-Item tests\functional\family_smoke.py, tests\functional\devlab.json "$dist\tests\functional"
+          Copy-Item tests\fixtures\embedding_gemma2 "$dist\tests\fixtures" -Recurse
           foreach ($dir in 'rocblas', 'hipblaslt') {
             if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
           }
@@ -270,7 +275,7 @@ jobs:
     needs: build
     if: github.repository == 'gufo-org/gufo'
     runs-on: [ windows, strix-halo, devlab-dispatch ]
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         shell: powershell
@@ -319,6 +324,57 @@ jobs:
           }
           Pop-Location
 
-      - name: Remove the bundle
+      # The pinned snapshots of tests/functional/devlab.json, downloaded the
+      # way the Linux Devlab job does; speed and disk are reported because
+      # this runner's link decides which families fit.
+      - name: Download the model weights
+        env:
+          GUFO_ASSETS: embedding
+          HF_HUB_DISABLE_XET: '0'
+          HF_XET_HIGH_PERFORMANCE: '1'
+          HF_HUB_DOWNLOAD_TIMEOUT: '120'
+          HF_HUB_ETAG_TIMEOUT: '60'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:HF_HOME = "$env:RUNNER_TEMP\huggingface"
+          $drive = (Get-Item $env:RUNNER_TEMP).PSDrive
+          "Free disk on {0}: before {1:N1} GiB" -f $drive.Name, ($drive.Free / 1GB)
+          python -m venv "$env:RUNNER_TEMP\hf-cli"
+          if ($LASTEXITCODE -ne 0) { throw 'cannot create the Hugging Face venv' }
+          & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -m pip install --quiet 'huggingface_hub[hf_xet]==1.26.0'
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install huggingface_hub' }
+          $script = @'
+          import json, os, sys, time
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+          registry = json.loads(Path("windows-gufo/tests/functional/devlab.json").read_text())
+          for key in os.environ["GUFO_ASSETS"].split(","):
+              asset = registry["assets"][key]
+              destination = Path(os.environ["RUNNER_TEMP"]) / "models" / key
+              started = time.monotonic()
+              snapshot_download(repo_id=asset["repo"], revision=asset["revision"],
+                                allow_patterns=asset["patterns"], local_dir=destination)
+              seconds = time.monotonic() - started
+              for name in asset["required"]:
+                  if not (destination / name).is_file():
+                      sys.exit(f"{key}: missing {name}")
+              size = sum(p.stat().st_size for p in destination.rglob("*") if p.is_file())
+              print(f"{key}: {size / 2**30:.2f} GiB in {seconds:.0f} s, {size / 2**20 / seconds:.1f} MiB/s", flush=True)
+          '@
+          $script | & "$env:RUNNER_TEMP\hf-cli\Scripts\python.exe" -
+          if ($LASTEXITCODE -ne 0) { throw 'model download failed' }
+          $drive = (Get-Item $env:RUNNER_TEMP).PSDrive
+          "Free disk on {0}: after {1:N1} GiB" -f $drive.Name, ($drive.Free / 1GB)
+
+      - name: Run the per-family model smoke checks
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python windows-gufo\tests\functional\family_smoke.py embedding `
+            --binary windows-gufo\gufo.exe --model "$env:RUNNER_TEMP\models\embedding" `
+            --log "$env:RUNNER_TEMP\embedding-server.log"
+          if ($LASTEXITCODE -ne 0) { throw 'embedding smoke check failed' }
+
+      - name: Remove the bundle and the weights
         if: always()
-        run: Remove-Item -Recurse -Force windows-gufo -ErrorAction SilentlyContinue
+        run: |
+          Remove-Item -Recurse -Force windows-gufo, "$env:RUNNER_TEMP\models", "$env:RUNNER_TEMP\huggingface", "$env:RUNNER_TEMP\hf-cli" -ErrorAction SilentlyContinue
