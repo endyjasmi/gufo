@@ -265,12 +265,37 @@ jobs:
     # Ephemeral runner with no SDK or package manager: it downloads the build
     # job's bundle, no checkout, and the pinned model snapshots.
     steps:
+      # Single-stream throughput from this runner to each host it downloads
+      # from: the artifact store (Azure blob, no CDN), a GitHub release asset
+      # (GitHub's download CDN) and Hugging Face over plain HTTPS. Diagnostic
+      # only; it never fails the job.
+      - name: Probe download routes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_URL: ${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts/${{ needs.build.outputs.bundle-id }}/zip
+          RELEASE_URL: https://github.com/endyjasmi/gufo/releases/download/toolchain/therock-10.0.0/therock-dist-windows-gfx1151-10.0.0.tar.gz
+          HF_URL: https://huggingface.co/google/embeddinggemma-2/resolve/914f7f89142e33e77833254d9c9b90c3cef7303b/model.safetensors
+        run: |
+          "Runner: $env:RUNNER_NAME on $env:COMPUTERNAME"
+          "Proxy variables: " + ((Get-ChildItem env: | Where-Object Name -match 'proxy' | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+          netsh winhttp show proxy
+          $signed = curl.exe --fail --silent --output NUL --write-out '%{redirect_url}' `
+            --header "Authorization: Bearer $env:GH_TOKEN" $env:BUNDLE_URL
+          $format = '%{size_download} %{speed_download} %{remote_ip} %{time_connect} %{time_starttransfer} %{http_code} %{url_effective}'
+          foreach ($route in @(@('artifact (Azure blob)', $signed), @('release asset (CDN)', $env:RELEASE_URL), @('Hugging Face (HTTPS)', $env:HF_URL))) {
+            $fields = (curl.exe --silent --location --max-time 10 --output NUL --write-out $format $route[1]) -split ' '
+            "{0,-22} {1,8:N0} KiB/s  ip={2} connect={3}s first-byte={4}s http={5} host={6}" -f `
+              $route[0], ([double]$fields[1] / 1KB), $fields[2], $fields[3], $fields[4], $fields[5], ([uri]$fields[6]).Host
+          }
+
       # The artifact action fetches the zip as one stream and, on this
       # runner's link, can stop early while reporting success. A single
       # stream to the artifact store can also crawl, so the zip is fetched as
       # parallel byte ranges, each retried on its own with a fresh signed URL
       # (they expire quickly), and checked against the upload's digest.
       - name: Download gufo
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
           BUNDLE_URL: ${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts/${{ needs.build.outputs.bundle-id }}/zip
@@ -285,9 +310,6 @@ jobs:
           $headers = curl.exe --fail --silent --show-error --head (& $signed)
           if ($LASTEXITCODE -ne 0) { throw 'cannot read the bundle size' }
           $size = [int64](($headers | Select-String -Pattern '^Content-Length:\s*(\d+)').Matches[-1].Groups[1].Value)
-          # Diagnostic: one stream for 20 s, to compare with the parallel rate.
-          $probe = curl.exe --silent --max-time 20 --output NUL --write-out '%{size_download}' (& $signed)
-          "Single stream: {0:N0} KiB/s" -f ([double]$probe / 1KB / 20)
           $count = 32
           $step = [math]::Ceiling($size / $count)
           $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -311,7 +333,14 @@ jobs:
               throw "part $i failed after 6 attempts"
             }
           }
-          $jobs | Wait-Job | Receive-Job
+          while (@($jobs | Where-Object State -eq 'Running').Count) {
+            Start-Sleep -Seconds 15
+            $have = (Get-ChildItem $dir -File | Measure-Object Length -Sum).Sum
+            "{0,5:N0} s: {1,6:N1} / {2:N1} MiB, {3,6:N0} KiB/s overall, {4}/{5} ranges done" -f `
+              $watch.Elapsed.TotalSeconds, ($have / 1MB), ($size / 1MB), ($have / 1KB / $watch.Elapsed.TotalSeconds), `
+              @($jobs | Where-Object State -eq 'Completed').Count, $count
+          }
+          $jobs | Receive-Job
           $zip = "$env:RUNNER_TEMP\windows-gufo.zip"
           $out = [IO.File]::Create($zip)
           foreach ($i in 0..($count - 1)) {
