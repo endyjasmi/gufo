@@ -197,6 +197,9 @@ jobs:
           Copy-Item tests\functional\family_smoke.py, tests\functional\devlab.json "$dist\tests\functional"
           Copy-Item tests\functional\fixtures\audio "$dist\tests\functional\fixtures" -Recurse
           $files = Get-ChildItem $dist -Recurse -File
+          # The Devlab job checks the download against this list.
+          $files | ForEach-Object { "{0}`t{1}" -f $_.Length, $_.FullName.Substring($dist.Length + 1) } |
+            Set-Content "$dist\bundle-manifest.txt" -Encoding utf8
           "Bundle: {0} files, {1:N0} MiB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB) |
             Tee-Object -Append $env:GITHUB_STEP_SUMMARY
 
@@ -255,8 +258,39 @@ jobs:
     # Ephemeral runner with no SDK or package manager: it downloads the build
     # job's bundle, no checkout, and the pinned model snapshots.
     steps:
+      # On this runner's link a download can end early while the action still
+      # reports success: the bundle is checked against the build job's
+      # manifest and downloaded once more when anything is missing.
       - name: Download gufo
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        # A healthy download takes under 3 minutes; a stalled one is cut off.
+        timeout-minutes: 10
+        continue-on-error: true
+        with:
+          name: windows-gufo-${{ github.run_attempt }}
+          path: windows-gufo
+
+      - name: Check the downloaded bundle
+        id: bundle
+        run: |
+          $missing = @()
+          if (Test-Path windows-gufo\bundle-manifest.txt) {
+            foreach ($line in Get-Content windows-gufo\bundle-manifest.txt) {
+              $size, $path = $line -split "`t", 2
+              $file = Get-Item -LiteralPath "windows-gufo\$path" -ErrorAction SilentlyContinue
+              if (-not $file -or $file.Length -ne [int64]$size) { $missing += $path }
+            }
+          } else {
+            $missing += 'bundle-manifest.txt'
+          }
+          "Incomplete files: $($missing.Count)"
+          $missing | Select-Object -First 10
+          "complete=$(-not $missing)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+
+      - name: Download gufo again
+        if: steps.bundle.outputs.complete != 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        timeout-minutes: 10
         with:
           name: windows-gufo-${{ github.run_attempt }}
           path: windows-gufo
@@ -264,6 +298,11 @@ jobs:
       - name: Run hipInfo, gufo --version and gufo diagnose
         run: |
           $ErrorActionPreference = 'Stop'
+          foreach ($line in Get-Content windows-gufo\bundle-manifest.txt) {
+            $size, $path = $line -split "`t", 2
+            $file = Get-Item -LiteralPath "windows-gufo\$path" -ErrorAction SilentlyContinue
+            if (-not $file -or $file.Length -ne [int64]$size) { throw "the gufo bundle is incomplete: $path" }
+          }
           (Get-CimInstance Win32_VideoController).Name
           .\windows-gufo\hipInfo.exe
           if ($LASTEXITCODE -ne 0) { throw 'hipInfo failed' }
