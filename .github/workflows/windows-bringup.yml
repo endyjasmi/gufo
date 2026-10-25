@@ -187,8 +187,10 @@ jobs:
           if (-not (Test-Path $gufo)) { throw "$gufo was not built" }
           & $gufo --version
           if ($LASTEXITCODE -ne 0) { throw 'gufo --version failed' }
-          & $gufo diagnose
-          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose failed' }
+          # The hosted runner has no GPU: only the platform section can pass
+          # here; the Devlab job runs the full diagnosis on the device.
+          & $gufo diagnose --section platform
+          if ($LASTEXITCODE -ne 0) { throw 'gufo diagnose --section platform failed' }
           cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target check-pr
           if ($LASTEXITCODE -ne 0) { throw 'check-pr failed' }
           ctest --test-dir build/windows-release --output-on-failure --no-tests=error --timeout 60 -R '^(qwen38_flash_next\.ngram|gpu_queues_test|bandwidth_test|allocation_benchmark_test)$'
