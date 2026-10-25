@@ -57,17 +57,6 @@
       }
     },
     {
-      "name": "windows-gpu-test",
-      "displayName": "Windows gfx1151 GPU Tests",
-      "description": "Windows build of the weight-free GPU tests for the Devlab Windows checks",
-      "inherits": "windows-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "ON"
-      }
-    },
-    {
       "name": "release",
       "displayName": "Release",
       "description": "Production gfx1151 build; same optimization as the Nix package",
@@ -124,11 +113,6 @@
       "name": "windows-release",
       "displayName": "Windows Release",
       "configurePreset": "windows-release"
-    },
-    {
-      "name": "windows-gpu-test",
-      "displayName": "Windows gfx1151 GPU Tests",
-      "configurePreset": "windows-gpu-test"
     },
     {
       "name": "release",
