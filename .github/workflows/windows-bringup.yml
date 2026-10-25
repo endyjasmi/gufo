@@ -107,7 +107,8 @@ jobs:
           "CCACHE_COMPILERCHECK=string:$env:SDK_TARBALL" >> $env:GITHUB_ENV
           "CCACHE_MAXSIZE=2G" >> $env:GITHUB_ENV
           "CCACHE_LOGFILE=$env:RUNNER_TEMP\ccache.log" >> $env:GITHUB_ENV
-          ccache --zero-stats
+          # GITHUB_ENV applies from the next step on.
+          ccache --dir "$env:RUNNER_TEMP\ccache" --zero-stats
 
       - name: Restore vcpkg binary cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -139,17 +140,21 @@ jobs:
           "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
           "$PWD\build\windows-release" >> $env:GITHUB_PATH
 
-      # Experiment: compile one object first, so ccache's verdict shows early.
-      - name: Probe ccache on one object
+      # Experiment: compile one C++ and one HIP object first, so ccache's
+      # verdict shows early.
+      - name: Probe ccache on one object per language
         run: |
           $db = Get-Content build\windows-release\compile_commands.json -Raw | ConvertFrom-Json
-          $entry = $db | Where-Object { $_.file -match 'src[\\/]core[\\/]platform[\\/].*\.cpp$' } | Select-Object -First 1
-          "Probe: $($entry.file) -> $($entry.output)"
-          "Command: $($entry.command)"
-          $target = [IO.Path]::GetRelativePath("$PWD\build\windows-release", $entry.output) -replace '\\', '/'
-          ninja -C build\windows-release $target
-          if ($LASTEXITCODE -ne 0) { throw "cannot build $target" }
-          Get-Content "$env:RUNNER_TEMP\ccache.log" | Select-String -Pattern 'unsupported|Command line|Result:|Compiler type' | ForEach-Object Line
+          foreach ($pattern in @('src[\\/]core[\\/]platform[\\/].*\.cpp$', '\.hip$')) {
+            $entry = $db | Where-Object { $_.file -match $pattern } | Select-Object -First 1
+            "Probe: $($entry.file) -> $($entry.output)"
+            "Command: $($entry.command)"
+            $target = [IO.Path]::GetRelativePath("$PWD\build\windows-release", $entry.output) -replace '\\', '/'
+            ninja -C build\windows-release $target
+            if ($LASTEXITCODE -ne 0) { throw "cannot build $target" }
+            Get-Content "$env:RUNNER_TEMP\ccache.log" | Select-String -Pattern 'unsupported|Command line|Result:|Compiler type' | ForEach-Object Line
+            Clear-Content "$env:RUNNER_TEMP\ccache.log"
+          }
           ccache --show-stats
 
       - name: Build

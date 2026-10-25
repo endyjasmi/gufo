@@ -38,6 +38,7 @@ if (GUFO_CCACHE_PROGRAM)
   # Newer CMake gives clang-cl gcc-style depfiles (-clang:-MD), which ccache
   # rejects as unsupported; /showIncludes is cacheable.
   if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(GUFO_CCACHE_CLANG_CL ON)
     foreach(lang C CXX)
       set(CMAKE_DEPFILE_FLAGS_${lang} "/showIncludes")
       set(CMAKE_${lang}_DEPFILE_FORMAT msvc)
@@ -102,6 +103,13 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
+  # clang-cl compiles HIP like C++ on Windows, so ccache covers it there.
+  if (GUFO_CCACHE_CLANG_CL)
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${GUFO_CCACHE_PROGRAM}")
+    set(CMAKE_DEPFILE_FLAGS_HIP "/showIncludes")
+    set(CMAKE_HIP_DEPFILE_FORMAT msvc)
+    message(STATUS "gufo: compiling HIP through ${GUFO_CCACHE_PROGRAM}")
+  endif()
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
