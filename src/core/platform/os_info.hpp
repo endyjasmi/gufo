@@ -37,6 +37,33 @@ struct HostIdentity {
 /// Returns nullopt when the OS cannot describe itself.
 std::optional<HostIdentity> QueryHostIdentity();
 
+/// The OS Gufo was built for: "Linux" or "Windows".
+const char* HostOsName() noexcept;
+
+/// The host's processors. Windows reads the processor name from the
+/// registry and the core counts from GetLogicalProcessorInformationEx;
+/// Linux reports only the online logical processors (the diagnostics parse
+/// /proc/cpuinfo for the rest). Zero or empty fields are unknown.
+struct HostCpu {
+  std::string model_name;
+  std::string vendor;
+  std::uint32_t logical_cores{0};
+  std::uint32_t physical_cores{0};
+};
+
+/// Returns nullopt when the OS cannot describe its processors.
+std::optional<HostCpu> QueryHostCpu();
+
+/// Physical memory in bytes. Windows reports GlobalMemoryStatusEx; Linux
+/// reports sysconf pages times the page size.
+struct HostMemory {
+  std::uint64_t total_bytes{0};
+  std::uint64_t available_bytes{0};
+};
+
+/// Returns nullopt when the OS cannot report its memory.
+std::optional<HostMemory> QueryHostMemory();
+
 /// Fills `out` with the process's local calendar time for `seconds`.
 /// Returns false when the platform cannot convert the time.
 bool LocalTime(std::time_t seconds, std::tm* out) noexcept;
