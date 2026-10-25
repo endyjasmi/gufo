@@ -84,10 +84,29 @@ jobs:
             "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
           }
 
-      - name: Install Ninja
+      - name: Install Ninja and ccache
         run: |
-          choco install ninja -y --no-progress
-          if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja' }
+          choco install ninja ccache -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja and ccache' }
+
+      # CMakeLists.txt compiles C and CXX through ccache when it is on PATH.
+      # The SDK is unpacked fresh each run, so the compiler is identified by
+      # its pinned tarball rather than by mtime.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\ccache
+          key: gufo-windows-ccache-v1-${{ env.SDK_TARBALL }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gufo-windows-ccache-v1-${{ env.SDK_TARBALL }}-
+
+      - name: Configure ccache
+        run: |
+          "CCACHE_DIR=$env:RUNNER_TEMP\ccache" >> $env:GITHUB_ENV
+          "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+          "CCACHE_COMPILERCHECK=string:$env:SDK_TARBALL" >> $env:GITHUB_ENV
+          "CCACHE_MAXSIZE=2G" >> $env:GITHUB_ENV
+          ccache --zero-stats
 
       - name: Restore vcpkg binary cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -111,7 +130,10 @@ jobs:
       - name: Configure
         id: configure
         run: |
-          cmake --preset windows-release -DBUILD_TESTING=ON "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT"
+          # ccache cannot cache objects that write a shared /Zi PDB: embed
+          # the debug info in each object instead (/Z7).
+          cmake --preset windows-release -DBUILD_TESTING=ON "-DCMAKE_HIP_COMPILER_ROCM_ROOT=$env:SDK_ROOT" `
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
           "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
           "$PWD\build\windows-release" >> $env:GITHUB_PATH
@@ -120,6 +142,21 @@ jobs:
         run: |
           cmake --build --preset windows-release --parallel $env:NUMBER_OF_PROCESSORS --target gufo gufo-server component_text_cache_test qwen38_flash_next_ngram_test gpu_queues_test bandwidth_test allocation_benchmark_test
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+
+      # Experiment: how much of the build ccache saves, and how much is the
+      # uncached HIP compiles.
+      - name: Report compiler cache and compile time by source type
+        if: always() && steps.configure.outcome == 'success'
+        run: |
+          ccache --show-stats --verbose
+          $rows = Get-Content build\windows-release\.ninja_log | Select-Object -Skip 1 | ForEach-Object {
+            $f = $_ -split "`t"
+            $kind = if ($f[3] -match '\.hip\.obj$') { 'hip' } elseif ($f[3] -match '\.(c|cc|cpp)\.obj$') { 'c/cxx' } else { 'other' }
+            [pscustomobject]@{ Kind = $kind; Seconds = ([int]$f[1] - [int]$f[0]) / 1000 }
+          }
+          $rows | Group-Object Kind | ForEach-Object {
+            "{0}: {1} steps, {2:N0} s summed" -f $_.Name, $_.Count, ($_.Group | Measure-Object Seconds -Sum).Sum
+          } | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
 
       - name: Run gufo --version, diagnose and the Windows PR contract suite
         run: |
@@ -151,6 +188,13 @@ jobs:
         with:
           path: ${{ runner.temp }}\therock-archive
           key: gufo-therock-v2-${{ env.SDK_TARBALL }}
+
+      - name: Save compiler cache
+        if: always() && steps.configure.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\ccache
+          key: gufo-windows-ccache-v1-${{ env.SDK_TARBALL }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Save vcpkg binary cache
         if: always() && steps.configure.outcome != 'skipped'
