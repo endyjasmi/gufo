@@ -146,7 +146,9 @@ jobs:
           $entry = $db | Where-Object { $_.file -match 'src[\\/]core[\\/]platform[\\/].*\.cpp$' } | Select-Object -First 1
           "Probe: $($entry.file) -> $($entry.output)"
           "Command: $($entry.command)"
-          ninja -C build\windows-release $entry.output
+          $target = [IO.Path]::GetRelativePath("$PWD\build\windows-release", $entry.output) -replace '\\', '/'
+          ninja -C build\windows-release $target
+          if ($LASTEXITCODE -ne 0) { throw "cannot build $target" }
           Get-Content "$env:RUNNER_TEMP\ccache.log" | Select-String -Pattern 'unsupported|Command line|Result:|Compiler type' | ForEach-Object Line
           ccache --show-stats
 
