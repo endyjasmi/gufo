@@ -1,9 +1,9 @@
 name: Windows
 
 # Windows x86-64 is a development build target (AGENTS.md). A hosted runner
-# builds gufo.exe with its runtime and runs the host contract suite; the
-# Windows Strix Halo Devlab runner then checks the device and one small model
-# per family from that bundle.
+# builds gufo.exe with its runtime and runs the host contract suite. On a
+# manual dispatch the Windows Strix Halo Devlab runner then checks the device
+# and one small model per family from that bundle (PR runs wait on #789).
 
 on:
   push:
@@ -252,8 +252,10 @@ jobs:
   devlab:
     name: Windows Devlab checks
     needs: build
-    # Same fork approval policy as the Linux Devlab checks; drafts wait.
-    if: github.repository == 'gufo-org/gufo' && !github.event.pull_request.draft
+    # Manual dispatch only for now: the runners' route to the Actions
+    # artifact store often crawls at tens of KiB/s, so a PR run cannot
+    # finish (#789). Restore the PR trigger once the bundle comes from a CDN.
+    if: github.repository == 'gufo-org/gufo' && github.event_name == 'workflow_dispatch'
     runs-on: [ windows, strix-halo, devlab-dispatch ]
     timeout-minutes: 60
     permissions:

@@ -107,11 +107,13 @@ Then `curl http://127.0.0.1:8080/ready` and POST to `/v1/chat/completions`.
 [`.github/workflows/windows.yml`](.github/workflows/windows.yml) builds this
 recipe on a hosted `windows-latest` runner, with the SDK archive, the vcpkg
 packages and the compiler cache restored from the Actions cache, and runs
-`check-pr`. The Windows Strix Halo Devlab runner then downloads the resulting
-bundle, runs `gufo diagnose`, the weight-free GPU tests, and one small model
-per family through
+`check-pr`. On a manual dispatch, the Windows Strix Halo Devlab runner then
+downloads the resulting bundle and runs `gufo diagnose`, the weight-free GPU
+tests, and one small model per family through
 [`tests/functional/family_smoke.py`](tests/functional/family_smoke.py):
-EmbeddingGemma 2, Qwen3-ASR, Qwen3-TTS and Qwen3.8-27B.
+EmbeddingGemma 2, Qwen3-ASR, Qwen3-TTS and Qwen3.8-27B. Pull requests do not
+run that job yet: the runners' route to the Actions artifact store is too slow
+for the bundle ([#789](https://github.com/gufo-org/gufo/issues/789)).
 
 ## Gotchas
 
