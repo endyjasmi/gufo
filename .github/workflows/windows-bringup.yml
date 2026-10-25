@@ -25,8 +25,12 @@ jobs:
       run:
         shell: pwsh
     env:
-      # From AMD's official index (about six weeks of nightlies).
-      SDK_TARBALL: therock-dist-windows-gfx1151-10.2.0a20261022.tar.gz
+      # TheRock 10.0.0, the SDK validated at full speed on gfx1151. AMD's
+      # index no longer serves it, so the job downloads the Windows port's
+      # mirror once and then restores it from the Actions cache.
+      SDK_TARBALL: therock-dist-windows-gfx1151-10.0.0.tar.gz
+      SDK_URL: https://github.com/endyjasmi/gufo/releases/download/toolchain/therock-10.0.0/therock-dist-windows-gfx1151-10.0.0.tar.gz
+      SDK_SHA256: 1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38
       # Forward slashes: CMake reads backslashes in -D values as escapes.
       SDK_ROOT: C:/TheRock/build
     steps:
@@ -48,11 +52,12 @@ jobs:
           $archive = "$env:RUNNER_TEMP\therock-archive\$env:SDK_TARBALL"
           New-Item -ItemType Directory -Force -Path (Split-Path $archive), $env:SDK_ROOT | Out-Null
           if (-not (Test-Path $archive)) {
-            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" `
-              "https://nightly.repo.amd.com/rocm/core/tarball/$env:SDK_TARBALL"
+            curl.exe --fail --location --retry 3 --no-progress-meter --output "$archive.part" $env:SDK_URL
             if ($LASTEXITCODE -ne 0) { throw "cannot download $env:SDK_TARBALL" }
             Move-Item "$archive.part" $archive
           }
+          $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($sha -ne $env:SDK_SHA256) { throw "$env:SDK_TARBALL has sha256 $sha, expected $env:SDK_SHA256" }
           "archive=ready" >> $env:GITHUB_OUTPUT
           tar -xzf $archive -C $env:SDK_ROOT
           if ($LASTEXITCODE -ne 0) { throw "cannot unpack $env:SDK_TARBALL" }
