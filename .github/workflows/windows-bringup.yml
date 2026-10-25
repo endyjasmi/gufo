@@ -211,6 +211,9 @@ jobs:
             if (-not $exe) { throw "$test.exe was not built" }
             Copy-Item $exe.FullName $dist
           }
+          # bandwidth_test reads its schema fixture relative to the working directory.
+          New-Item -ItemType Directory -Force -Path "$dist\tests\fixtures" | Out-Null
+          Copy-Item tests\fixtures\diagnostics "$dist\tests\fixtures" -Recurse
           foreach ($dir in 'rocblas', 'hipblaslt') {
             if (Test-Path "$build\$dir") { Copy-Item "$build\$dir" $dist -Recurse }
           }
@@ -307,12 +310,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "gufo diagnose --benchmark $benchmark failed" }
             "{0}: {1:N1} s" -f $benchmark, $watch.Elapsed.TotalSeconds
           }
+          Push-Location windows-gufo
           foreach ($test in 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test') {
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            & ".\windows-gufo\$test.exe"
+            & ".\$test.exe"
             if ($LASTEXITCODE -ne 0) { throw "$test failed with exit code $LASTEXITCODE" }
             "{0}: {1:N1} s" -f $test, $watch.Elapsed.TotalSeconds
           }
+          Pop-Location
 
       - name: Remove the bundle
         if: always()
