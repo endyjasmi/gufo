@@ -266,9 +266,10 @@ jobs:
     # job's bundle, no checkout, and the pinned model snapshots.
     steps:
       # The artifact action fetches the zip as one stream and, on this
-      # runner's link, can stop early while reporting success. curl resumes
-      # each dropped or stalled transfer instead, and the zip is checked
-      # against the digest the upload reported.
+      # runner's link, can stop early while reporting success. A single
+      # stream to the artifact store can also crawl, so the zip is fetched as
+      # parallel byte ranges, each retried on its own with a fresh signed URL
+      # (they expire quickly), and checked against the upload's digest.
       - name: Download gufo
         env:
           GH_TOKEN: ${{ github.token }}
@@ -276,22 +277,48 @@ jobs:
           BUNDLE_DIGEST: ${{ needs.build.outputs.bundle-digest }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $zip = "$env:RUNNER_TEMP\windows-gufo.zip"
-          Remove-Item -Force $zip -ErrorAction SilentlyContinue
+          $dir = "$env:RUNNER_TEMP\windows-gufo-parts"
+          Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $signed = { curl.exe --fail --silent --show-error --output NUL --write-out '%{redirect_url}' `
+                        --header "Authorization: Bearer $env:GH_TOKEN" $env:BUNDLE_URL }
+          $headers = curl.exe --fail --silent --show-error --head (& $signed)
+          if ($LASTEXITCODE -ne 0) { throw 'cannot read the bundle size' }
+          $size = [int64](($headers | Select-String -Pattern '^Content-Length:\s*(\d+)').Matches[-1].Groups[1].Value)
+          # Diagnostic: one stream for 20 s, to compare with the parallel rate.
+          $probe = curl.exe --silent --max-time 20 --output NUL --write-out '%{size_download}' (& $signed)
+          "Single stream: {0:N0} KiB/s" -f ([double]$probe / 1KB / 20)
+          $count = 32
+          $step = [math]::Ceiling($size / $count)
           $watch = [Diagnostics.Stopwatch]::StartNew()
-          for ($attempt = 1; $attempt -le 8; $attempt++) {
-            # A transfer below 1 MiB/s for a minute counts as stalled.
-            curl.exe --fail --location --silent --show-error --connect-timeout 30 `
-              --speed-limit 1048576 --speed-time 60 --continue-at - `
-              --header "Authorization: Bearer $env:GH_TOKEN" --output $zip $env:BUNDLE_URL
-            if ($LASTEXITCODE -eq 0) { break }
-            $have = if (Test-Path $zip) { (Get-Item $zip).Length } else { 0 }
-            "attempt {0}: curl exit {1} with {2:N0} MiB so far; resuming" -f $attempt, $LASTEXITCODE, ($have / 1MB)
-            if ($attempt -eq 8) { throw 'cannot download the gufo bundle' }
-            Start-Sleep -Seconds 5
+          $jobs = foreach ($i in 0..($count - 1)) {
+            $first = $i * $step
+            $last = [math]::Min($size, $first + $step) - 1
+            Start-Job -ArgumentList $i, $first, $last, $dir, $env:BUNDLE_URL, $env:GH_TOKEN -ScriptBlock {
+              param($i, $first, $last, $dir, $api, $token)
+              $part = "$dir\part$i"
+              for ($attempt = 1; $attempt -le 6; $attempt++) {
+                $url = curl.exe --fail --silent --output NUL --write-out '%{redirect_url}' `
+                  --header "Authorization: Bearer $token" $api
+                # Only a stalled range (under 16 KiB/s for a minute) is retried.
+                $rate = curl.exe --fail --silent --show-error --connect-timeout 30 --speed-limit 16384 --speed-time 60 `
+                  --range "$first-$last" --output $part --write-out '%{speed_download}' $url
+                if ($LASTEXITCODE -eq 0 -and (Get-Item $part).Length -eq ($last - $first + 1)) {
+                  return "part {0}: attempt {1}, {2:N0} KiB/s" -f $i, $attempt, ([double]$rate / 1KB)
+                }
+                Start-Sleep -Seconds 5
+              }
+              throw "part $i failed after 6 attempts"
+            }
           }
-          $mib = (Get-Item $zip).Length / 1MB
-          "Bundle: {0:N0} MiB in {1:N0} s" -f $mib, $watch.Elapsed.TotalSeconds
+          $jobs | Wait-Job | Receive-Job
+          $zip = "$env:RUNNER_TEMP\windows-gufo.zip"
+          $out = [IO.File]::Create($zip)
+          foreach ($i in 0..($count - 1)) {
+            $in = [IO.File]::OpenRead("$dir\part$i"); $in.CopyTo($out); $in.Dispose()
+          }
+          $out.Dispose()
+          "Bundle: {0:N0} MiB in {1:N0} s over {2} ranges, {3:N0} KiB/s" -f ($size / 1MB), $watch.Elapsed.TotalSeconds, $count, ($size / 1KB / $watch.Elapsed.TotalSeconds)
           $expected = $env:BUNDLE_DIGEST -replace '^sha256:', ''
           $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           if ($expected -and $sha -ne $expected.ToLowerInvariant()) { throw "bundle sha256 $sha, expected $expected" }
@@ -299,7 +326,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path windows-gufo | Out-Null
           tar -xf $zip -C windows-gufo
           if ($LASTEXITCODE -ne 0) { throw 'cannot unpack the gufo bundle' }
-          Remove-Item -Force $zip
+          Remove-Item -Recurse -Force $zip, $dir
 
       - name: Run hipInfo, gufo --version and gufo diagnose
         run: |
